@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from xml.etree import ElementTree as ET
 
@@ -19,6 +19,7 @@ import requests
 import yaml
 
 SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 1
 REQUEST_TIMEOUT_SECONDS = 20
 DROP_QUERY_PARAMS = {
     "utm_source",
@@ -94,6 +95,16 @@ class RawEntry:
     extra_provenance: Dict[str, Any]
 
 
+@dataclasses.dataclass
+class FetchResult:
+    body: Optional[str]
+    status_code: Optional[int]
+    content_type: Optional[str]
+    elapsed_ms: int
+    etag: Optional[str]
+    last_modified: Optional[str]
+
+
 class PipelineError(RuntimeError):
     pass
 
@@ -110,6 +121,12 @@ def parse_now(value: Optional[str]) -> datetime:
 
 def iso_z(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def default_state_path(output_dir: Path) -> Path:
+    if output_dir.parent.name == "runs" or re.match(r"^(dry-run-)?\d{8}T\d{6}Z$", output_dir.name):
+        return output_dir.parent / "state.json"
+    return output_dir / "state.json"
 
 
 def read_source_config(path: Path) -> List[SourceConfig]:
@@ -162,14 +179,75 @@ def read_source_config(path: Path) -> List[SourceConfig]:
     return sources
 
 
-def fetch_feed(source: SourceConfig) -> Tuple[str, Optional[int], Optional[str], int]:
+def empty_state(path: Optional[Path]) -> Dict[str, Any]:
+    return {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "state_path": str(path) if path is not None else None,
+        "sources": {},
+    }
+
+
+def load_state(path: Optional[Path]) -> Dict[str, Any]:
+    if path is None or not path.exists():
+        return empty_state(path)
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, dict):
+        raise PipelineError("Invalid state file: {}".format(path))
+    if payload.get("schema_version") != STATE_SCHEMA_VERSION:
+        raise PipelineError("Unsupported state schema in {}".format(path))
+    if not isinstance(payload.get("sources"), dict):
+        raise PipelineError("Invalid state sources in {}".format(path))
+    payload["state_path"] = str(path)
+    return payload
+
+
+def save_state(path: Path, state: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "state_path": str(path),
+        "sources": state.get("sources", {}),
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def source_state_view(state: Dict[str, Any], source_id: str) -> Dict[str, Any]:
+    sources = state.setdefault("sources", {})
+    view = sources.setdefault(source_id, {})
+    view.setdefault("validators", {})
+    view.setdefault("seen_identities", [])
+    return view
+
+
+def fetch_feed(source: SourceConfig, validators: Optional[Dict[str, str]] = None) -> FetchResult:
     started = time.perf_counter()
     headers = {"User-Agent": "argus/0.1 (+local-only worker)"}
     headers.update(source.request_headers)
+    if validators:
+        if validators.get("etag"):
+            headers["If-None-Match"] = validators["etag"]
+        if validators.get("last_modified"):
+            headers["If-Modified-Since"] = validators["last_modified"]
     response = requests.get(source.feed_url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
     elapsed_ms = int((time.perf_counter() - started) * 1000)
+    if response.status_code == 304:
+        return FetchResult(
+            body=None,
+            status_code=response.status_code,
+            content_type=response.headers.get("content-type"),
+            elapsed_ms=elapsed_ms,
+            etag=response.headers.get("etag"),
+            last_modified=response.headers.get("last-modified"),
+        )
     response.raise_for_status()
-    return response.text, response.status_code, response.headers.get("content-type"), elapsed_ms
+    return FetchResult(
+        body=response.text,
+        status_code=response.status_code,
+        content_type=response.headers.get("content-type"),
+        elapsed_ms=elapsed_ms,
+        etag=response.headers.get("etag"),
+        last_modified=response.headers.get("last-modified"),
+    )
 
 
 def strip_html(text: str) -> str:
@@ -324,13 +402,7 @@ def normalize_timestamp(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
     text = value.strip()
-    formats = [
-        None,
-        "%a, %d %b %Y %H:%M:%S %z",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%d %H:%M:%S%z",
-    ]
+    formats = [None, "%a, %d %b %Y %H:%M:%S %z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S%z"]
     for fmt in formats:
         try:
             if fmt is None:
@@ -361,6 +433,25 @@ def dedupe_key(report: Dict[str, Any]) -> Tuple[str, str, str]:
     if report.get("canonical_url"):
         return source_id, "canonical_url_exact", report["canonical_url"]
     return source_id, "normalized_title_date_bucket", "{}|{}".format(normalize_title(report["title"]), date_bucket(report.get("published_at")))
+
+
+def persistent_identities_for(report: Dict[str, Any]) -> List[Tuple[str, str]]:
+    identities: List[Tuple[str, str]] = []
+    if report.get("feed_entry_id"):
+        identities.append(("feed_entry_id_exact", report["feed_entry_id"]))
+    if report.get("canonical_url"):
+        identities.append(("canonical_url_exact", report["canonical_url"]))
+    identities.append(
+        (
+            "normalized_title_date_bucket",
+            "{}|{}".format(normalize_title(report["title"]), date_bucket(report.get("published_at"))),
+        )
+    )
+    return identities
+
+
+def persistent_identity_keys(report: Dict[str, Any]) -> List[str]:
+    return ["{}|{}".format(kind, value) for kind, value in persistent_identities_for(report)]
 
 
 def normalize_entry(entry: RawEntry, fetched_at: str) -> Dict[str, Any]:
@@ -436,11 +527,27 @@ def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
             handle.write(json.dumps(row) + "\n")
 
 
-def read_fixture_feed(fixture_dir: Path, source: SourceConfig) -> Tuple[str, Optional[int], Optional[str], int]:
+def read_fixture_feed(fixture_dir: Path, source: SourceConfig, validators: Optional[Dict[str, str]] = None) -> FetchResult:
     feed_path = fixture_dir / "{}.xml".format(source.id)
+    meta_path = fixture_dir / "{}.meta.json".format(source.id)
     if not feed_path.exists():
         raise PipelineError("Missing fixture for {}: {}".format(source.id, feed_path))
-    return feed_path.read_text(), 200, "application/xml", 1
+    metadata: Dict[str, Any] = {}
+    if meta_path.exists():
+        metadata = json.loads(meta_path.read_text())
+    status_code = int(metadata.get("status_code", 200))
+    etag = metadata.get("etag")
+    last_modified = metadata.get("last_modified")
+    if status_code == 304:
+        expected_etag = metadata.get("if_none_match")
+        expected_last_modified = metadata.get("if_modified_since")
+        if expected_etag and (validators or {}).get("etag") != expected_etag:
+            status_code = 200
+        elif expected_last_modified and (validators or {}).get("last_modified") != expected_last_modified:
+            status_code = 200
+    if status_code == 304:
+        return FetchResult(body=None, status_code=304, content_type=metadata.get("content_type"), elapsed_ms=1, etag=etag, last_modified=last_modified)
+    return FetchResult(body=feed_path.read_text(), status_code=status_code, content_type=metadata.get("content_type", "application/xml"), elapsed_ms=1, etag=etag, last_modified=last_modified)
 
 
 def run_pipeline(
@@ -449,9 +556,14 @@ def run_pipeline(
     now: datetime,
     fixture_dir: Optional[Path] = None,
     dry_run: bool = False,
+    state_path: Optional[Path] = None,
+    state_write: bool = True,
 ) -> Tuple[int, Dict[str, Any]]:
     sources = read_source_config(sources_path)
     output_dir.mkdir(parents=True, exist_ok=True)
+    effective_state_path = state_path or default_state_path(output_dir)
+    state = load_state(effective_state_path)
+    next_state = json.loads(json.dumps(state))
 
     source_health: List[Dict[str, Any]] = []
     normalized_rows: List[Dict[str, Any]] = []
@@ -464,6 +576,11 @@ def run_pipeline(
     succeeded_sources = 0
 
     for source in sources:
+        state_before = source_state_view(state, source.id)
+        state_after = source_state_view(next_state, source.id)
+        validator_view = state_before.get("validators", {})
+        seen_identities: Set[str] = set(state_before.get("seen_identities", []))
+
         if not source.enabled:
             source_health.append(
                 {
@@ -476,8 +593,12 @@ def run_pipeline(
                     "content_type": None,
                     "raw_entry_count": 0,
                     "normalized_entry_count": 0,
+                    "emitted_candidate_count": 0,
+                    "skipped_previously_seen_count": 0,
                     "failure_reason": None,
                     "elapsed_ms": 0,
+                    "etag": validator_view.get("etag"),
+                    "last_modified": validator_view.get("last_modified"),
                 }
             )
             continue
@@ -485,15 +606,45 @@ def run_pipeline(
         fetched_at = iso_z(now)
         try:
             if fixture_dir is not None:
-                xml_text, status_code, content_type, elapsed_ms = read_fixture_feed(fixture_dir, source)
+                fetch_result = read_fixture_feed(fixture_dir, source, validators=validator_view)
             else:
-                xml_text, status_code, content_type, elapsed_ms = fetch_feed(source)
+                fetch_result = fetch_feed(source, validators=validator_view)
             fetched_sources += 1
-            entries = parse_feed(xml_text, source)
+
+            if fetch_result.status_code == 304:
+                succeeded_sources += 1
+                if fetch_result.etag:
+                    state_after["validators"]["etag"] = fetch_result.etag
+                if fetch_result.last_modified:
+                    state_after["validators"]["last_modified"] = fetch_result.last_modified
+                source_health.append(
+                    {
+                        "source_id": source.id,
+                        "source_name": source.name,
+                        "status": "not_modified",
+                        "feed_url": source.feed_url,
+                        "fetched_at": fetched_at,
+                        "http_status": fetch_result.status_code,
+                        "content_type": fetch_result.content_type,
+                        "raw_entry_count": 0,
+                        "normalized_entry_count": 0,
+                        "emitted_candidate_count": 0,
+                        "skipped_previously_seen_count": 0,
+                        "failure_reason": None,
+                        "elapsed_ms": fetch_result.elapsed_ms,
+                        "etag": state_after["validators"].get("etag"),
+                        "last_modified": state_after["validators"].get("last_modified"),
+                    }
+                )
+                continue
+
+            entries = parse_feed(fetch_result.body or "", source)
             raw_entries += len(entries)
             seen: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
             source_clusters: List[Dict[str, Any]] = []
             normalized_count = 0
+            emitted_count = 0
+            skipped_seen_count = 0
             for entry in entries:
                 report = normalize_entry(entry, fetched_at)
                 identity = dedupe_key(report)
@@ -501,11 +652,7 @@ def run_pipeline(
                     duplicate_count += 1
                     cluster_id = cluster_id_for(source.id, identity[1], identity[2])
                     existing_report = seen[identity]
-                    cluster = None
-                    for row in source_clusters:
-                        if row["cluster_id"] == cluster_id:
-                            cluster = row
-                            break
+                    cluster = next((row for row in source_clusters if row["cluster_id"] == cluster_id), None)
                     if cluster is None:
                         cluster = {
                             "schema_version": SCHEMA_VERSION,
@@ -523,16 +670,26 @@ def run_pipeline(
                 seen[identity] = report
                 normalized_rows.append(report)
                 normalized_count += 1
-                publish_candidates.append(
-                    candidate_for(
-                        report,
-                        {"primary": identity[1], "value": identity[2]},
-                    )
-                )
+
+                identity_keys = persistent_identity_keys(report)
+                already_seen = any(key in seen_identities for key in identity_keys)
+                if already_seen:
+                    skipped_seen_count += 1
+                    continue
+
+                emitted_count += 1
+                publish_candidates.append(candidate_for(report, {"primary": identity[1], "value": identity[2]}))
+                for key in identity_keys:
+                    seen_identities.add(key)
 
             clusters.extend(source_clusters)
             status = "ok" if entries else "empty"
             succeeded_sources += 1
+            if fetch_result.etag:
+                state_after["validators"]["etag"] = fetch_result.etag
+            if fetch_result.last_modified:
+                state_after["validators"]["last_modified"] = fetch_result.last_modified
+            state_after["seen_identities"] = sorted(seen_identities)
             source_health.append(
                 {
                     "source_id": source.id,
@@ -540,12 +697,16 @@ def run_pipeline(
                     "status": status,
                     "feed_url": source.feed_url,
                     "fetched_at": fetched_at,
-                    "http_status": status_code,
-                    "content_type": content_type,
+                    "http_status": fetch_result.status_code,
+                    "content_type": fetch_result.content_type,
                     "raw_entry_count": len(entries),
                     "normalized_entry_count": normalized_count,
+                    "emitted_candidate_count": emitted_count,
+                    "skipped_previously_seen_count": skipped_seen_count,
                     "failure_reason": None,
-                    "elapsed_ms": elapsed_ms,
+                    "elapsed_ms": fetch_result.elapsed_ms,
+                    "etag": state_after["validators"].get("etag"),
+                    "last_modified": state_after["validators"].get("last_modified"),
                 }
             )
         except Exception as exc:
@@ -561,8 +722,12 @@ def run_pipeline(
                     "content_type": None,
                     "raw_entry_count": 0,
                     "normalized_entry_count": 0,
+                    "emitted_candidate_count": 0,
+                    "skipped_previously_seen_count": 0,
                     "failure_reason": str(exc),
                     "elapsed_ms": 0,
+                    "etag": validator_view.get("etag"),
+                    "last_modified": validator_view.get("last_modified"),
                 }
             )
 
@@ -576,6 +741,9 @@ def run_pipeline(
     else:
         exit_status = "success"
         exit_code = 0
+
+    if state_write and exit_code == 0:
+        save_state(effective_state_path, next_state)
 
     run_summary = {
         "schema_version": SCHEMA_VERSION,
@@ -604,6 +772,12 @@ def run_pipeline(
         },
         "dry_run": dry_run,
         "publish_performed": False,
+        "state": {
+            "path": str(effective_state_path),
+            "loaded": effective_state_path.exists(),
+            "write_enabled": state_write,
+            "write_performed": bool(state_write and exit_code == 0),
+        },
     }
 
     write_json(output_dir / "run-summary.json", run_summary)
@@ -618,12 +792,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Argus local-only RSS ingestion")
     parser.add_argument("--sources", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--state", type=Path, help="Path to persistent Argus feed state. Defaults to <out parent>/state.json.")
+    parser.add_argument("--no-state-write", action="store_true", help="Read existing state but do not mutate durable state for this run.")
     parser.add_argument("--now", type=str)
     parser.add_argument("--fixture-dir", type=Path)
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Fetch live sources and write local artifacts only. This is currently the default behavior; the flag is explicit operator intent and run metadata.",
+        help="Fetch sources and write local artifacts only. Dry runs read state for filtering but do not write state unless future behavior explicitly changes.",
     )
     return parser
 
@@ -631,8 +807,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     now = parse_now(args.now)
+    state_write = not args.no_state_write and not args.dry_run
     try:
-        exit_code, run_summary = run_pipeline(args.sources, args.out, now, fixture_dir=args.fixture_dir, dry_run=args.dry_run)
+        exit_code, run_summary = run_pipeline(
+            args.sources,
+            args.out,
+            now,
+            fixture_dir=args.fixture_dir,
+            dry_run=args.dry_run,
+            state_path=args.state,
+            state_write=state_write,
+        )
     except PipelineError as exc:
         print(str(exc), file=sys.stderr)
         return 1

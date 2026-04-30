@@ -16,6 +16,7 @@ Recommended layout:
 ~/src/argus                         # source checkout for operators/developers
 ~/.local/bin/argus                  # executable shim or symlink
 ~/.config/argus/sources.yaml        # operator config
+~/.local/state/argus/state.json     # persistent feed cursor / validators
 ~/.local/state/argus/runs/          # run outputs/artifacts
 ~/.local/state/argus/logs/          # logs if supervised
 ```
@@ -40,6 +41,7 @@ Run it:
 ```bash
 ~/.local/bin/argus \
   --sources ~/.config/argus/sources.yaml \
+  --state ~/.local/state/argus/state.json \
   --out ~/.local/state/argus/runs/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
@@ -51,6 +53,7 @@ For a shared/server install, use `/opt` for code, `/etc` for config, and `/var/l
 /opt/argus/                         # source checkout / release tree
 /usr/local/bin/argus                # executable shim or symlink
 /etc/argus/sources.yaml             # system config
+/var/lib/argus/state.json           # persistent feed cursor / validators
 /var/lib/argus/runs/                # run outputs/artifacts
 /var/log/argus/                     # logs if supervised
 ```
@@ -81,6 +84,7 @@ Run once:
 ```bash
 sudo -u argus /usr/local/bin/argus \
   --sources /etc/argus/sources.yaml \
+  --state /var/lib/argus/state.json \
   --out /var/lib/argus/runs/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
@@ -93,6 +97,7 @@ Recommended Racter layout:
 ```text
 /opt/argus/
 /etc/argus/sources.yaml
+/var/lib/argus/state.json
 /var/lib/argus/runs/
 /var/log/argus/
 /usr/local/bin/argus
@@ -107,6 +112,13 @@ Racter deploy should be treated as an operator deployment, not a code checkout e
 5. Write run artifacts under `/var/lib/argus/runs/<timestamp>/`.
 6. Log supervisor output under `/var/log/argus/`.
 7. Only after the Subspace publisher exists, add publisher config separately; do not overload the scraper config with subscriber interpretation.
+
+Argus state notes:
+
+- Point `--state` at a stable path outside the timestamped run directory.
+- If omitted, Argus defaults to `<out parent>/state.json`, which works well when runs live under `/var/lib/argus/runs/<timestamp>`.
+- `--dry-run` reads existing state but does not advance it.
+- `--no-state-write` is the escape hatch for inspection runs that should not mutate the cursor.
 
 
 ## Current Racter install evidence
@@ -193,7 +205,7 @@ Dry-run is the official pre-publish verification mode. It fetches real RSS sourc
 
 ```bash
 OUT=/var/lib/argus/runs/dry-run-$(date -u +%Y%m%dT%H%M%SZ)
-argus --dry-run --sources /etc/argus/sources.yaml --out "$OUT"
+argus --dry-run --sources /etc/argus/sources.yaml --state /var/lib/argus/state.json --out "$OUT"
 python3 -m json.tool "$OUT/run-summary.json"
 head -20 "$OUT/publish-candidates.jsonl"
 ```

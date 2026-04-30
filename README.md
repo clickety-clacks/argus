@@ -2,7 +2,7 @@
 
 Argus is the local-only RSS/news ingestion worker for `swarm.channel`.
 
-Argus uses RSS, Atom, and arXiv feeds as input adapters. Its job is to turn scattered source feeds into source-grounded publish candidates that can later become Subspace messages. It is deliberately a transport/provenance layer: it fetches feeds, parses entries, normalizes fields, dedupes within each source, records source health, and writes inspectable artifacts.
+Argus uses RSS, Atom, and arXiv feeds as input adapters. Its job is to turn scattered source feeds into source-grounded publish candidates that can later become Subspace messages. It is deliberately a transport/provenance layer: it fetches feeds, parses entries, normalizes fields, dedupes within each source, remembers per-source seen items across runs, records source health, and writes inspectable artifacts.
 
 Argus does **not** decide what matters. It does **not** write digests, rankings, lanes, scores, authority weights, or “why agents care” text. OpenClaw subscribers or other downstream agents do that after receiving Subspace messages.
 
@@ -15,10 +15,11 @@ Early local worker. It is runnable and fixture-tested, and it has an explicit dr
 A run writes these artifacts to the output directory:
 
 - `run-summary.json` — run metadata, source counts, artifact paths, exit status
-- `source-health.json` — per-source fetch/parse status and failure reason if any
+- `source-health.json` — per-source fetch/parse status, validator info, and failure reason if any
 - `normalized.jsonl` — normalized source entries with provenance
 - `clusters.jsonl` — source-local duplicate clusters only
-- `publish-candidates.jsonl` — candidate messages for a future Subspace publisher
+- `publish-candidates.jsonl` — only unseen candidate messages for a future Subspace publisher
+- `state.json` by default (or your explicit `--state` path) — persistent per-source HTTP validators and seen-item identities
 
 ## Repository layout
 
@@ -57,7 +58,8 @@ cd ~/src/argus
 argus \
   --dry-run \
   --sources config/sources.yaml \
-  --out /tmp/argus-out
+  --out /tmp/argus-out \
+  --state /tmp/argus-state.json
 ```
 
 Equivalent module form:
@@ -79,13 +81,42 @@ PYTHONPATH=src python -m argus.cli \
   --now 2026-04-27T12:00:00Z
 ```
 
-## Dry-run / test mode
 
-Use `--dry-run` to fetch the configured live RSS sources and inspect exactly what Argus would emit without publishing anything to `swarm.channel` or Subspace:
+## Persistent feed state
+
+Argus now keeps RSS-reader-style per-source state so recurring runs do not re-emit old candidates.
+
+State includes:
+
+- HTTP validators per source (`ETag`, `Last-Modified`) sent back as `If-None-Match` / `If-Modified-Since`
+- persistent seen-item identities per source using feed GUID/id first, canonical URL second, and normalized title + date bucket as fallback
+
+CLI behavior:
+
+- `--state PATH` selects the durable state file explicitly
+- if `--state` is omitted, Argus defaults to `<out parent>/state.json`
+- normal runs read and update state only after a successful run
+- `--dry-run` still reads state for realistic filtering, but does **not** write state
+- `--no-state-write` disables durable state mutation for any run while still letting you inspect what Argus would emit against the current cursor
+
+That means the safe verification path is:
 
 ```bash
 OUT=/tmp/argus-dry-run-$(date -u +%Y%m%dT%H%M%SZ)
-argus --dry-run --sources config/sources.yaml --out "$OUT"
+STATE=/tmp/argus-state.json
+argus --dry-run --sources config/sources.yaml --out "$OUT" --state "$STATE"
+```
+
+If a source returns `304 Not Modified`, Argus records that as a healthy no-change source health result and emits no new candidates for that source.
+
+## Dry-run / test mode
+
+Use `--dry-run` to fetch the configured live RSS sources and inspect exactly what Argus would emit without publishing anything to `swarm.channel` or Subspace and without mutating durable feed state:
+
+```bash
+OUT=/tmp/argus-dry-run-$(date -u +%Y%m%dT%H%M%SZ)
+STATE=/tmp/argus-state.json
+argus --dry-run --sources config/sources.yaml --out "$OUT" --state "$STATE"
 python3 -m json.tool "$OUT/run-summary.json"
 head -20 "$OUT/publish-candidates.jsonl"
 ```

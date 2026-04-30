@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import shutil
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from argus.pipeline import read_source_config, run_pipeline
+from argus.pipeline import default_state_path, read_source_config, run_pipeline
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "argus"
 FEEDS = FIXTURE_ROOT / "feeds"
@@ -46,6 +47,8 @@ class PipelineTests(unittest.TestCase):
                     "publish-candidates.jsonl",
                 ]:
                     self.assertTrue((Path(tmpdir) / name).exists(), name)
+                self.assertEqual(summary["state"]["path"], str(default_state_path(Path(tmpdir))))
+                self.assertTrue(summary["state"]["write_performed"])
 
     def test_artifacts_preserve_provenance_and_community_labeling(self):
         from tempfile import TemporaryDirectory
@@ -106,6 +109,93 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(exit_code, 1)
             self.assertEqual(summary["exit_status"], "failed")
+
+    def test_state_filters_repeated_items_and_emits_only_new_additions(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmpdir:
+            fixture_dir = Path(tmpdir) / "fixtures"
+            fixture_dir.mkdir()
+            shutil.copy(FEEDS / "stateful_source.xml", fixture_dir / "stateful_source.xml")
+            shutil.copy(FIXTURE_ROOT / "stateful-sources.yaml", Path(tmpdir) / "stateful-sources.yaml")
+            state_path = Path(tmpdir) / "argus-state.json"
+            out1 = Path(tmpdir) / "run1"
+            out2 = Path(tmpdir) / "run2"
+            out3 = Path(tmpdir) / "run3"
+
+            _, summary1 = run_pipeline(Path(tmpdir) / "stateful-sources.yaml", out1, now=NOW, fixture_dir=fixture_dir, state_path=state_path)
+            self.assertEqual(summary1["counts"]["publish_candidates"], 2)
+            self.assertTrue(state_path.exists())
+
+            _, summary2 = run_pipeline(Path(tmpdir) / "stateful-sources.yaml", out2, now=NOW, fixture_dir=fixture_dir, state_path=state_path)
+            self.assertEqual(summary2["counts"]["publish_candidates"], 0)
+            health2 = read_json(out2 / "source-health.json")
+            self.assertEqual(health2[0]["skipped_previously_seen_count"], 2)
+
+            xml_path = fixture_dir / "stateful_source.xml"
+            xml_text = xml_path.read_text()
+            xml_path.write_text(
+                xml_text.replace(
+                    "</channel>\n</rss>",
+                    """    <item>\n      <guid>stateful-guid-3</guid>\n      <title>Third story</title>\n      <link>https://stateful.example/story-3?utm_source=rss</link>\n      <pubDate>Wed, 30 Apr 2026 10:00:00 +0000</pubDate>\n      <description>Brand new story.</description>\n    </item>\n  </channel>\n</rss>""",
+                )
+            )
+            _, summary3 = run_pipeline(Path(tmpdir) / "stateful-sources.yaml", out3, now=NOW, fixture_dir=fixture_dir, state_path=state_path)
+            self.assertEqual(summary3["counts"]["publish_candidates"], 1)
+            candidates3 = read_jsonl(out3 / "publish-candidates.jsonl")
+            self.assertEqual([row["title"] for row in candidates3], ["Third story"])
+
+    def test_state_supports_http_304_without_re_emitting(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmpdir:
+            fixture_dir = Path(tmpdir) / "fixtures"
+            fixture_dir.mkdir()
+            shutil.copy(FEEDS / "stateful_source.xml", fixture_dir / "stateful_source.xml")
+            shutil.copy(FIXTURE_ROOT / "stateful-sources.yaml", Path(tmpdir) / "stateful-sources.yaml")
+            meta_path = fixture_dir / "stateful_source.meta.json"
+            meta_path.write_text(json.dumps({"etag": "\"stateful-etag-v1\"", "last_modified": "Wed, 30 Apr 2026 09:00:00 GMT"}))
+            state_path = Path(tmpdir) / "argus-state.json"
+
+            run_pipeline(Path(tmpdir) / "stateful-sources.yaml", Path(tmpdir) / "run1", now=NOW, fixture_dir=fixture_dir, state_path=state_path)
+            meta_path.write_text(
+                json.dumps(
+                    {
+                        "status_code": 304,
+                        "etag": "\"stateful-etag-v1\"",
+                        "last_modified": "Wed, 30 Apr 2026 09:00:00 GMT",
+                        "if_none_match": "\"stateful-etag-v1\"",
+                    }
+                )
+            )
+            _, summary = run_pipeline(Path(tmpdir) / "stateful-sources.yaml", Path(tmpdir) / "run2", now=NOW, fixture_dir=fixture_dir, state_path=state_path)
+            self.assertEqual(summary["counts"]["publish_candidates"], 0)
+            health = read_json(Path(tmpdir) / "run2" / "source-health.json")
+            self.assertEqual(health[0]["status"], "not_modified")
+            self.assertEqual(health[0]["http_status"], 304)
+
+    def test_dry_run_reads_state_but_does_not_write_it(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmpdir:
+            fixture_dir = Path(tmpdir) / "fixtures"
+            fixture_dir.mkdir()
+            shutil.copy(FEEDS / "stateful_source.xml", fixture_dir / "stateful_source.xml")
+            shutil.copy(FIXTURE_ROOT / "stateful-sources.yaml", Path(tmpdir) / "stateful-sources.yaml")
+            state_path = Path(tmpdir) / "argus-state.json"
+
+            _, summary = run_pipeline(
+                Path(tmpdir) / "stateful-sources.yaml",
+                Path(tmpdir) / "run1",
+                now=NOW,
+                fixture_dir=fixture_dir,
+                state_path=state_path,
+                dry_run=True,
+                state_write=False,
+            )
+            self.assertFalse(state_path.exists())
+            self.assertFalse(summary["state"]["write_enabled"])
+            self.assertFalse(summary["state"]["write_performed"])
 
 
 if __name__ == "__main__":

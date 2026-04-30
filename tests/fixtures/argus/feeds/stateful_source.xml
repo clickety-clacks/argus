@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Stateful Source</title>
+    <item>
+      <guid>stateful-guid-1</guid>
+      <title>First story</title>
+      <link>https://stateful.example/story-1?utm_source=rss</link>
+      <pubDate>Tue, 29 Apr 2026 07:00:00 +0000</pubDate>
+      <description>First stateful story.</description>
+    </item>
+    <item>
+      <guid>stateful-guid-2</guid>
+      <title>Second story</title>
+      <link>https://stateful.example/story-2?utm_medium=email</link>
+      <pubDate>Tue, 29 Apr 2026 08:00:00 +0000</pubDate>
+      <description>Second stateful story.</description>
+    </item>
+  </channel>
+</rss>
