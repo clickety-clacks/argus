@@ -142,6 +142,10 @@ On eezo, the current local run against `config/sources.yaml` verified:
 - 1,907 normalized entries
 - 1,907 publish candidates
 
+## Install/deploy
+
+See [`docs/DEPLOY.md`](docs/DEPLOY.md) for the official install layout, Racter target layout, scheduling options, verification gate, upgrade, and rollback notes.
+
 ## Non-goals for this repo right now
 
 - no cron or scheduler
