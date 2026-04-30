@@ -157,12 +157,25 @@ The `ExecStart` output path should usually be replaced with a wrapper script tha
 
 Use launchd only for Mac hosts. Keep config in `~/.config/swarm-news-ingest` and output in `~/.local/state/swarm-news-ingest` for single-user installs.
 
+## Dry-run before deploy
+
+Dry-run is the official pre-publish verification mode. It fetches real RSS sources and writes the same local artifacts, but performs no Subspace publish:
+
+```bash
+OUT=/var/lib/swarm-news-ingest/runs/dry-run-$(date -u +%Y%m%dT%H%M%SZ)
+swarm-news-ingest --dry-run --sources /etc/swarm-news-ingest/sources.yaml --out "$OUT"
+python3 -m json.tool "$OUT/run-summary.json"
+head -20 "$OUT/publish-candidates.jsonl"
+```
+
+For Racter, run this after install and before enabling any scheduler or publisher. The current worker has no publisher, so all runs are non-publishing; the flag exists to make the safety boundary explicit and durable.
+
 ## Verification gate
 
 Before calling any install healthy:
 
 ```bash
-swarm-news-ingest --sources <config-path> --out <fresh-output-dir>
+swarm-news-ingest --dry-run --sources <config-path> --out <fresh-output-dir>
 ```
 
 Then verify:

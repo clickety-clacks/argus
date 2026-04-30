@@ -55,6 +55,7 @@ python -m pip install -e .
 cd ~/src/swarm-news-ingest
 . .venv/bin/activate
 swarm-news-ingest \
+  --dry-run \
   --sources config/sources.yaml \
   --out /tmp/swarm-news-out
 ```
@@ -63,6 +64,7 @@ Equivalent module form:
 
 ```bash
 PYTHONPATH=src python -m swarm_news_ingest.cli \
+  --dry-run \
   --sources config/sources.yaml \
   --out /tmp/swarm-news-out
 ```
@@ -71,10 +73,24 @@ For deterministic run IDs/timestamps during verification, pass `--now`:
 
 ```bash
 PYTHONPATH=src python -m swarm_news_ingest.cli \
+  --dry-run \
   --sources config/sources.yaml \
   --out /tmp/swarm-news-out \
   --now 2026-04-27T12:00:00Z
 ```
+
+## Dry-run / test mode
+
+Use `--dry-run` to fetch the configured live RSS sources and inspect exactly what the worker would emit without publishing anything to `swarm.channel` or Subspace:
+
+```bash
+OUT=/tmp/swarm-news-dry-run-$(date -u +%Y%m%dT%H%M%SZ)
+swarm-news-ingest --dry-run --sources config/sources.yaml --out "$OUT"
+python3 -m json.tool "$OUT/run-summary.json"
+head -20 "$OUT/publish-candidates.jsonl"
+```
+
+Current code is local-artifact-only, so `--dry-run` is explicit operator intent plus run metadata. Future publisher work must keep this flag as the safe verification path.
 
 ## Run tests
 

@@ -443,7 +443,13 @@ def read_fixture_feed(fixture_dir: Path, source: SourceConfig) -> Tuple[str, Opt
     return feed_path.read_text(), 200, "application/xml", 1
 
 
-def run_pipeline(sources_path: Path, output_dir: Path, now: datetime, fixture_dir: Optional[Path] = None) -> Tuple[int, Dict[str, Any]]:
+def run_pipeline(
+    sources_path: Path,
+    output_dir: Path,
+    now: datetime,
+    fixture_dir: Optional[Path] = None,
+    dry_run: bool = False,
+) -> Tuple[int, Dict[str, Any]]:
     sources = read_source_config(sources_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -596,6 +602,8 @@ def run_pipeline(sources_path: Path, output_dir: Path, now: datetime, fixture_di
             "clusters": "clusters.jsonl",
             "publish_candidates": "publish-candidates.jsonl",
         },
+        "dry_run": dry_run,
+        "publish_performed": False,
     }
 
     write_json(output_dir / "run-summary.json", run_summary)
@@ -612,6 +620,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--now", type=str)
     parser.add_argument("--fixture-dir", type=Path)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch live sources and write local artifacts only. This is currently the default behavior; the flag is explicit operator intent and run metadata.",
+    )
     return parser
 
 
@@ -619,7 +632,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     now = parse_now(args.now)
     try:
-        exit_code, run_summary = run_pipeline(args.sources, args.out, now, fixture_dir=args.fixture_dir)
+        exit_code, run_summary = run_pipeline(args.sources, args.out, now, fixture_dir=args.fixture_dir, dry_run=args.dry_run)
     except PipelineError as exc:
         print(str(exc), file=sys.stderr)
         return 1
