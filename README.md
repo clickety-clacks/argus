@@ -154,9 +154,9 @@ On Racter, the current dry run against `config/sources.yaml` verified:
 
 - 13 configured/enabled/fetched sources
 - 0 failed sources
-- 1,907 raw entries
-- 1,907 normalized entries
-- 1,907 publish candidates
+- 1,906 raw entries
+- 1,906 normalized entries
+- 1,906 publish candidates
 - `publish_performed: false`
 
 ## Install/deploy

@@ -119,8 +119,8 @@ config: /etc/argus/sources.yaml
 output root: /var/lib/argus/runs/
 command: /usr/local/bin/argus
 run user: argus
-verified commit: pre-rename 646381c; Argus rename pending Racter migration
-latest verified dry run: /var/lib/argus/runs/dry-run-20260430T085742Z
+verified commit: fd286a4
+latest verified dry run: /var/lib/argus/runs/dry-run-20260430T185027Z
 ```
 
 Latest verified dry run result:
@@ -131,8 +131,8 @@ publish_performed: false
 exit_status: success
 configured/enabled/fetched sources: 13/13/13
 failed sources: 0
-normalized entries: 1,907
-publish candidates: 1,907
+normalized entries: 1,906
+publish candidates: 1,906
 ```
 
 No scheduler/timer and no Subspace publisher are installed yet.
