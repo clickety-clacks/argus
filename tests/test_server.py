@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import unittest
 from datetime import datetime, timezone
@@ -17,11 +18,14 @@ NOW = datetime(2026, 4, 29, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def write_config(root: Path, *, mode: str = "interval", interval: str = "1h", publish: dict | None = None) -> Path:
+    fixture_dir = root / "feeds"
+    fixture_dir.mkdir(exist_ok=True)
+    shutil.copy(FEEDS / "stateful_source.xml", fixture_dir / "stateful-source.xml")
     config = {
         "runtime": {
             "database_path": str(root / "argus.sqlite3"),
             "output_dir": str(root / "out"),
-            "fixture_dir": str(FEEDS),
+            "fixture_dir": str(fixture_dir),
         },
         "schedule": {
             "mode": mode,
@@ -33,10 +37,10 @@ def write_config(root: Path, *, mode: str = "interval", interval: str = "1h", pu
         "publish": publish or {"state": "inactive"},
         "sources": [
             {
-                "id": "stateful_source",
+                "id": "stateful-source",
                 "display_name": "Stateful Source",
                 "source_class": "editorial",
-                "feed_url": "https://fixture.invalid/stateful_source.xml",
+                "feed_url": "https://fixture.invalid/stateful-source.xml",
                 "site_url": "https://stateful.example/",
                 "adapter": "rss",
                 "enabled": True,
@@ -111,7 +115,8 @@ class ServerTests(unittest.TestCase):
             self.assertTrue(summary["prime"])
             run_dir = next((root / "out" / "runs").glob("20260429T120000Z-prime-*"))
             self.assertTrue((run_dir / "prime-baseline.json").exists())
-            self.assertEqual((run_dir / "package-candidates.jsonl").read_text(), "")
+            self.assertFalse((run_dir / "publish-candidates.jsonl").exists())
+            self.assertFalse((run_dir / "package-candidates.jsonl").exists())
             self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
             self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
 
@@ -120,8 +125,8 @@ class ServerTests(unittest.TestCase):
             root = Path(tmpdir)
             path = write_config(root, publish={"state": "inactive"})
             fixture_dir = root / "feeds"
-            fixture_dir.mkdir()
-            (fixture_dir / "stateful_source.xml").write_text((FEEDS / "stateful_source.xml").read_text())
+            fixture_dir.mkdir(exist_ok=True)
+            (fixture_dir / "stateful-source.xml").write_text((FEEDS / "stateful_source.xml").read_text())
             config = yaml.safe_load(path.read_text())
             config["runtime"]["fixture_dir"] = str(fixture_dir)
             path.write_text(yaml.safe_dump(config))
@@ -147,7 +152,7 @@ class ServerTests(unittest.TestCase):
                 path.write_text(yaml.safe_dump(config))
                 server.reload()
                 clock.advance(3600)
-                (fixture_dir / "stateful_source.xml").write_text(
+                (fixture_dir / "stateful-source.xml").write_text(
                     (FEEDS / "stateful_source.xml").read_text().replace(
                         "  </channel>\n</rss>",
                         """    <item>\n      <guid>stateful-guid-3</guid>\n      <title>Third story</title>\n      <link>https://stateful.example/story-3</link>\n      <pubDate>Wed, 30 Apr 2026 10:00:00 +0000</pubDate>\n      <description>Brand new story.</description>\n    </item>\n  </channel>\n</rss>""",
@@ -165,7 +170,15 @@ class ServerTests(unittest.TestCase):
     def test_invalid_reload_fails_closed_from_active(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "active", "live_approval": True, "subspace_endpoint": "https://subspace.invalid"})
+            path = write_config(
+                root,
+                publish={
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.invalid",
+                    "allow_non_embedded_fallback": True,
+                },
+            )
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
                 self.assertEqual(server.status()["publish"]["effective_mode"], "active")
@@ -252,9 +265,138 @@ class ServerTests(unittest.TestCase):
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
                 server.tick()
+                self.assertEqual(server.status()["publish"]["effective_mode"], "blocked")
             finally:
                 server.close()
             self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+
+    def test_configured_embedding_backend_does_not_imply_candidate_embeddings(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.invalid",
+                    "require_embeddings": True,
+                },
+            )
+            config = yaml.safe_load(path.read_text())
+            config["embedding"] = {
+                "backend": "cli",
+                "command": "/definitely/not/invoked",
+                "model": "text-embedding-3-small",
+                "dimensions": 1536,
+                "space_id": "openai:text-embedding-3-small:1536:v1",
+            }
+            path.write_text(yaml.safe_dump(config))
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                self.assertEqual(server.status()["publish"]["effective_mode"], "active")
+                server.tick()
+            finally:
+                server.close()
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+
+    def test_active_no_backfill_even_if_historical_report_reprocessed(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            clock = FakeClock(NOW)
+            server = ArgusServer(path, clock=clock)
+            try:
+                server.tick()
+                inactive_package_ids = {row["package_id"] for row in rows(root / "argus.sqlite3", "packages")}
+                (root / "out" / "state.json").unlink()
+                config = yaml.safe_load(path.read_text())
+                config["publish"] = {
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.invalid",
+                    "allow_non_embedded_fallback": True,
+                }
+                path.write_text(yaml.safe_dump(config))
+                server.reload()
+                clock.advance(3600)
+                server.tick()
+            finally:
+                server.close()
+            packages = rows(root / "argus.sqlite3", "packages")
+            self.assertEqual({row["package_id"] for row in packages}, inactive_package_ids)
+            self.assertEqual(sum(row["active_eligible"] for row in packages), 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+
+    def test_invalid_scheduler_reload_keeps_publish_snapshot(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.invalid",
+                    "allow_non_embedded_fallback": True,
+                },
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                self.assertEqual(server.status()["publish"]["effective_mode"], "active")
+                config = yaml.safe_load(path.read_text())
+                for invalid_interval in ("1m", "bogus"):
+                    config["schedule"]["interval"] = invalid_interval
+                    path.write_text(yaml.safe_dump(config))
+                    server.reload()
+                    self.assertEqual(server.status()["publish"]["effective_mode"], "active")
+                config["schedule"]["interval"] = "1h"
+                config["schedule"]["jitter_seconds"] = "bogus"
+                path.write_text(yaml.safe_dump(config))
+                server.reload()
+                self.assertEqual(server.status()["publish"]["effective_mode"], "active")
+            finally:
+                server.close()
+            self.assertIn("scheduler_reload_failed", [row["event_type"] for row in rows(root / "argus.sqlite3", "scheduler_events")])
+
+    def test_invalid_scheduler_reload_with_publish_change_fails_inactive(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.invalid",
+                    "allow_non_embedded_fallback": True,
+                },
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                self.assertEqual(server.status()["publish"]["effective_mode"], "active")
+                config = yaml.safe_load(path.read_text())
+                config["publish"] = {"state": "inactive"}
+                config["schedule"]["interval"] = "1m"
+                path.write_text(yaml.safe_dump(config))
+                server.reload()
+                self.assertEqual(server.status()["publish"]["effective_mode"], "inactive")
+            finally:
+                server.close()
+
+    def test_server_config_rejects_invalid_source_id(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root)
+            config = yaml.safe_load(path.read_text())
+            config["sources"][0]["id"] = "stateful_source"
+            path.write_text(yaml.safe_dump(config))
+            with self.assertRaisesRegex(Exception, "Invalid source id"):
+                load_runtime_config(path)
+
+    def test_manual_mode_ignores_invalid_interval_value(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, mode="manual", interval="bogus")
+            config = load_runtime_config(path)
+            self.assertEqual(config.scheduler.mode, "manual")
 
 
 if __name__ == "__main__":

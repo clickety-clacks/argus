@@ -492,6 +492,7 @@ def cluster_id_for(source_id: str, identity_type: str, identity_value: str) -> s
 
 def candidate_for(report: Dict[str, Any], dedupe_identity: Dict[str, str]) -> Dict[str, Any]:
     candidate_basis = "{}|{}".format(report["report_id"], report["canonical_url"] or "")
+    embedding_text = " ".join(part for part in [report["title"], report["clean_summary"]] if part).strip()
     return {
         "schema_version": SCHEMA_VERSION,
         "candidate_id": hashlib.sha256(candidate_basis.encode("utf-8")).hexdigest()[:24],
@@ -512,7 +513,7 @@ def candidate_for(report: Dict[str, Any], dedupe_identity: Dict[str, str]) -> Di
             "source_category": report["source_category"],
         },
         "metadata": {
-            "embedding_text": " ".join(part for part in [report["title"], report["clean_summary"]] if part).strip(),
+            "embedding_text": embedding_text,
         },
     }
 
@@ -798,7 +799,7 @@ def run_pipeline_for_sources(
             "source_health": "source-health.json",
             "normalized": "normalized.jsonl",
             "clusters": "clusters.jsonl",
-            "publish_candidates": "publish-candidates.jsonl",
+            **({} if prime else {"publish_candidates": "publish-candidates.jsonl"}),
         },
         "dry_run": dry_run,
         "prime": prime,
@@ -815,7 +816,8 @@ def run_pipeline_for_sources(
     write_json(output_dir / "source-health.json", source_health)
     write_jsonl(output_dir / "normalized.jsonl", normalized_rows)
     write_jsonl(output_dir / "clusters.jsonl", clusters)
-    write_jsonl(output_dir / "publish-candidates.jsonl", publish_candidates)
+    if not prime:
+        write_jsonl(output_dir / "publish-candidates.jsonl", publish_candidates)
     return exit_code, run_summary
 
 

@@ -4,6 +4,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -21,6 +22,7 @@ from .pipeline import PipelineError, SourceConfig, iso_z, parse_now, run_pipelin
 MIN_INTERVAL_SECONDS = 15 * 60
 MAX_INTERVAL_SECONDS = 24 * 60 * 60
 DEFAULT_INTERVAL_SECONDS = 60 * 60
+SOURCE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -42,12 +44,23 @@ class PublishConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class EmbeddingConfig:
+    backend: Optional[str] = None
+    command: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    dimensions: Optional[int] = None
+    space_id: Optional[str] = None
+
+
+@dataclasses.dataclass(frozen=True)
 class RuntimeConfig:
     database_path: Path
     output_dir: Path
     sources: List[SourceConfig]
     scheduler: SchedulerConfig
     publish: PublishConfig
+    embedding: EmbeddingConfig
     fixture_dir: Optional[Path] = None
     source_config_path: str = "<config>"
     config_hash: str = ""
@@ -85,16 +98,19 @@ class FakeClock(Clock):
 
 
 def parse_duration_seconds(value: Any) -> int:
-    if isinstance(value, int):
-        return value
-    text = str(value).strip()
-    if text.endswith("m"):
-        return int(text[:-1]) * 60
-    if text.endswith("h"):
-        return int(text[:-1]) * 60 * 60
-    if text.endswith("s"):
-        return int(text[:-1])
-    return int(text)
+    try:
+        if isinstance(value, int):
+            return value
+        text = str(value).strip()
+        if text.endswith("m"):
+            return int(text[:-1]) * 60
+        if text.endswith("h"):
+            return int(text[:-1]) * 60 * 60
+        if text.endswith("s"):
+            return int(text[:-1])
+        return int(text)
+    except (TypeError, ValueError):
+        raise PipelineError("Invalid schedule.interval: {}".format(value))
 
 
 def config_hash(payload: Any) -> str:
@@ -111,8 +127,11 @@ def validate_scheduler(payload: Dict[str, Any]) -> SchedulerConfig:
     mode = str(payload.get("mode", "interval"))
     if mode not in {"interval", "manual"}:
         raise PipelineError("Invalid schedule.mode: {}".format(mode))
-    interval_seconds = parse_duration_seconds(payload.get("interval", "1h"))
-    jitter_seconds = int(payload.get("jitter_seconds", 0))
+    interval_seconds = DEFAULT_INTERVAL_SECONDS if mode == "manual" else parse_duration_seconds(payload.get("interval", "1h"))
+    try:
+        jitter_seconds = int(payload.get("jitter_seconds", 0))
+    except (TypeError, ValueError):
+        raise PipelineError("Invalid schedule.jitter_seconds: {}".format(payload.get("jitter_seconds")))
     missed_tick_policy = str(payload.get("missed_tick_policy", "coalesce_one"))
     if missed_tick_policy != "coalesce_one":
         raise PipelineError("Invalid schedule.missed_tick_policy: {}".format(missed_tick_policy))
@@ -134,6 +153,8 @@ def validate_scheduler(payload: Dict[str, Any]) -> SchedulerConfig:
 
 def source_from_runtime(row: Dict[str, Any]) -> SourceConfig:
     source_id = str(row["id"])
+    if not SOURCE_ID_RE.match(source_id):
+        raise PipelineError("Invalid source id: {}".format(source_id))
     feed_url = row.get("feed_url") or row.get("api_url")
     adapter = str(row.get("adapter", "rss"))
     feed_type = {"rss": "rss", "atom": "atom", "arxiv_atom": "arxiv_atom", "generic_rss": "rss"}.get(adapter, adapter)
@@ -181,6 +202,7 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
     if not any(source.enabled for source in sources):
         raise PipelineError("at least one enabled source is required")
     publish_payload = payload.get("publish") or {}
+    embedding_payload = payload.get("embedding") or {}
     publish = PublishConfig(
         state=str(publish_payload.get("state", "inactive")),
         live_approval=bool(publish_payload.get("live_approval", False)),
@@ -196,6 +218,14 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
         sources=sources,
         scheduler=validate_scheduler(payload.get("schedule") or {}),
         publish=publish,
+        embedding=EmbeddingConfig(
+            backend=(str(embedding_payload["backend"]) if embedding_payload.get("backend") else None),
+            command=(str(embedding_payload["command"]) if embedding_payload.get("command") else None),
+            provider=(str(embedding_payload["provider"]) if embedding_payload.get("provider") else None),
+            model=(str(embedding_payload["model"]) if embedding_payload.get("model") else None),
+            dimensions=(int(embedding_payload["dimensions"]) if embedding_payload.get("dimensions") is not None else None),
+            space_id=(str(embedding_payload["space_id"]) if embedding_payload.get("space_id") else None),
+        ),
         fixture_dir=(Path(runtime["fixture_dir"]) if runtime.get("fixture_dir") else None),
         source_config_path=str(path),
         config_hash=config_hash(payload),
@@ -230,6 +260,13 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
           created_at TEXT NOT NULL,
           active_eligible INTEGER NOT NULL,
           package_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS accepted_reports (
+          report_id TEXT PRIMARY KEY,
+          first_accepted_run_id TEXT NOT NULL,
+          first_effective_mode TEXT NOT NULL,
+          first_snapshot_id TEXT NOT NULL,
+          first_accepted_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS publish_attempts (
           attempt_id TEXT PRIMARY KEY,
@@ -326,6 +363,9 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
         elif not config.publish.subspace_endpoint:
             effective = "blocked"
             blocked_reason = "missing_subspace_endpoint"
+        elif config.publish.require_embeddings and not config.publish.allow_non_embedded_fallback and not embedding_config_valid(config.embedding):
+            effective = "blocked"
+            blocked_reason = "missing_embedding_config"
         else:
             effective = "active"
             activation_observed_at = iso_z(observed_at)
@@ -342,6 +382,18 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
         "blocked_reason": blocked_reason,
     }
     return snapshot
+
+
+def embedding_config_valid(config: EmbeddingConfig) -> bool:
+    if config.backend == "disabled":
+        return False
+    if not config.backend or not config.model or not config.dimensions or not config.space_id:
+        return False
+    if config.backend == "cli" and not config.command:
+        return False
+    if config.backend != "cli" and not config.provider:
+        return False
+    return True
 
 
 def store_runtime_snapshot(connection: sqlite3.Connection, snapshot: Dict[str, Any], event_type: str, status: str, error: Optional[str] = None) -> None:
@@ -387,6 +439,20 @@ def latest_snapshot(connection: sqlite3.Connection) -> Dict[str, Any]:
     if row is None:
         raise PipelineError("No runtime publish snapshot")
     return json.loads(row["snapshot_json"])
+
+
+def package_id_for(candidate: Dict[str, Any]) -> str:
+    supplied_embeddings = candidate.get("supplied_embeddings") or {}
+    vector_hash = supplied_embeddings.get("vector_hash") or hashlib.sha256(
+        json.dumps(supplied_embeddings, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    basis = "package:swarm.channel.news.report.v0\n{}\n{}\n{}\n{}".format(
+        candidate["report_id"],
+        candidate.get("schema_version", 1),
+        supplied_embeddings.get("space_id", ""),
+        vector_hash,
+    )
+    return "package:" + hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
 class ArgusServer:
@@ -466,6 +532,9 @@ class ArgusServer:
         try:
             new_config = load_runtime_config(self.config_path)
         except Exception as exc:
+            if (str(exc).startswith("Invalid schedule") or "schedule.jitter_seconds" in str(exc)) and self._reload_publish_inputs_unchanged():
+                self._record_scheduler_event("scheduler_reload_failed", None, "failed", {"error": str(exc)}, now)
+                return
             snapshot = build_publish_snapshot(self.config, now, force_inactive=True, error=str(exc))
             store_runtime_snapshot(self.connection, snapshot, "reload_failed", "failed", str(exc))
             self._record_scheduler_event("scheduler_reload_failed", None, "failed", {"error": str(exc)}, now)
@@ -475,6 +544,32 @@ class ArgusServer:
         store_runtime_snapshot(self.connection, snapshot, "reload", "ok")
         self._record_scheduler_config(new_config.scheduler, now, recompute_next=True)
         self._record_scheduler_event("scheduler_reload", None, "ok", {"mode": new_config.scheduler.mode}, now)
+
+    def _reload_publish_inputs_unchanged(self) -> bool:
+        try:
+            payload = yaml.safe_load(self.config_path.read_text())
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        publish_payload = payload.get("publish") or {}
+        embedding_payload = payload.get("embedding") or {}
+        publish = PublishConfig(
+            state=str(publish_payload.get("state", "inactive")),
+            live_approval=bool(publish_payload.get("live_approval", False)),
+            subspace_endpoint=(str(publish_payload["subspace_endpoint"]) if publish_payload.get("subspace_endpoint") else None),
+            require_embeddings=bool(publish_payload.get("require_embeddings", True)),
+            allow_non_embedded_fallback=bool(publish_payload.get("allow_non_embedded_fallback", False)),
+        )
+        embedding = EmbeddingConfig(
+            backend=(str(embedding_payload["backend"]) if embedding_payload.get("backend") else None),
+            command=(str(embedding_payload["command"]) if embedding_payload.get("command") else None),
+            provider=(str(embedding_payload["provider"]) if embedding_payload.get("provider") else None),
+            model=(str(embedding_payload["model"]) if embedding_payload.get("model") else None),
+            dimensions=(int(embedding_payload["dimensions"]) if embedding_payload.get("dimensions") is not None else None),
+            space_id=(str(embedding_payload["space_id"]) if embedding_payload.get("space_id") else None),
+        )
+        return publish == self.config.publish and embedding == self.config.embedding
 
     def set_publish_state(self, state: str) -> Dict[str, Any]:
         if state not in {"inactive", "active"}:
@@ -608,7 +703,6 @@ class ArgusServer:
         (output_dir / "prime-source-health.json").write_text((output_dir / "source-health.json").read_text())
         (output_dir / "prime-normalized-items.jsonl").write_text((output_dir / "normalized.jsonl").read_text())
         (output_dir / "prime-baseline.md").write_text("# Argus Prime Baseline\n\nNo live publish work was created.\n")
-        (output_dir / "package-candidates.jsonl").write_text("")
 
     def _store_run(self, run_id: str, run_kind: str, now: datetime, exit_code: int, output_dir: Path, snapshot: Dict[str, Any], summary: Dict[str, Any]) -> None:
         status = "succeeded" if exit_code == 0 else "failed"
@@ -622,9 +716,27 @@ class ArgusServer:
         candidates_path = output_dir / "publish-candidates.jsonl"
         rows = [json.loads(line) for line in candidates_path.read_text().splitlines() if line.strip()]
         for candidate in rows:
-            package_id = "package:" + hashlib.sha256(json.dumps(candidate, sort_keys=True).encode("utf-8")).hexdigest()
+            if self.reload_requested:
+                self.reload_requested = False
+                self.reload()
+                snapshot = latest_snapshot(self.connection)
+            self.connection.execute(
+                "INSERT OR IGNORE INTO accepted_reports VALUES (?, ?, ?, ?, ?)",
+                (
+                    candidate["report_id"],
+                    run_id,
+                    snapshot["effective_mode"],
+                    snapshot["snapshot_id"],
+                    iso_z(now),
+                ),
+            )
+            first = self.connection.execute(
+                "SELECT first_effective_mode FROM accepted_reports WHERE report_id = ?",
+                (candidate["report_id"],),
+            ).fetchone()
+            package_id = package_id_for(candidate)
             has_embedding = bool(candidate.get("supplied_embeddings") or candidate.get("embedding"))
-            publish_allowed = snapshot["effective_mode"] == "active" and (
+            publish_allowed = first["first_effective_mode"] == "active" and snapshot["effective_mode"] == "active" and (
                 not snapshot["require_embeddings"] or snapshot["allow_non_embedded_fallback"] or has_embedding
             )
             self.connection.execute(

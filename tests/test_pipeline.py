@@ -220,7 +220,7 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(summary1["state"]["write_performed"])
             self.assertEqual(summary1["counts"]["publish_candidates"], 0)
             self.assertEqual(summary1["counts"]["primed_candidates"], 2)
-            self.assertEqual(read_jsonl(Path(tmpdir) / "prime" / "publish-candidates.jsonl"), [])
+            self.assertFalse((Path(tmpdir) / "prime" / "publish-candidates.jsonl").exists())
 
             _, summary2 = run_pipeline(
                 Path(tmpdir) / "stateful-sources.yaml",
