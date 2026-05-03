@@ -561,6 +561,30 @@ def run_pipeline(
     state_write: bool = True,
 ) -> Tuple[int, Dict[str, Any]]:
     sources = read_source_config(sources_path)
+    return run_pipeline_for_sources(
+        sources,
+        str(sources_path),
+        output_dir,
+        now,
+        fixture_dir=fixture_dir,
+        dry_run=dry_run,
+        prime=prime,
+        state_path=state_path,
+        state_write=state_write,
+    )
+
+
+def run_pipeline_for_sources(
+    sources: List[SourceConfig],
+    source_config_path: str,
+    output_dir: Path,
+    now: datetime,
+    fixture_dir: Optional[Path] = None,
+    dry_run: bool = False,
+    prime: bool = False,
+    state_path: Optional[Path] = None,
+    state_write: bool = True,
+) -> Tuple[int, Dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     effective_state_path = state_path or default_state_path(output_dir)
     state = load_state(effective_state_path)
@@ -756,7 +780,7 @@ def run_pipeline(
         "started_at": iso_z(now),
         "finished_at": iso_z(utc_now()),
         "now": iso_z(now),
-        "source_config_path": str(sources_path),
+        "source_config_path": source_config_path,
         "output_dir": str(output_dir),
         "exit_status": exit_status,
         "counts": {
@@ -816,7 +840,100 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_command_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Argus server-mode RSS ingestion")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    serve = subparsers.add_parser("serve", help="Start the long-running Argus server")
+    serve.add_argument("--config", required=True, type=Path)
+    serve.add_argument("--once", action="store_true", help="Run one scheduler decision and exit. Intended for deterministic tests.")
+
+    prime = subparsers.add_parser("prime", help="Run an explicit baseline prime cycle")
+    prime.add_argument("--config", required=True, type=Path)
+
+    run_cycle = subparsers.add_parser("run-cycle", help="Run one normal manual cycle")
+    run_cycle.add_argument("--config", required=True, type=Path)
+    run_cycle.add_argument("--reason", default="manual")
+
+    set_publish = subparsers.add_parser("set-publish-state", help="Record a publish-state snapshot")
+    set_publish.add_argument("--config", required=True, type=Path)
+    set_publish.add_argument("--state", required=True, choices=["inactive", "active"])
+
+    reload_parser = subparsers.add_parser("reload", help="Reload scheduler and publish config")
+    reload_parser.add_argument("--config", required=True, type=Path)
+
+    status = subparsers.add_parser("status", help="Print runtime status")
+    status.add_argument("--db", required=True, type=Path)
+
+    health = subparsers.add_parser("source-health", help="Print last source-health artifact")
+    health.add_argument("--db", required=True, type=Path)
+
+    explain = subparsers.add_parser("explain-skip", help="Print run explanation details")
+    explain.add_argument("--db", required=True, type=Path)
+    explain.add_argument("--run", required=True)
+    return parser
+
+
+def command_main(argv: List[str]) -> int:
+    from .server import ArgusServer, explain_skip, request_process_reload, run_source_health, run_status
+
+    args = build_command_parser().parse_args(argv)
+    try:
+        if args.command == "serve":
+            server = ArgusServer(args.config)
+            try:
+                if args.once:
+                    result = server.tick()
+                    print(json.dumps(result[1] if result else server.status(), indent=2))
+                    return result[0] if result else 0
+                return server.serve_forever()
+            finally:
+                server.close()
+        if args.command == "prime":
+            server = ArgusServer(args.config, register_service=False)
+            try:
+                exit_code, summary = server.prime()
+                print(json.dumps(summary, indent=2))
+                return exit_code
+            finally:
+                server.close()
+        if args.command == "run-cycle":
+            server = ArgusServer(args.config, register_service=False)
+            try:
+                exit_code, summary = server.manual_cycle()
+                print(json.dumps(summary, indent=2))
+                return exit_code
+            finally:
+                server.close()
+        if args.command == "set-publish-state":
+            server = ArgusServer(args.config, register_service=False)
+            try:
+                print(json.dumps(server.set_publish_state(args.state), indent=2))
+                return 0
+            finally:
+                server.close()
+        if args.command == "reload":
+            print(json.dumps(request_process_reload(args.config), indent=2))
+            return 0
+        if args.command == "status":
+            print(json.dumps(run_status(args.db), indent=2))
+            return 0
+        if args.command == "source-health":
+            print(json.dumps(run_source_health(args.db), indent=2))
+            return 0
+        if args.command == "explain-skip":
+            print(json.dumps(explain_skip(args.db, args.run), indent=2))
+            return 0
+    except PipelineError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    return 2
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(argv if argv is not None else sys.argv[1:])
+    if argv and argv[0] in {"serve", "prime", "run-cycle", "set-publish-state", "reload", "status", "source-health", "explain-skip"}:
+        return command_main(argv)
     args = build_parser().parse_args(argv)
     if args.dry_run and args.prime:
         print("--prime and --dry-run are mutually exclusive", file=sys.stderr)
