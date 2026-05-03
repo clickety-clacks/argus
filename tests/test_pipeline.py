@@ -197,6 +197,40 @@ class PipelineTests(unittest.TestCase):
             self.assertFalse(summary["state"]["write_enabled"])
             self.assertFalse(summary["state"]["write_performed"])
 
+    def test_prime_advances_state_without_emitting_publish_candidates(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmpdir:
+            fixture_dir = Path(tmpdir) / "fixtures"
+            fixture_dir.mkdir()
+            shutil.copy(FEEDS / "stateful_source.xml", fixture_dir / "stateful_source.xml")
+            shutil.copy(FIXTURE_ROOT / "stateful-sources.yaml", Path(tmpdir) / "stateful-sources.yaml")
+            state_path = Path(tmpdir) / "argus-state.json"
+
+            _, summary1 = run_pipeline(
+                Path(tmpdir) / "stateful-sources.yaml",
+                Path(tmpdir) / "prime",
+                now=NOW,
+                fixture_dir=fixture_dir,
+                state_path=state_path,
+                prime=True,
+            )
+            self.assertTrue(state_path.exists())
+            self.assertTrue(summary1["prime"])
+            self.assertTrue(summary1["state"]["write_performed"])
+            self.assertEqual(summary1["counts"]["publish_candidates"], 0)
+            self.assertEqual(summary1["counts"]["primed_candidates"], 2)
+            self.assertEqual(read_jsonl(Path(tmpdir) / "prime" / "publish-candidates.jsonl"), [])
+
+            _, summary2 = run_pipeline(
+                Path(tmpdir) / "stateful-sources.yaml",
+                Path(tmpdir) / "after",
+                now=NOW,
+                fixture_dir=fixture_dir,
+                state_path=state_path,
+            )
+            self.assertEqual(summary2["counts"]["publish_candidates"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -199,6 +199,18 @@ The `ExecStart` output path should usually be replaced with a wrapper script tha
 
 Use launchd only for Mac hosts. Keep config in `~/.config/argus` and output in `~/.local/state/argus` for single-user installs.
 
+## Prime before first publisher activation
+
+Before enabling any future Subspace publisher, run one `--prime` pass against the durable production state path. This fetches all configured sources, advances HTTP validators and seen-item identities, writes inspection artifacts, emits no publish candidates, and performs no Subspace publish. Subsequent active runs using the same state should only see items that arrived after the priming fetch.
+
+```bash
+OUT=/var/lib/argus/runs/prime-$(date -u +%Y%m%dT%H%M%SZ)
+argus --prime --sources /etc/argus/sources.yaml --state /var/lib/argus/state.json --out "$OUT"
+python3 -m json.tool "$OUT/run-summary.json"
+```
+
+Do not use `--dry-run` for priming; dry-run intentionally does not mutate durable state.
+
 ## Dry-run before deploy
 
 Dry-run is the official pre-publish verification mode. It fetches real RSS sources and writes the same local artifacts, but performs no Subspace publish:

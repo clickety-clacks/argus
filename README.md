@@ -109,6 +109,21 @@ argus --dry-run --sources config/sources.yaml --out "$OUT" --state "$STATE"
 
 If a source returns `304 Not Modified`, Argus records that as a healthy no-change source health result and emits no new candidates for that source.
 
+## Prime mode
+
+Use `--prime` for the first safe baseline fetch before activating a future publisher. Prime mode fetches sources, writes normal inspection artifacts, advances durable HTTP validators and seen-item state, but emits no publish candidates and never publishes to Subspace.
+
+```bash
+OUT=/var/lib/argus/runs/prime-$(date -u +%Y%m%dT%H%M%SZ)
+argus --prime --sources /etc/argus/sources.yaml --state /var/lib/argus/state.json --out "$OUT"
+python3 -m json.tool "$OUT/run-summary.json"
+```
+
+`--prime` and `--dry-run` are mutually exclusive:
+
+- `--dry-run` = inspect without state mutation
+- `--prime` = advance state without publish candidates
+
 ## Dry-run / test mode
 
 Use `--dry-run` to fetch the configured live RSS sources and inspect exactly what Argus would emit without publishing anything to `swarm.channel` or Subspace and without mutating durable feed state:

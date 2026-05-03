@@ -556,6 +556,7 @@ def run_pipeline(
     now: datetime,
     fixture_dir: Optional[Path] = None,
     dry_run: bool = False,
+    prime: bool = False,
     state_path: Optional[Path] = None,
     state_write: bool = True,
 ) -> Tuple[int, Dict[str, Any]]:
@@ -569,6 +570,7 @@ def run_pipeline(
     normalized_rows: List[Dict[str, Any]] = []
     clusters: List[Dict[str, Any]] = []
     publish_candidates: List[Dict[str, Any]] = []
+    primed_candidates = 0
     duplicate_count = 0
     fetched_sources = 0
     failed_sources = 0
@@ -677,8 +679,11 @@ def run_pipeline(
                     skipped_seen_count += 1
                     continue
 
-                emitted_count += 1
-                publish_candidates.append(candidate_for(report, {"primary": identity[1], "value": identity[2]}))
+                if prime:
+                    primed_candidates += 1
+                else:
+                    emitted_count += 1
+                    publish_candidates.append(candidate_for(report, {"primary": identity[1], "value": identity[2]}))
                 for key in identity_keys:
                     seen_identities.add(key)
 
@@ -763,6 +768,7 @@ def run_pipeline(
             "normalized_entries": len(normalized_rows),
             "source_local_duplicates": duplicate_count,
             "publish_candidates": len(publish_candidates),
+            "primed_candidates": primed_candidates,
         },
         "artifact_paths": {
             "source_health": "source-health.json",
@@ -771,6 +777,7 @@ def run_pipeline(
             "publish_candidates": "publish-candidates.jsonl",
         },
         "dry_run": dry_run,
+        "prime": prime,
         "publish_performed": False,
         "state": {
             "path": str(effective_state_path),
@@ -801,11 +808,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fetch sources and write local artifacts only. Dry runs read state for filtering but do not write state unless future behavior explicitly changes.",
     )
+    parser.add_argument(
+        "--prime",
+        action="store_true",
+        help="Fetch sources, advance durable seen-state/validators, and emit no publish candidates. Mutually exclusive with --dry-run.",
+    )
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.dry_run and args.prime:
+        print("--prime and --dry-run are mutually exclusive", file=sys.stderr)
+        return 2
     now = parse_now(args.now)
     state_write = not args.no_state_write and not args.dry_run
     try:
@@ -815,6 +830,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             now,
             fixture_dir=args.fixture_dir,
             dry_run=args.dry_run,
+            prime=args.prime,
             state_path=args.state,
             state_write=state_write,
         )
