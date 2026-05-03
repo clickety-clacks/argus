@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import yaml
 
-from .pipeline import PipelineError, SourceConfig, iso_z, parse_now, run_pipeline_for_sources, utc_now
+from .pipeline import PipelineError, SourceConfig, date_bucket, iso_z, normalize_feed_entry_id, normalize_title, parse_now, run_pipeline_for_sources, utc_now
 
 
 MIN_INTERVAL_SECONDS = 15 * 60
@@ -256,10 +256,14 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS packages (
           package_id TEXT PRIMARY KEY,
           report_id TEXT NOT NULL,
-          run_id TEXT NOT NULL,
-          created_at TEXT NOT NULL,
+          schema_version TEXT NOT NULL,
+          embedding_space_id TEXT,
+          embedding_vector_hash TEXT,
           active_eligible INTEGER NOT NULL,
-          package_json TEXT NOT NULL
+          package_json TEXT NOT NULL,
+          created_run_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          UNIQUE (report_id, schema_version, embedding_space_id, embedding_vector_hash)
         );
         CREATE TABLE IF NOT EXISTS accepted_reports (
           report_id TEXT PRIMARY KEY,
@@ -268,14 +272,91 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
           first_snapshot_id TEXT NOT NULL,
           first_accepted_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS normalized_reports (
+          report_id TEXT PRIMARY KEY,
+          source_id TEXT NOT NULL,
+          first_seen_run_id TEXT NOT NULL,
+          latest_seen_run_id TEXT NOT NULL,
+          report_id_input_type TEXT NOT NULL,
+          report_id_input_hash TEXT NOT NULL,
+          feed_guid TEXT,
+          raw_url TEXT,
+          canonical_url TEXT,
+          title_normalized TEXT NOT NULL,
+          published_at TEXT,
+          fetched_at TEXT NOT NULL,
+          report_json TEXT NOT NULL,
+          status TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS report_seen_runs (
+          report_id TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          seen_at TEXT NOT NULL,
+          PRIMARY KEY (report_id, run_id)
+        );
+        CREATE TABLE IF NOT EXISTS dedupe_keys (
+          key_scope TEXT NOT NULL,
+          key_type TEXT NOT NULL,
+          key_hash TEXT NOT NULL,
+          report_id TEXT NOT NULL,
+          normalized_key_value TEXT NOT NULL,
+          PRIMARY KEY (key_type, key_scope, key_hash)
+        );
+        CREATE TABLE IF NOT EXISTS dedupe_decisions (
+          run_id TEXT NOT NULL,
+          report_id TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          decision TEXT NOT NULL,
+          duplicate_of_report_id TEXT,
+          duplicate_key_type TEXT,
+          duplicate_key_scope TEXT,
+          duplicate_key_hash TEXT,
+          duplicate_key_precedence INTEGER,
+          duplicate_key_value_preview TEXT,
+          reason TEXT NOT NULL,
+          detail_json TEXT NOT NULL,
+          PRIMARY KEY (run_id, report_id)
+        );
+        CREATE TABLE IF NOT EXISTS skipped_items (
+          run_id TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          report_id TEXT,
+          reason_code TEXT NOT NULL,
+          detail_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS embeddings (
+          report_id TEXT NOT NULL,
+          embedding_space_id TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          model TEXT NOT NULL,
+          dimensions INTEGER NOT NULL,
+          embedded_text_hash TEXT NOT NULL,
+          embedding_vector_hash TEXT NOT NULL,
+          vector_json TEXT NOT NULL,
+          backend_request_id TEXT,
+          status TEXT NOT NULL,
+          failure_json TEXT,
+          embedded_at TEXT,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (report_id, embedding_space_id, embedded_text_hash)
+        );
         CREATE TABLE IF NOT EXISTS publish_attempts (
           attempt_id TEXT PRIMARY KEY,
           package_id TEXT NOT NULL,
-          run_id TEXT NOT NULL,
-          snapshot_id TEXT NOT NULL,
-          publish_idempotency_key TEXT NOT NULL UNIQUE,
+          publish_target_key TEXT NOT NULL,
+          publish_idempotency_key TEXT NOT NULL,
+          effective_publish_snapshot_id TEXT NOT NULL,
+          attempt_number INTEGER NOT NULL,
+          mode TEXT NOT NULL,
           status TEXT NOT NULL,
-          created_at TEXT NOT NULL
+          attempted_at TEXT NOT NULL,
+          completed_at TEXT,
+          response_json TEXT,
+          error_class TEXT,
+          error_message TEXT,
+          UNIQUE (publish_idempotency_key, attempt_number)
         );
         CREATE TABLE IF NOT EXISTS runtime_config_snapshots (
           snapshot_id TEXT PRIMARY KEY,
@@ -379,6 +460,8 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
         "live_approval_observed": bool(config.publish.live_approval),
         "require_embeddings": bool(config.publish.require_embeddings),
         "allow_non_embedded_fallback": bool(config.publish.allow_non_embedded_fallback),
+        "embedding_space_id": config.embedding.space_id,
+        "embedding_backend": config.embedding.backend,
         "blocked_reason": blocked_reason,
     }
     return snapshot
@@ -441,8 +524,17 @@ def latest_snapshot(connection: sqlite3.Connection) -> Dict[str, Any]:
     return json.loads(row["snapshot_json"])
 
 
+def supplied_embedding_for(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    supplied = candidate.get("supplied_embeddings") or []
+    if isinstance(supplied, list):
+        return supplied[0] if supplied else {}
+    if isinstance(supplied, dict):
+        return supplied
+    return {}
+
+
 def package_id_for(candidate: Dict[str, Any]) -> str:
-    supplied_embeddings = candidate.get("supplied_embeddings") or {}
+    supplied_embeddings = supplied_embedding_for(candidate)
     vector_hash = supplied_embeddings.get("vector_hash") or hashlib.sha256(
         json.dumps(supplied_embeddings, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -452,7 +544,83 @@ def package_id_for(candidate: Dict[str, Any]) -> str:
         supplied_embeddings.get("space_id", ""),
         vector_hash,
     )
-    return "package:" + hashlib.sha256(basis.encode("utf-8")).hexdigest()
+    return "sha256:" + hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+def embedding_matches_snapshot(snapshot: Dict[str, Any], supplied_embeddings: Dict[str, Any]) -> bool:
+    return bool(supplied_embeddings) and supplied_embeddings.get("space_id") == snapshot.get("embedding_space_id")
+
+
+def is_scheduler_reload_error(exc: Exception) -> bool:
+    text = str(exc)
+    return text.startswith("Invalid schedule.") or text.startswith("schedule.")
+
+
+def selected_dedupe_key_for_report(report: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    if report.get("feed_entry_id"):
+        key_type = "feed_entry_id"
+        normalized_key_value = normalize_feed_entry_id(report["feed_entry_id"])
+    elif report.get("canonical_url"):
+        key_type = "canonical_url"
+        normalized_key_value = report["canonical_url"]
+    else:
+        key_type = "normalized_title_date"
+        normalized_key_value = "{}\n{}".format(normalize_title(report["title"]), date_bucket(report.get("published_at")))
+    key_scope = "source:{}".format(report["source_id"])
+    key_hash = "sha256:" + hashlib.sha256("dedupe:v0\n{}\n{}\n{}".format(key_scope, key_type, normalized_key_value).encode("utf-8")).hexdigest()
+    return key_type, key_scope, normalized_key_value, key_hash
+
+
+def canonical_embedding_record(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    supplied = supplied_embedding_for(candidate)
+    return {
+        "space_id": supplied.get("space_id"),
+        "provider": supplied.get("provider") or supplied.get("backend"),
+        "model": supplied.get("model"),
+        "dimensions": supplied.get("dimensions"),
+        "input_hash": supplied.get("input_hash") or ("sha256:" + hashlib.sha256((candidate.get("metadata", {}).get("embedding_text") or "").encode("utf-8")).hexdigest()),
+        "vector_hash": supplied.get("vector_hash"),
+        "vector": supplied.get("vector"),
+    }
+
+
+def embedded_text_hash(candidate: Dict[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256((candidate.get("metadata", {}).get("embedding_text") or "").encode("utf-8")).hexdigest()
+
+
+def package_payload_for(candidate: Dict[str, Any], package_id: str) -> Dict[str, Any]:
+    selected_key_type = candidate.get("dedupe_identity", {}).get("primary")
+    selected_key_value = candidate.get("dedupe_identity", {}).get("value")
+    selected_key_scope = "source:{}".format(candidate["source_id"])
+    selected_key_hash = None
+    if selected_key_type and selected_key_value is not None:
+        selected_key_hash = "sha256:" + hashlib.sha256("dedupe:v0\n{}\n{}\n{}".format(selected_key_scope, selected_key_type, selected_key_value).encode("utf-8")).hexdigest()
+    return {
+        "schema": "swarm.channel.news.report.v0",
+        "package_id": package_id,
+        "report_id": candidate["report_id"],
+        "body": {
+            "title": candidate["title"],
+            "summary": candidate["clean_summary"],
+            "url": candidate["canonical_url"],
+            "source_name": candidate["source_name"],
+            "published_at": candidate["published_at"],
+        },
+        "provenance": {
+            "source_id": candidate["source_id"],
+            "source_class": candidate["source_class"],
+            "feed_guid": candidate.get("feed_entry_id") if selected_key_type == "feed_entry_id" else None,
+            "raw_url": candidate.get("raw_url"),
+            "canonical_url": candidate["canonical_url"],
+            "fetched_at": candidate["fetched_at"],
+        },
+        "dedupe": {
+            "selected_key_type": selected_key_type,
+            "selected_key_scope": selected_key_scope,
+            "selected_key_hash": selected_key_hash,
+        },
+        "supplied_embeddings": [canonical_embedding_record(candidate)] if supplied_embedding_for(candidate) else [],
+    }
 
 
 class ArgusServer:
@@ -532,7 +700,7 @@ class ArgusServer:
         try:
             new_config = load_runtime_config(self.config_path)
         except Exception as exc:
-            if (str(exc).startswith("Invalid schedule") or "schedule.jitter_seconds" in str(exc)) and self._reload_publish_inputs_unchanged():
+            if is_scheduler_reload_error(exc) and self._reload_publish_inputs_unchanged():
                 self._record_scheduler_event("scheduler_reload_failed", None, "failed", {"error": str(exc)}, now)
                 return
             snapshot = build_publish_snapshot(self.config, now, force_inactive=True, error=str(exc))
@@ -655,7 +823,7 @@ class ArgusServer:
             run_kind,
             hashlib.sha256("{}:{}:{}".format(run_kind, iso_z(now), time.monotonic_ns()).encode("utf-8")).hexdigest()[:8],
         )
-        snapshot = latest_snapshot(self.connection)
+        cycle_snapshot = latest_snapshot(self.connection)
         output_dir = self.config.output_dir / "runs" / run_id
         self.connection.execute(
             "UPDATE scheduler_state SET running_run_id = ?, last_started_run_id = ?, updated_at = ? WHERE id = 1",
@@ -672,6 +840,8 @@ class ArgusServer:
                 prime=prime,
                 state_path=self.config.output_dir / "state.json",
                 state_write=True,
+                package_candidates_artifact=".pre-package-candidates.jsonl",
+                publish_candidates_artifact=".pre-publish-candidates.jsonl",
             )
             summary["run_id"] = run_id
             summary["run_kind"] = run_kind
@@ -679,13 +849,22 @@ class ArgusServer:
                 self.reload_requested = False
                 self.reload()
             publish_snapshot = latest_snapshot(self.connection)
-            summary["effective_publish_snapshot"] = publish_snapshot
+            summary["effective_publish_snapshot"] = cycle_snapshot
             (output_dir / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-            self._store_run(run_id, run_kind, now, exit_code, output_dir, publish_snapshot, summary)
+            self._store_run(run_id, run_kind, now, exit_code, output_dir, cycle_snapshot, summary)
             if prime:
+                self._store_normalized_storage(run_id, now, output_dir, None)
                 self._write_prime_artifacts(output_dir)
             else:
-                self._store_packages_and_publish(run_id, now, output_dir, publish_snapshot)
+                package_candidates_path = output_dir / ".pre-package-candidates.jsonl"
+                package_candidate_rows = [json.loads(line) for line in package_candidates_path.read_text().splitlines() if line.strip()]
+                candidate_report_ids = {row["report_id"] for row in package_candidate_rows}
+                accepted_report_ids = self._store_normalized_storage(run_id, now, output_dir, candidate_report_ids)
+                accepted_candidate_rows = [row for row in package_candidate_rows if row["report_id"] in accepted_report_ids]
+                package_candidates_path.write_text("".join(json.dumps(row) + "\n" for row in accepted_candidate_rows))
+                package_payloads = self._store_packages_and_publish(run_id, now, package_candidates_path, cycle_snapshot, publish_snapshot)
+                (output_dir / "package-candidates.jsonl").write_text("".join(json.dumps(row) + "\n" for row in package_payloads))
+                (output_dir / "publish-candidates.jsonl").write_text("".join(json.dumps(row) + "\n" for row in package_payloads))
             completed_at = self.clock.now()
             self._record_scheduler_completion(run_id, completed_at)
             self._record_scheduler_event("cycle_completed", run_id, "ok" if exit_code == 0 else "failed", {"run_kind": run_kind}, completed_at)
@@ -701,7 +880,7 @@ class ArgusServer:
     def _write_prime_artifacts(self, output_dir: Path) -> None:
         (output_dir / "prime-baseline.json").write_text((output_dir / "run-summary.json").read_text())
         (output_dir / "prime-source-health.json").write_text((output_dir / "source-health.json").read_text())
-        (output_dir / "prime-normalized-items.jsonl").write_text((output_dir / "normalized.jsonl").read_text())
+        (output_dir / "prime-normalized-items.jsonl").write_text((output_dir / "normalized-items.jsonl").read_text())
         (output_dir / "prime-baseline.md").write_text("# Argus Prime Baseline\n\nNo live publish work was created.\n")
 
     def _store_run(self, run_id: str, run_kind: str, now: datetime, exit_code: int, output_dir: Path, snapshot: Dict[str, Any], summary: Dict[str, Any]) -> None:
@@ -712,21 +891,72 @@ class ArgusServer:
         )
         self.connection.commit()
 
-    def _store_packages_and_publish(self, run_id: str, now: datetime, output_dir: Path, snapshot: Dict[str, Any]) -> None:
-        candidates_path = output_dir / "publish-candidates.jsonl"
+    def _embedding_for_candidate(self, candidate: Dict[str, Any], now: datetime) -> Optional[Dict[str, Any]]:
+        if self.config.embedding.backend == "cli" and self.config.embedding.command:
+            input_hash = embedded_text_hash(candidate)
+            request_id = "sha256:" + hashlib.sha256(
+                "embed-request:v0\n{}\n{}\n{}".format(candidate["report_id"], self.config.embedding.space_id, input_hash).encode("utf-8")
+            ).hexdigest()
+            request = {
+                "request_id": request_id,
+                "space_id": self.config.embedding.space_id,
+                "provider": self.config.embedding.provider,
+                "model": self.config.embedding.model,
+                "dimensions": self.config.embedding.dimensions,
+                "text": candidate.get("metadata", {}).get("embedding_text") or "",
+            }
+            try:
+                completed = subprocess.run(
+                    [self.config.embedding.command, "--input-json", "-"],
+                    input=json.dumps(request),
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                )
+                if completed.returncode != 0:
+                    return None
+                response = json.loads(completed.stdout)
+            except (OSError, ValueError):
+                return None
+            if (
+                response.get("space_id") != self.config.embedding.space_id
+                or response.get("model") != self.config.embedding.model
+                or int(response.get("dimensions", -1)) != int(self.config.embedding.dimensions or -2)
+            ):
+                return None
+            vector = response.get("vector")
+            if not isinstance(vector, list):
+                return None
+            vector_hash = "sha256:" + hashlib.sha256(json.dumps(vector, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+            return {
+                "space_id": self.config.embedding.space_id,
+                "provider": response.get("provider") or self.config.embedding.provider or "cli",
+                "model": self.config.embedding.model,
+                "dimensions": self.config.embedding.dimensions,
+                "input_hash": input_hash,
+                "vector_hash": vector_hash,
+                "vector": vector,
+                "backend_request_id": response.get("backend_request_id"),
+                "embedded_at": iso_z(now),
+            }
+        supplied = supplied_embedding_for(candidate)
+        return supplied if supplied else None
+
+    def _store_packages_and_publish(self, run_id: str, now: datetime, candidates_path: Path, cycle_snapshot: Dict[str, Any], publish_snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+        package_payloads: List[Dict[str, Any]] = []
         rows = [json.loads(line) for line in candidates_path.read_text().splitlines() if line.strip()]
         for candidate in rows:
             if self.reload_requested:
                 self.reload_requested = False
                 self.reload()
-                snapshot = latest_snapshot(self.connection)
+                publish_snapshot = latest_snapshot(self.connection)
             self.connection.execute(
                 "INSERT OR IGNORE INTO accepted_reports VALUES (?, ?, ?, ?, ?)",
                 (
                     candidate["report_id"],
                     run_id,
-                    snapshot["effective_mode"],
-                    snapshot["snapshot_id"],
+                    cycle_snapshot["effective_mode"],
+                    cycle_snapshot["snapshot_id"],
                     iso_z(now),
                 ),
             )
@@ -734,24 +964,189 @@ class ArgusServer:
                 "SELECT first_effective_mode FROM accepted_reports WHERE report_id = ?",
                 (candidate["report_id"],),
             ).fetchone()
+            supplied_embeddings = self._embedding_for_candidate(candidate, now)
+            if supplied_embeddings is None and cycle_snapshot["require_embeddings"] and not cycle_snapshot["allow_non_embedded_fallback"]:
+                self.connection.execute(
+                    "INSERT INTO skipped_items VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        candidate["source_id"],
+                        candidate["report_id"],
+                        "embed_backend_unavailable",
+                        json.dumps({"report_id": candidate["report_id"], "source_id": candidate["source_id"]}, sort_keys=True),
+                        iso_z(now),
+                    ),
+                )
+                continue
+            if supplied_embeddings is None:
+                supplied_embeddings = {}
+            candidate = {**candidate, "supplied_embeddings": [supplied_embeddings] if supplied_embeddings else []}
             package_id = package_id_for(candidate)
-            has_embedding = bool(candidate.get("supplied_embeddings") or candidate.get("embedding"))
-            publish_allowed = first["first_effective_mode"] == "active" and snapshot["effective_mode"] == "active" and (
-                not snapshot["require_embeddings"] or snapshot["allow_non_embedded_fallback"] or has_embedding
+            if supplied_embeddings:
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO embeddings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        candidate["report_id"],
+                        supplied_embeddings.get("space_id", ""),
+                        supplied_embeddings.get("provider", ""),
+                        supplied_embeddings.get("model", ""),
+                        int(supplied_embeddings.get("dimensions") or 0),
+                        supplied_embeddings.get("input_hash") or embedded_text_hash(candidate),
+                        supplied_embeddings.get("vector_hash", ""),
+                        json.dumps(supplied_embeddings.get("vector") or [], sort_keys=True),
+                        supplied_embeddings.get("backend_request_id"),
+                        "embedded",
+                        None,
+                        supplied_embeddings.get("embedded_at") or iso_z(now),
+                        iso_z(now),
+                    ),
+                )
+            first_acceptance_allows_publish = first["first_effective_mode"] == "active" and (
+                not cycle_snapshot["require_embeddings"] or cycle_snapshot["allow_non_embedded_fallback"] or embedding_matches_snapshot(cycle_snapshot, supplied_embeddings)
             )
+            publish_allowed = first_acceptance_allows_publish and publish_snapshot["effective_mode"] == "active" and (
+                not publish_snapshot["require_embeddings"] or publish_snapshot["allow_non_embedded_fallback"] or embedding_matches_snapshot(publish_snapshot, supplied_embeddings)
+            )
+            package_payload = package_payload_for(candidate, package_id)
+            package_payloads.append(package_payload)
             self.connection.execute(
-                "INSERT OR IGNORE INTO packages VALUES (?, ?, ?, ?, ?, ?)",
-                (package_id, candidate["report_id"], run_id, iso_z(now), int(publish_allowed), json.dumps(candidate, sort_keys=True)),
+                "INSERT OR IGNORE INTO packages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    package_id,
+                    candidate["report_id"],
+                    str(candidate.get("schema_version", 1)),
+                    supplied_embeddings.get("space_id"),
+                    supplied_embeddings.get("vector_hash"),
+                    int(first_acceptance_allows_publish),
+                    json.dumps(package_payload, sort_keys=True),
+                    run_id,
+                    iso_z(now),
+                ),
             )
             if publish_allowed:
-                target = hashlib.sha256(str(self.config.publish.subspace_endpoint).encode("utf-8")).hexdigest()
+                target = "sha256:" + hashlib.sha256(("publish-target:v0\n" + str(self.config.publish.subspace_endpoint)).encode("utf-8")).hexdigest()
                 key = "sha256:" + hashlib.sha256(("publish:v0\n{}\n{}".format(package_id, target)).encode("utf-8")).hexdigest()
                 attempt = "sha256:" + hashlib.sha256(("publish-attempt:v0\n{}\n1".format(key)).encode("utf-8")).hexdigest()
                 self.connection.execute(
-                    "INSERT OR IGNORE INTO publish_attempts VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (attempt, package_id, run_id, snapshot["snapshot_id"], key, "pending", iso_z(now)),
+                    "INSERT OR IGNORE INTO publish_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (attempt, package_id, target, key, publish_snapshot["snapshot_id"], 1, publish_snapshot["effective_mode"], "pending", iso_z(now), None, None, None, None),
                 )
         self.connection.commit()
+        return package_payloads
+
+    def _store_normalized_storage(self, run_id: str, now: datetime, output_dir: Path, accepted_report_ids: Optional[set[str]]) -> set[str]:
+        sqlite_accepted_report_ids: set[str] = set()
+        rows = [json.loads(line) for line in (output_dir / "normalized-items.jsonl").read_text().splitlines() if line.strip()]
+        for report in rows:
+            key_type, key_scope, normalized_key_value, key_hash = selected_dedupe_key_for_report(report)
+            existing_report = self.connection.execute("SELECT report_id FROM normalized_reports WHERE report_id = ?", (report["report_id"],)).fetchone()
+            existing_key = self.connection.execute(
+                "SELECT report_id FROM dedupe_keys WHERE key_type = ? AND key_scope = ? AND key_hash = ?",
+                (key_type, key_scope, key_hash),
+            ).fetchone()
+            is_accepted = accepted_report_ids is None or report["report_id"] in accepted_report_ids
+            if existing_report:
+                decision = "seen_existing_report"
+            elif existing_key:
+                decision = "exact_duplicate"
+            elif is_accepted:
+                decision = "accepted"
+                sqlite_accepted_report_ids.add(report["report_id"])
+            else:
+                decision = "skipped_not_package_candidate"
+            if decision in {"exact_duplicate", "skipped_not_package_candidate"}:
+                detail = {
+                    "source_id": report["source_id"],
+                    "report_id": report["report_id"],
+                    "duplicate_of_report_id": existing_key["report_id"] if existing_key else None,
+                    "duplicate_key_type": key_type,
+                    "duplicate_key_scope": key_scope,
+                    "duplicate_key_hash": key_hash,
+                    "duplicate_key_precedence": 1 if key_type == "feed_entry_id" else 2 if key_type == "canonical_url" else 3,
+                    "reason": decision,
+                    "title": report["title"],
+                    "canonical_url": report["canonical_url"],
+                    "feed_entry_id": report.get("feed_entry_id"),
+                    "published_at": report.get("published_at"),
+                }
+                self.connection.execute(
+                    "INSERT INTO skipped_items VALUES (?, ?, ?, ?, ?, ?)",
+                    (run_id, report["source_id"], report["report_id"], decision, json.dumps(detail, sort_keys=True), iso_z(now)),
+                )
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO dedupe_decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        report["report_id"],
+                        report["source_id"],
+                        decision,
+                        detail["duplicate_of_report_id"],
+                        key_type,
+                        key_scope,
+                        key_hash,
+                        detail["duplicate_key_precedence"],
+                        normalized_key_value.replace("\n", " ")[:160],
+                        decision,
+                        json.dumps(detail, sort_keys=True),
+                    ),
+                )
+                continue
+            report_id_input_hash = "sha256:" + hashlib.sha256(normalized_key_value.encode("utf-8")).hexdigest()
+            self.connection.execute(
+                """
+                INSERT INTO normalized_reports VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(report_id) DO UPDATE SET latest_seen_run_id = excluded.latest_seen_run_id, report_json = excluded.report_json, status = excluded.status
+                """,
+                (
+                    report["report_id"],
+                    report["source_id"],
+                    run_id,
+                    run_id,
+                    key_type,
+                    report_id_input_hash,
+                    report.get("feed_entry_id"),
+                    report.get("raw_url"),
+                    report.get("canonical_url"),
+                    normalize_title(report["title"]),
+                    report.get("published_at"),
+                    report["fetched_at"],
+                    json.dumps(report, sort_keys=True),
+                    "accepted",
+                ),
+            )
+            self.connection.execute(
+                "INSERT OR IGNORE INTO report_seen_runs VALUES (?, ?, ?, ?)",
+                (report["report_id"], run_id, report["source_id"], iso_z(now)),
+            )
+            self.connection.execute(
+                "INSERT OR IGNORE INTO dedupe_keys VALUES (?, ?, ?, ?, ?)",
+                (key_scope, key_type, key_hash, report["report_id"], normalized_key_value),
+            )
+            self.connection.execute(
+                "INSERT OR REPLACE INTO dedupe_decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    report["report_id"],
+                    report["source_id"],
+                    decision,
+                    None,
+                    key_type,
+                    key_scope,
+                    key_hash,
+                    1 if key_type == "feed_entry_id" else 2 if key_type == "canonical_url" else 3,
+                    normalized_key_value.replace("\n", " ")[:160],
+                    decision,
+                    json.dumps({"key_hash": key_hash, "key_type": key_type}, sort_keys=True),
+                ),
+            )
+        skipped_path = output_dir / "skipped-items.json"
+        for item in json.loads(skipped_path.read_text()) if skipped_path.exists() else []:
+            self.connection.execute(
+                "INSERT INTO skipped_items VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, item["source_id"], None, "source_skipped_counts", json.dumps(item, sort_keys=True), iso_z(now)),
+            )
+        self.connection.commit()
+        return sqlite_accepted_report_ids
 
     def _record_scheduler_config(self, scheduler: SchedulerConfig, now: datetime, recompute_next: bool) -> None:
         existing = self.connection.execute("SELECT mode, last_completed_at FROM scheduler_state WHERE id = 1").fetchone()

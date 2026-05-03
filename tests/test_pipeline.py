@@ -86,11 +86,11 @@ class PipelineTests(unittest.TestCase):
             candidates = read_jsonl(Path(tmpdir) / "publish-candidates.jsonl")
 
             dup_cluster = next(row for row in clusters if row["source_id"] == "dup_source")
-            self.assertEqual(dup_cluster["dedupe_reasons"], ["canonical_url_exact"])
+            self.assertEqual(dup_cluster["dedupe_reasons"], ["canonical_url"])
             self.assertEqual(len(dup_cluster["report_ids"]), 2)
 
             title_cluster = next(row for row in clusters if row["source_id"] == "dup_title_source")
-            self.assertEqual(title_cluster["dedupe_reasons"], ["normalized_title_date_bucket"])
+            self.assertEqual(title_cluster["dedupe_reasons"], ["normalized_title_date"])
             self.assertEqual(len(title_cluster["report_ids"]), 2)
 
             shared_candidates = [row for row in candidates if row["canonical_url"] == "https://shared.example/story"]

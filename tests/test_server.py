@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 
 import yaml
 
+import argus.server as server_module
 from argus.server import ArgusServer, FakeClock, load_runtime_config
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "argus"
@@ -17,7 +18,7 @@ FEEDS = FIXTURE_ROOT / "feeds"
 NOW = datetime(2026, 4, 29, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def write_config(root: Path, *, mode: str = "interval", interval: str = "1h", publish: dict | None = None) -> Path:
+def write_config(root: Path, *, mode: str = "interval", interval: str = "1h", publish: dict | None = None, embedding: dict | bool | None = None) -> Path:
     fixture_dir = root / "feeds"
     fixture_dir.mkdir(exist_ok=True)
     shutil.copy(FEEDS / "stateful_source.xml", fixture_dir / "stateful-source.xml")
@@ -35,6 +36,17 @@ def write_config(root: Path, *, mode: str = "interval", interval: str = "1h", pu
             "missed_tick_policy": "coalesce_one",
         },
         "publish": publish or {"state": "inactive"},
+        "embedding": (
+            {
+                "backend": "cli",
+                "command": str(write_fake_embedder(root)),
+                "model": "argus-local-v0",
+                "dimensions": 1,
+                "space_id": "argus-local-v0",
+            }
+            if embedding is None
+            else ({} if embedding is False else embedding)
+        ),
         "sources": [
             {
                 "id": "stateful-source",
@@ -59,6 +71,29 @@ def rows(db_path: Path, table: str):
         return [dict(row) for row in connection.execute(f"SELECT * FROM {table}")]
     finally:
         connection.close()
+
+
+def write_fake_embedder(root: Path) -> Path:
+    script = root / "fake_embedder.py"
+    script.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+request = json.loads(sys.stdin.read())
+print(json.dumps({
+    "request_id": request["request_id"],
+    "space_id": request["space_id"],
+    "provider": request.get("provider") or "fake",
+    "model": request["model"],
+    "dimensions": request["dimensions"],
+    "vector": [float(len(request.get("text", "")) % 17)],
+    "backend_request_id": "fake-" + request["request_id"][-8:],
+}))
+"""
+    )
+    script.chmod(0o755)
+    return script
 
 
 class ServerTests(unittest.TestCase):
@@ -172,6 +207,7 @@ class ServerTests(unittest.TestCase):
             root = Path(tmpdir)
             path = write_config(
                 root,
+                embedding=False,
                 publish={
                     "state": "active",
                     "live_approval": True,
@@ -255,6 +291,7 @@ class ServerTests(unittest.TestCase):
             root = Path(tmpdir)
             path = write_config(
                 root,
+                embedding=False,
                 publish={
                     "state": "active",
                     "live_approval": True,
@@ -327,7 +364,7 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(sum(row["active_eligible"] for row in packages), 0)
             self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
 
-    def test_invalid_scheduler_reload_keeps_publish_snapshot(self):
+    def test_invalid_scheduler_reload_keeps_publish_snapshot_when_publish_inputs_unchanged(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             path = write_config(
@@ -397,6 +434,180 @@ class ServerTests(unittest.TestCase):
             path = write_config(root, mode="manual", interval="bogus")
             config = load_runtime_config(path)
             self.assertEqual(config.scheduler.mode, "manual")
+
+    def test_inactive_run_writes_review_artifacts_and_sqlite_state(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server.close()
+            run_dir = next((root / "out" / "runs").glob("20260429T120000Z-scheduled-*"))
+            for artifact in [
+                "digest.md",
+                "digest.json",
+                "normalized-items.jsonl",
+                "dedupe-decisions.json",
+                "skipped-items.json",
+                "package-candidates.jsonl",
+            ]:
+                self.assertTrue((run_dir / artifact).exists(), artifact)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "normalized_reports")), 2)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "report_seen_runs")), 2)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "dedupe_keys")), 2)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "dedupe_decisions")), 2)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "embeddings")), 2)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 2)
+
+    def test_prime_persists_baseline_dedupe_state_without_packages(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root)
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.prime()
+            finally:
+                server.close()
+            self.assertEqual(len(rows(root / "argus.sqlite3", "normalized_reports")), 2)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "dedupe_keys")), 2)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+
+    def test_stale_items_are_not_inserted_as_accepted_reports(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            config = yaml.safe_load(path.read_text())
+            config["sources"][0]["freshness_window_hours"] = 1
+            path.write_text(yaml.safe_dump(config))
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server.close()
+            self.assertEqual(len(rows(root / "argus.sqlite3", "normalized_reports")), 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
+            self.assertGreaterEqual(len(rows(root / "argus.sqlite3", "skipped_items")), 1)
+
+    def test_same_canonical_url_different_feed_ids_are_distinct_candidates(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            fixture = root / "feeds" / "stateful-source.xml"
+            fixture.write_text(
+                """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Stateful Source</title>
+    <item>
+      <guid>guid-a</guid>
+      <title>First item</title>
+      <link>https://stateful.example/shared</link>
+      <pubDate>Wed, 29 Apr 2026 10:00:00 +0000</pubDate>
+      <description>First item.</description>
+    </item>
+    <item>
+      <guid>guid-b</guid>
+      <title>Second item</title>
+      <link>https://stateful.example/shared</link>
+      <pubDate>Wed, 29 Apr 2026 10:05:00 +0000</pubDate>
+      <description>Second item.</description>
+    </item>
+  </channel>
+</rss>"""
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server.close()
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 2)
+
+    def test_feed_identity_rerun_updates_seen_report_not_duplicate_report(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            fixture = root / "feeds" / "stateful-source.xml"
+            clock = FakeClock(NOW)
+            server = ArgusServer(path, clock=clock)
+            try:
+                server.tick()
+                fixture.write_text(
+                    fixture.read_text().replace("<title>First story</title>", "<title>First story revised</title>")
+                )
+                clock.advance(3600)
+                server.tick()
+            finally:
+                server.close()
+            self.assertEqual(len(rows(root / "argus.sqlite3", "normalized_reports")), 2)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "report_seen_runs")), 4)
+            self.assertIn("seen_existing_report", {row["decision"] for row in rows(root / "argus.sqlite3", "dedupe_decisions")})
+
+    def test_package_json_uses_canonical_shape_and_embeddings(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.invalid",
+                    "require_embeddings": True,
+                },
+            )
+            config = yaml.safe_load(path.read_text())
+            embedder = write_fake_embedder(root)
+            config["embedding"] = {
+                "backend": "cli",
+                "command": str(embedder),
+                "model": "argus-local-v0",
+                "dimensions": 1,
+                "space_id": "argus-local-v0",
+            }
+            path.write_text(yaml.safe_dump(config))
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server.close()
+            package = json.loads(rows(root / "argus.sqlite3", "packages")[0]["package_json"])
+            self.assertEqual(package["schema"], "swarm.channel.news.report.v0")
+            self.assertTrue(package["package_id"].startswith("sha256:"))
+            self.assertIsInstance(package["supplied_embeddings"], list)
+            self.assertEqual(package["supplied_embeddings"][0]["space_id"], "argus-local-v0")
+            self.assertNotIn("suppliedEmbeddings", package)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 2)
+
+    def test_activation_reload_during_cycle_does_not_backfill_cycle_started_inactive(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            config = yaml.safe_load(path.read_text())
+            original_run_pipeline = server_module.run_pipeline_for_sources
+            server = ArgusServer(path, clock=FakeClock(NOW))
+
+            def activate_during_fetch(*args, **kwargs):
+                result = original_run_pipeline(*args, **kwargs)
+                config["publish"] = {
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.invalid",
+                    "allow_non_embedded_fallback": True,
+                }
+                path.write_text(yaml.safe_dump(config))
+                server.reload_requested = True
+                return result
+
+            server_module.run_pipeline_for_sources = activate_during_fetch
+            try:
+                server.tick()
+            finally:
+                server_module.run_pipeline_for_sources = original_run_pipeline
+                server.close()
+            self.assertEqual(rows(root / "argus.sqlite3", "packages")[0]["active_eligible"], 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
 
 
 if __name__ == "__main__":

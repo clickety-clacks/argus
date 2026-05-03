@@ -8,7 +8,7 @@ import json
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -121,6 +121,10 @@ def parse_now(value: Optional[str]) -> datetime:
 
 def iso_z(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def time_delta_hours(hours: int) -> timedelta:
+    return timedelta(hours=hours)
 
 
 def default_state_path(output_dir: Path) -> Path:
@@ -417,9 +421,22 @@ def normalize_timestamp(value: Optional[str]) -> Optional[str]:
     return text
 
 
+def normalize_feed_entry_id(value: str) -> str:
+    return re.sub(r"[ \t\r\n]+", " ", value.strip())
+
+
+def report_identity_input(feed_entry_id: Optional[str], canonical_url: Optional[str], title: str, published_at: Optional[str]) -> Tuple[str, str]:
+    if feed_entry_id:
+        return "feed_entry_id", normalize_feed_entry_id(feed_entry_id)
+    if canonical_url:
+        return "canonical_url", canonical_url
+    return "normalized_title_date", "{}\n{}".format(normalize_title(title), date_bucket(published_at))
+
+
 def report_id_for(source_id: str, feed_entry_id: Optional[str], canonical_url: Optional[str], title: str, published_at: Optional[str]) -> str:
-    basis = "|".join([source_id, feed_entry_id or "", canonical_url or "", normalize_title(title), published_at or ""])
-    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
+    input_type, input_value = report_identity_input(feed_entry_id, canonical_url, title, published_at)
+    basis = "report:v0\n{}\n{}\n{}".format(source_id, input_type, input_value)
+    return "sha256:" + hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
 def date_bucket(timestamp: Optional[str]) -> str:
@@ -429,22 +446,22 @@ def date_bucket(timestamp: Optional[str]) -> str:
 def dedupe_key(report: Dict[str, Any]) -> Tuple[str, str, str]:
     source_id = report["source_id"]
     if report.get("feed_entry_id"):
-        return source_id, "feed_entry_id_exact", report["feed_entry_id"]
+        return source_id, "feed_entry_id", normalize_feed_entry_id(report["feed_entry_id"])
     if report.get("canonical_url"):
-        return source_id, "canonical_url_exact", report["canonical_url"]
-    return source_id, "normalized_title_date_bucket", "{}|{}".format(normalize_title(report["title"]), date_bucket(report.get("published_at")))
+        return source_id, "canonical_url", report["canonical_url"]
+    return source_id, "normalized_title_date", "{}\n{}".format(normalize_title(report["title"]), date_bucket(report.get("published_at")))
 
 
 def persistent_identities_for(report: Dict[str, Any]) -> List[Tuple[str, str]]:
     identities: List[Tuple[str, str]] = []
     if report.get("feed_entry_id"):
-        identities.append(("feed_entry_id_exact", report["feed_entry_id"]))
+        identities.append(("feed_entry_id", normalize_feed_entry_id(report["feed_entry_id"])))
     if report.get("canonical_url"):
-        identities.append(("canonical_url_exact", report["canonical_url"]))
+        identities.append(("canonical_url", report["canonical_url"]))
     identities.append(
         (
-            "normalized_title_date_bucket",
-            "{}|{}".format(normalize_title(report["title"]), date_bucket(report.get("published_at"))),
+            "normalized_title_date",
+            "{}\n{}".format(normalize_title(report["title"]), date_bucket(report.get("published_at"))),
         )
     )
     return identities
@@ -502,6 +519,8 @@ def candidate_for(report: Dict[str, Any], dedupe_identity: Dict[str, str]) -> Di
         "source_class": report["source_class"],
         "title": report["title"],
         "canonical_url": report["canonical_url"],
+        "raw_url": report["raw_url"],
+        "feed_entry_id": report["feed_entry_id"],
         "published_at": report["published_at"],
         "fetched_at": report["fetched_at"],
         "clean_summary": report["clean_summary"],
@@ -560,6 +579,8 @@ def run_pipeline(
     prime: bool = False,
     state_path: Optional[Path] = None,
     state_write: bool = True,
+    package_candidates_artifact: str = "package-candidates.jsonl",
+    publish_candidates_artifact: str = "publish-candidates.jsonl",
 ) -> Tuple[int, Dict[str, Any]]:
     sources = read_source_config(sources_path)
     return run_pipeline_for_sources(
@@ -572,6 +593,8 @@ def run_pipeline(
         prime=prime,
         state_path=state_path,
         state_write=state_write,
+        package_candidates_artifact=package_candidates_artifact,
+        publish_candidates_artifact=publish_candidates_artifact,
     )
 
 
@@ -585,6 +608,8 @@ def run_pipeline_for_sources(
     prime: bool = False,
     state_path: Optional[Path] = None,
     state_write: bool = True,
+    package_candidates_artifact: str = "package-candidates.jsonl",
+    publish_candidates_artifact: str = "publish-candidates.jsonl",
 ) -> Tuple[int, Dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     effective_state_path = state_path or default_state_path(output_dir)
@@ -672,9 +697,12 @@ def run_pipeline_for_sources(
             normalized_count = 0
             emitted_count = 0
             skipped_seen_count = 0
+            skipped_stale_count = 0
             for entry in entries:
                 report = normalize_entry(entry, fetched_at)
                 identity = dedupe_key(report)
+                normalized_rows.append(report)
+                normalized_count += 1
                 if identity in seen:
                     duplicate_count += 1
                     cluster_id = cluster_id_for(source.id, identity[1], identity[2])
@@ -695,22 +723,24 @@ def run_pipeline_for_sources(
                     continue
 
                 seen[identity] = report
-                normalized_rows.append(report)
-                normalized_count += 1
 
-                identity_keys = persistent_identity_keys(report)
-                already_seen = any(key in seen_identities for key in identity_keys)
-                if already_seen:
+                identity_key = "{}|{}".format(identity[1], identity[2])
+                if identity_key in seen_identities:
                     skipped_seen_count += 1
                     continue
+                if source.freshness_window_hours is not None and report.get("published_at"):
+                    published_at = parse_now(report["published_at"])
+                    if published_at < now - time_delta_hours(source.freshness_window_hours):
+                        skipped_stale_count += 1
+                        seen_identities.add(identity_key)
+                        continue
 
                 if prime:
                     primed_candidates += 1
                 else:
                     emitted_count += 1
                     publish_candidates.append(candidate_for(report, {"primary": identity[1], "value": identity[2]}))
-                for key in identity_keys:
-                    seen_identities.add(key)
+                seen_identities.add(identity_key)
 
             clusters.extend(source_clusters)
             status = "ok" if entries else "empty"
@@ -733,6 +763,7 @@ def run_pipeline_for_sources(
                     "normalized_entry_count": normalized_count,
                     "emitted_candidate_count": emitted_count,
                     "skipped_previously_seen_count": skipped_seen_count,
+                    "skipped_stale_count": skipped_stale_count,
                     "failure_reason": None,
                     "elapsed_ms": fetch_result.elapsed_ms,
                     "etag": state_after["validators"].get("etag"),
@@ -797,9 +828,13 @@ def run_pipeline_for_sources(
         },
         "artifact_paths": {
             "source_health": "source-health.json",
-            "normalized": "normalized.jsonl",
+            "normalized": "normalized-items.jsonl",
             "clusters": "clusters.jsonl",
-            **({} if prime else {"publish_candidates": "publish-candidates.jsonl"}),
+            "dedupe_decisions": "dedupe-decisions.json",
+            "skipped_items": "skipped-items.json",
+            "digest_json": "digest.json",
+            "digest_markdown": "digest.md",
+            **({} if prime else {"package_candidates": "package-candidates.jsonl", "publish_candidates": "publish-candidates.jsonl"}),
         },
         "dry_run": dry_run,
         "prime": prime,
@@ -815,9 +850,29 @@ def run_pipeline_for_sources(
     write_json(output_dir / "run-summary.json", run_summary)
     write_json(output_dir / "source-health.json", source_health)
     write_jsonl(output_dir / "normalized.jsonl", normalized_rows)
+    write_jsonl(output_dir / "normalized-items.jsonl", normalized_rows)
     write_jsonl(output_dir / "clusters.jsonl", clusters)
+    write_json(output_dir / "dedupe-decisions.json", clusters)
+    skipped_items = [
+        {
+            "source_id": row["source_id"],
+            "skipped_previously_seen_count": row.get("skipped_previously_seen_count", 0),
+            "skipped_stale_count": row.get("skipped_stale_count", 0),
+        }
+        for row in source_health
+        if row.get("skipped_previously_seen_count", 0) or row.get("skipped_stale_count", 0)
+    ]
+    write_json(output_dir / "skipped-items.json", skipped_items)
+    digest = {
+        "run_id": run_summary["run_id"],
+        "candidate_count": len(publish_candidates),
+        "source_health": source_health,
+    }
+    write_json(output_dir / "digest.json", digest)
+    (output_dir / "digest.md").write_text("# Argus Digest\n\n{} package candidates.\n".format(len(publish_candidates)))
     if not prime:
-        write_jsonl(output_dir / "publish-candidates.jsonl", publish_candidates)
+        write_jsonl(output_dir / publish_candidates_artifact, publish_candidates)
+        write_jsonl(output_dir / package_candidates_artifact, publish_candidates)
     return exit_code, run_summary
 
 
