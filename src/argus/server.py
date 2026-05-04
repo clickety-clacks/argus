@@ -1114,7 +1114,7 @@ class ArgusServer:
             if prime:
                 self._store_normalized_storage(run_id, now, output_dir, None)
                 self._write_decision_artifacts(run_id, output_dir)
-                self._store_run(run_id, run_kind, now, exit_code, output_dir, cycle_snapshot, summary)
+                self._store_run(run_id, run_kind, now, exit_code, output_dir, cycle_snapshot, summary, commit=False)
                 (output_dir / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
                 self._write_prime_artifacts(output_dir)
                 self.connection.commit()
@@ -1132,7 +1132,7 @@ class ArgusServer:
                 package_candidates_path.write_text("".join(json.dumps(row) + "\n" for row in accepted_candidate_rows))
                 package_payloads = self._store_packages_and_publish(run_id, now, output_dir, package_candidates_path, cycle_snapshot, publish_snapshot, cycle_embedding)
                 self._rewrite_source_health_final_counts(run_id, output_dir, package_payloads)
-                self._store_source_health(run_id, now, output_dir, update_totals=False)
+                self._store_source_health(run_id, now, output_dir, update_totals=False, commit=False)
                 self._write_decision_artifacts(run_id, output_dir)
                 (output_dir / "package-candidates.jsonl").write_text("".join(json.dumps(row) + "\n" for row in package_payloads))
                 (output_dir / "publish-candidates.jsonl").write_text("".join(json.dumps(row) + "\n" for row in package_payloads))
@@ -1141,7 +1141,7 @@ class ArgusServer:
                 summary["counts"]["embedding_failures"] = len(json.loads((output_dir / "embedding-failures.json").read_text()))
                 summary["artifact_paths"]["embedding_failures"] = "embedding-failures.json"
                 self._write_digest_artifacts(run_id, output_dir, package_payloads)
-                self._store_run(run_id, run_kind, now, exit_code, output_dir, cycle_snapshot, summary)
+                self._store_run(run_id, run_kind, now, exit_code, output_dir, cycle_snapshot, summary, commit=False)
                 (output_dir / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
                 self.connection.commit()
             completed_at = self.clock.now()
@@ -1244,13 +1244,24 @@ class ArgusServer:
             row["final_package_candidate_count"] = counts.get(row["source_id"], 0)
         path.write_text(json.dumps(health_rows, indent=2, sort_keys=True) + "\n")
 
-    def _store_run(self, run_id: str, run_kind: str, now: datetime, exit_code: int, output_dir: Path, snapshot: Dict[str, Any], summary: Dict[str, Any]) -> None:
+    def _store_run(
+        self,
+        run_id: str,
+        run_kind: str,
+        now: datetime,
+        exit_code: int,
+        output_dir: Path,
+        snapshot: Dict[str, Any],
+        summary: Dict[str, Any],
+        commit: bool = True,
+    ) -> None:
         status = "failed" if exit_code != 0 else "succeeded_with_source_errors" if summary.get("counts", {}).get("failed_sources", 0) else "succeeded"
         self.connection.execute(
             "INSERT OR REPLACE INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (run_id, run_kind, iso_z(now), iso_z(self.clock.now()), status, str(output_dir), snapshot["snapshot_id"], json.dumps(summary, sort_keys=True)),
         )
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
 
     def _mark_run_failed(self, run_id: str, run_kind: str, now: datetime, output_dir: Path, snapshot: Dict[str, Any], error: Exception) -> None:
         row = self.connection.execute("SELECT summary_json FROM runs WHERE run_id = ?", (run_id,)).fetchone()
@@ -1268,7 +1279,7 @@ class ArgusServer:
             )
         self.connection.commit()
 
-    def _store_source_health(self, run_id: str, now: datetime, output_dir: Path, update_totals: bool = True) -> None:
+    def _store_source_health(self, run_id: str, now: datetime, output_dir: Path, update_totals: bool = True, commit: bool = True) -> None:
         path = output_dir / "source-health.json"
         health_rows = json.loads(path.read_text()) if path.exists() else []
         for item in health_rows:
@@ -1351,7 +1362,8 @@ class ArgusServer:
                     last_error.get("message"),
                 ),
             )
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
 
     def _embedding_for_candidate(self, candidate: Dict[str, Any], now: datetime, embedding_config: Optional[EmbeddingConfig] = None) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
         embedding = embedding_config or self.config.embedding

@@ -955,6 +955,60 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
             self.assertEqual(len(rows(root / "argus.sqlite3", "embeddings")), 0)
 
+    def test_post_pipeline_storage_rolls_back_when_package_artifact_fails(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            original_write_text = Path.write_text
+            fail_package_artifact = {"enabled": False}
+
+            def flaky_write_text(self, data, *args, **kwargs):
+                if fail_package_artifact["enabled"] and self.name == "package-candidates.jsonl":
+                    raise OSError("simulated package artifact failure")
+                return original_write_text(self, data, *args, **kwargs)
+
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            fail_package_artifact["enabled"] = True
+            Path.write_text = flaky_write_text
+            try:
+                with self.assertRaisesRegex(OSError, "simulated package artifact failure"):
+                    server.tick()
+            finally:
+                Path.write_text = original_write_text
+                server.close()
+            self.assertEqual(rows(root / "argus.sqlite3", "runs")[0]["status"], "failed")
+            self.assertEqual(len(rows(root / "argus.sqlite3", "normalized_reports")), 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "dedupe_keys")), 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "embeddings")), 0)
+
+    def test_post_pipeline_storage_rolls_back_when_summary_artifact_fails(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            original_write_text = Path.write_text
+            fail_summary_artifact = {"enabled": False}
+
+            def flaky_write_text(self, data, *args, **kwargs):
+                if fail_summary_artifact["enabled"] and self.name == "run-summary.json":
+                    raise OSError("simulated summary artifact failure")
+                return original_write_text(self, data, *args, **kwargs)
+
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            fail_summary_artifact["enabled"] = True
+            Path.write_text = flaky_write_text
+            try:
+                with self.assertRaisesRegex(OSError, "simulated summary artifact failure"):
+                    server.tick()
+            finally:
+                Path.write_text = original_write_text
+                server.close()
+            self.assertEqual(rows(root / "argus.sqlite3", "runs")[0]["status"], "failed")
+            self.assertEqual(len(rows(root / "argus.sqlite3", "normalized_reports")), 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "dedupe_keys")), 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "embeddings")), 0)
+
     def test_prime_artifact_failure_marks_prime_event_failed(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
