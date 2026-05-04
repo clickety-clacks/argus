@@ -40,6 +40,7 @@ def write_config(root: Path, *, mode: str = "interval", interval: str = "1h", pu
             {
                 "backend": "cli",
                 "command": str(write_fake_embedder(root)),
+                "provider": "fake",
                 "model": "argus-local-v0",
                 "dimensions": 1,
                 "space_id": "argus-local-v0",
@@ -81,15 +82,45 @@ import json
 import sys
 
 request = json.loads(sys.stdin.read())
+vector_seed = sum(ord(ch) for ch in request["request_id"])
 print(json.dumps({
     "request_id": request["request_id"],
     "space_id": request["space_id"],
-    "provider": request.get("provider") or "fake",
+    "provider": request["provider"],
     "model": request["model"],
     "dimensions": request["dimensions"],
-    "vector": [float(len(request.get("text", "")) % 17)],
+    "vector": [float(vector_seed % 17)],
     "backend_request_id": "fake-" + request["request_id"][-8:],
 }))
+"""
+    )
+    script.chmod(0o755)
+    return script
+
+
+def write_failing_embedder(root: Path) -> Path:
+    script = root / "failing_embedder.py"
+    script.write_text(
+        """#!/usr/bin/env python3
+import sys
+
+sys.stderr.write("embedding failed\\n")
+sys.exit(2)
+"""
+    )
+    script.chmod(0o755)
+    return script
+
+
+def write_json_failing_embedder(root: Path) -> Path:
+    script = root / "json_failing_embedder.py"
+    script.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+print(json.dumps({"error_class": "embed_invalid_response", "message": "bad vector", "retry_eligible": True}))
+sys.exit(2)
 """
     )
     script.chmod(0o755)
@@ -136,6 +167,26 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(summary["run_kind"], "manual")
             self.assertEqual(len(rows(root / "argus.sqlite3", "runs")), 1)
             self.assertEqual(len(rows(root / "argus.sqlite3", "prime_events")), 0)
+
+    def test_manual_to_interval_reload_waits_one_interval_without_backfill(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, mode="manual")
+            clock = FakeClock(NOW)
+            server = ArgusServer(path, clock=clock)
+            try:
+                config = yaml.safe_load(path.read_text())
+                config["schedule"]["mode"] = "interval"
+                config["schedule"]["interval"] = "1h"
+                path.write_text(yaml.safe_dump(config))
+                server.reload()
+                state = dict(server.connection.execute("SELECT * FROM scheduler_state WHERE id = 1").fetchone())
+                self.assertEqual(state["next_due_at"], "2026-04-29T13:00:00Z")
+                self.assertIsNone(server.tick())
+                clock.advance(3600)
+                self.assertIsNotNone(server.tick())
+            finally:
+                server.close()
 
     def test_prime_creates_baseline_only_no_packages_or_attempts(self):
         with TemporaryDirectory() as tmpdir:
@@ -299,13 +350,8 @@ class ServerTests(unittest.TestCase):
                     "require_embeddings": True,
                 },
             )
-            server = ArgusServer(path, clock=FakeClock(NOW))
-            try:
-                server.tick()
-                self.assertEqual(server.status()["publish"]["effective_mode"], "blocked")
-            finally:
-                server.close()
-            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+            with self.assertRaisesRegex(Exception, "missing_embedding_config"):
+                ArgusServer(path, clock=FakeClock(NOW))
 
     def test_configured_embedding_backend_does_not_imply_candidate_embeddings(self):
         with TemporaryDirectory() as tmpdir:
@@ -323,6 +369,7 @@ class ServerTests(unittest.TestCase):
             config["embedding"] = {
                 "backend": "cli",
                 "command": "/definitely/not/invoked",
+                "provider": "fake",
                 "model": "text-embedding-3-small",
                 "dimensions": 1536,
                 "space_id": "openai:text-embedding-3-small:1536:v1",
@@ -336,6 +383,105 @@ class ServerTests(unittest.TestCase):
                 server.close()
             self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
 
+    def test_cli_embedding_requires_provider(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.invalid",
+                    "require_embeddings": True,
+                },
+            )
+            config = yaml.safe_load(path.read_text())
+            del config["embedding"]["provider"]
+            path.write_text(yaml.safe_dump(config))
+            with self.assertRaisesRegex(Exception, "missing_embedding_config"):
+                ArgusServer(path, clock=FakeClock(NOW))
+
+    def test_embedding_failure_records_failed_embedding_and_artifact(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                embedding={
+                    "backend": "cli",
+                    "command": str(write_failing_embedder(root)),
+                    "provider": "fake",
+                    "model": "argus-local-v0",
+                    "dimensions": 1,
+                    "space_id": "argus-local-v0",
+                },
+                publish={"state": "inactive", "require_embeddings": True},
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server.close()
+            self.assertEqual({row["status"] for row in rows(root / "argus.sqlite3", "embeddings")}, {"failed"})
+            run_dir = next((root / "out" / "runs").glob("20260429T120000Z-scheduled-*"))
+            failures = json.loads((run_dir / "embedding-failures.json").read_text())
+            self.assertEqual(len(failures), 2)
+            self.assertEqual({failure["class"] for failure in failures}, {"embed_backend_unavailable"})
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
+
+    def test_embedding_failure_retries_on_later_cycle(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                embedding={
+                    "backend": "cli",
+                    "command": str(write_failing_embedder(root)),
+                    "provider": "fake",
+                    "model": "argus-local-v0",
+                    "dimensions": 1,
+                    "space_id": "argus-local-v0",
+                },
+                publish={"state": "inactive", "require_embeddings": True},
+            )
+            clock = FakeClock(NOW)
+            server = ArgusServer(path, clock=clock)
+            try:
+                server.tick()
+                config = yaml.safe_load(path.read_text())
+                config["embedding"]["command"] = str(write_fake_embedder(root))
+                path.write_text(yaml.safe_dump(config))
+                server.reload()
+                clock.advance(3600)
+                server.tick()
+            finally:
+                server.close()
+            self.assertEqual({row["status"] for row in rows(root / "argus.sqlite3", "embeddings")}, {"embedded"})
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 2)
+
+    def test_embedding_failure_honors_backend_failure_json(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                embedding={
+                    "backend": "cli",
+                    "command": str(write_json_failing_embedder(root)),
+                    "provider": "fake",
+                    "model": "argus-local-v0",
+                    "dimensions": 1,
+                    "space_id": "argus-local-v0",
+                },
+                publish={"state": "inactive", "require_embeddings": True},
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server.close()
+            failure = json.loads(rows(root / "argus.sqlite3", "embeddings")[0]["failure_json"])
+            self.assertEqual(failure["class"], "embed_invalid_response")
+            self.assertEqual(failure["message"], "bad vector")
+
     def test_active_no_backfill_even_if_historical_report_reprocessed(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -345,7 +491,6 @@ class ServerTests(unittest.TestCase):
             try:
                 server.tick()
                 inactive_package_ids = {row["package_id"] for row in rows(root / "argus.sqlite3", "packages")}
-                (root / "out" / "state.json").unlink()
                 config = yaml.safe_load(path.read_text())
                 config["publish"] = {
                     "state": "active",
@@ -460,6 +605,91 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(len(rows(root / "argus.sqlite3", "dedupe_decisions")), 2)
             self.assertEqual(len(rows(root / "argus.sqlite3", "embeddings")), 2)
             self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 2)
+            self.assertEqual(len(json.loads((run_dir / "dedupe-decisions.json").read_text())), 2)
+            self.assertEqual(json.loads((run_dir / "skipped-items.json").read_text()), [])
+
+    def test_server_ignores_legacy_json_seen_state_for_sqlite_authority(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            legacy_state = root / "out" / "runs" / "state.json"
+            legacy_state.parent.mkdir(parents=True)
+            legacy_state.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "sources": {
+                            "stateful-source": {
+                                "validators": {},
+                                "seen_identities": [
+                                    "feed_entry_id|stateful-guid-1",
+                                    "feed_entry_id|stateful-guid-2",
+                                ],
+                            }
+                        },
+                    }
+                )
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server.close()
+            self.assertEqual(len(rows(root / "argus.sqlite3", "normalized_reports")), 2)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 2)
+
+    def test_post_pipeline_artifact_failure_records_failed_run(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            original_write_text = Path.write_text
+            fail_after_pipeline = {"enabled": False}
+
+            def flaky_write_text(self, data, *args, **kwargs):
+                if fail_after_pipeline["enabled"] and self.name == "run-summary.json":
+                    raise OSError("simulated artifact failure")
+                return original_write_text(self, data, *args, **kwargs)
+
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            fail_after_pipeline["enabled"] = True
+            Path.write_text = flaky_write_text
+            try:
+                with self.assertRaisesRegex(OSError, "simulated artifact failure"):
+                    server.tick()
+            finally:
+                Path.write_text = original_write_text
+                server.close()
+            run_rows = rows(root / "argus.sqlite3", "runs")
+            self.assertEqual(len(run_rows), 1)
+            self.assertEqual(run_rows[0]["status"], "failed")
+            self.assertIn("post_pipeline_error", json.loads(run_rows[0]["summary_json"]))
+
+    def test_prime_artifact_failure_marks_prime_event_failed(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            original_write_text = Path.write_text
+            fail_prime_artifact = {"enabled": False}
+
+            def flaky_write_text(self, data, *args, **kwargs):
+                if fail_prime_artifact["enabled"] and self.name == "prime-baseline.md":
+                    raise OSError("simulated prime artifact failure")
+                return original_write_text(self, data, *args, **kwargs)
+
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            fail_prime_artifact["enabled"] = True
+            Path.write_text = flaky_write_text
+            try:
+                with self.assertRaisesRegex(OSError, "simulated prime artifact failure"):
+                    server.prime()
+            finally:
+                Path.write_text = original_write_text
+                server.close()
+            event = rows(root / "argus.sqlite3", "prime_events")[0]
+            self.assertEqual(event["status"], "failed")
+            self.assertIsNotNone(event["completed_at"])
+            self.assertIsNotNone(event["run_id"])
+            self.assertEqual(rows(root / "argus.sqlite3", "runs")[0]["status"], "failed")
 
     def test_prime_persists_baseline_dedupe_state_without_packages(self):
         with TemporaryDirectory() as tmpdir:
@@ -562,6 +792,7 @@ class ServerTests(unittest.TestCase):
             config["embedding"] = {
                 "backend": "cli",
                 "command": str(embedder),
+                "provider": "fake",
                 "model": "argus-local-v0",
                 "dimensions": 1,
                 "space_id": "argus-local-v0",
@@ -579,6 +810,136 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(package["supplied_embeddings"][0]["space_id"], "argus-local-v0")
             self.assertNotIn("suppliedEmbeddings", package)
             self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 2)
+
+    def test_spec_named_cli_backend_invokes_embedding_command(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                embedding={
+                    "backend": "subspace-embedding-cli",
+                    "command": str(write_fake_embedder(root)),
+                    "provider": "fake",
+                    "model": "argus-local-v0",
+                    "dimensions": 1,
+                    "space_id": "argus-local-v0",
+                },
+                publish={"state": "inactive", "require_embeddings": True},
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server.close()
+            self.assertEqual({row["status"] for row in rows(root / "argus.sqlite3", "embeddings")}, {"embedded"})
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 2)
+
+    def test_source_health_command_reads_sqlite_state(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server.close()
+            health = server_module.run_source_health(root / "argus.sqlite3")
+            self.assertEqual(health[0]["source_id"], "stateful-source")
+            self.assertEqual(health[0]["last_run_id"], rows(root / "argus.sqlite3", "runs")[0]["run_id"])
+            self.assertEqual(len(rows(root / "argus.sqlite3", "source_run_status")), 1)
+
+    def test_run_status_records_source_errors(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            config = yaml.safe_load(path.read_text())
+            config["sources"].append(
+                {
+                    "id": "missing-source",
+                    "display_name": "Missing Source",
+                    "source_class": "editorial",
+                    "feed_url": "https://fixture.invalid/missing-source.xml",
+                    "site_url": "https://missing.example/",
+                    "adapter": "rss",
+                    "enabled": True,
+                }
+            )
+            path.write_text(yaml.safe_dump(config))
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                exit_code, _ = server.tick()
+            finally:
+                server.close()
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(rows(root / "argus.sqlite3", "runs")[0]["status"], "succeeded_with_source_errors")
+            self.assertEqual({row["status"] for row in rows(root / "argus.sqlite3", "source_run_status")}, {"ok", "failed"})
+
+    def test_explain_skip_includes_exact_duplicate_details_from_sqlite(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            (root / "feeds" / "stateful-source.xml").write_text(
+                """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Stateful Source</title>
+    <item>
+      <title>Canonical duplicate story</title>
+      <link>https://stateful.example/story?utm_source=rss</link>
+      <pubDate>Tue, 29 Apr 2026 07:00:00 +0000</pubDate>
+      <description>First copy.</description>
+    </item>
+    <item>
+      <title>Canonical duplicate story</title>
+      <link>https://stateful.example/story?utm_medium=email</link>
+      <pubDate>Tue, 29 Apr 2026 07:00:00 +0000</pubDate>
+      <description>Second copy.</description>
+    </item>
+  </channel>
+</rss>
+"""
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                _, summary = server.tick()
+            finally:
+                server.close()
+            explanation = server_module.explain_skip(root / "argus.sqlite3", summary["run_id"])
+            self.assertEqual(len(explanation["exact_duplicates"]), 1)
+            duplicate = explanation["exact_duplicates"][0]
+            self.assertEqual(duplicate["selected_key_type"], "canonical_url")
+            self.assertEqual(duplicate["candidate"]["canonical_url"], "https://stateful.example/story")
+            self.assertIsNotNone(duplicate["duplicate_of_report_id"])
+            self.assertIn("cross-source", duplicate["cross_source_note"])
+
+    def test_missing_identity_key_is_skipped_before_storage_and_package(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            (root / "feeds" / "stateful-source.xml").write_text(
+                """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Stateful Source</title>
+    <item>
+      <description>No identity fields.</description>
+    </item>
+  </channel>
+</rss>
+"""
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server.close()
+            self.assertEqual(len(rows(root / "argus.sqlite3", "normalized_reports")), 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
+            skipped = rows(root / "argus.sqlite3", "skipped_items")
+            self.assertEqual(skipped[0]["reason_code"], "missing_identity_key")
+            run_dir = next((root / "out" / "runs").glob("20260429T120000Z-scheduled-*"))
+            artifact = json.loads((run_dir / "skipped-items.json").read_text())
+            self.assertEqual(artifact[0]["reason_code"], "missing_identity_key")
 
     def test_activation_reload_during_cycle_does_not_backfill_cycle_started_inactive(self):
         with TemporaryDirectory() as tmpdir:

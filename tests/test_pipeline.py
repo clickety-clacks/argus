@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from argus.pipeline import default_state_path, read_source_config, run_pipeline
+from argus.pipeline import canonicalize_url, default_state_path, normalize_title, read_source_config, run_pipeline
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "argus"
 FEEDS = FIXTURE_ROOT / "feeds"
@@ -22,6 +22,56 @@ def read_jsonl(path: Path):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_canonical_url_normalizes_specified_dedupe_shape(self):
+        self.assertEqual(
+            canonicalize_url("HTTPS://Example.COM:443/a/b/../c/%7eone?b=2&a=2&a=1&utm_source=x&igshid=y#frag"),
+            "https://example.com/a/c/~one?a=1&a=2&b=2",
+        )
+        self.assertEqual(canonicalize_url("https://example.com/a%2Fb?x=%7e&y=%2f"), "https://example.com/a%2Fb?x=~&y=%2F")
+        self.assertNotEqual(canonicalize_url("https://example.com/a"), canonicalize_url("https://example.com/a/"))
+        self.assertIsNone(canonicalize_url("/relative/path"))
+
+    def test_title_key_normalization_preserves_internal_punctuation(self):
+        self.assertEqual(normalize_title("  ...AI/ML: shipping now!!!  "), "ai/ml: shipping now")
+        self.assertNotEqual(normalize_title("AI/ML"), normalize_title("AI ML"))
+
+    def test_title_date_fallback_uses_fetched_date_when_published_missing(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmpdir:
+            fixture_dir = Path(tmpdir) / "fixtures"
+            fixture_dir.mkdir()
+            fixture = fixture_dir / "stateful_source.xml"
+            fixture.write_text(
+                """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Stateful Source</title>
+    <item>
+      <title>No published date</title>
+      <description>First day.</description>
+    </item>
+  </channel>
+</rss>
+"""
+            )
+            shutil.copy(FIXTURE_ROOT / "stateful-sources.yaml", Path(tmpdir) / "stateful-sources.yaml")
+            _, summary1 = run_pipeline(Path(tmpdir) / "stateful-sources.yaml", Path(tmpdir) / "run1", now=NOW, fixture_dir=fixture_dir)
+            _, summary2 = run_pipeline(
+                Path(tmpdir) / "stateful-sources.yaml",
+                Path(tmpdir) / "run2",
+                now=NOW.replace(day=30),
+                fixture_dir=fixture_dir,
+            )
+            self.assertEqual(summary1["counts"]["publish_candidates"], 1)
+            self.assertEqual(summary2["counts"]["publish_candidates"], 1)
+            report1 = read_jsonl(Path(tmpdir) / "run1" / "normalized-items.jsonl")[0]
+            report2 = read_jsonl(Path(tmpdir) / "run2" / "normalized-items.jsonl")[0]
+            self.assertNotEqual(report1["report_id"], report2["report_id"])
+            self.assertTrue(report1["report_id_input_value"].endswith("2026-04-29"))
+            self.assertTrue(report2["report_id_input_value"].endswith("2026-04-30"))
+
+
     def test_source_config_validation_and_pipeline(self):
         sources = read_source_config(FIXTURE_ROOT / "test-sources.yaml")
         self.assertEqual(len(sources), 11)
@@ -97,7 +147,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(len(shared_candidates), 2)
             self.assertEqual({row["source_id"] for row in shared_candidates}, {"cross_source_one", "cross_source_two"})
 
-    def test_all_source_failure_exits_nonzero(self):
+    def test_all_source_failure_is_source_scoped_degradation(self):
         from tempfile import TemporaryDirectory
 
         with TemporaryDirectory() as tmpdir:
@@ -107,8 +157,8 @@ class PipelineTests(unittest.TestCase):
                 now=NOW,
                 fixture_dir=FEEDS,
             )
-            self.assertEqual(exit_code, 1)
-            self.assertEqual(summary["exit_status"], "failed")
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(summary["exit_status"], "partial_failure")
 
     def test_state_filters_repeated_items_and_emits_only_new_additions(self):
         from tempfile import TemporaryDirectory

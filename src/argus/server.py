@@ -212,20 +212,23 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
     )
     if publish.state not in {"inactive", "active"}:
         raise PipelineError("Invalid publish.state: {}".format(publish.state))
+    embedding = EmbeddingConfig(
+        backend=(str(embedding_payload["backend"]) if embedding_payload.get("backend") else None),
+        command=(str(embedding_payload["command"]) if embedding_payload.get("command") else None),
+        provider=(str(embedding_payload["provider"]) if embedding_payload.get("provider") else None),
+        model=(str(embedding_payload["model"]) if embedding_payload.get("model") else None),
+        dimensions=(int(embedding_payload["dimensions"]) if embedding_payload.get("dimensions") is not None else None),
+        space_id=(str(embedding_payload["space_id"]) if embedding_payload.get("space_id") else None),
+    )
+    if publish.require_embeddings and not publish.allow_non_embedded_fallback and not embedding_config_valid(embedding):
+        raise PipelineError("missing_embedding_config")
     return RuntimeConfig(
         database_path=Path(database_path),
         output_dir=Path(output_dir),
         sources=sources,
         scheduler=validate_scheduler(payload.get("schedule") or {}),
         publish=publish,
-        embedding=EmbeddingConfig(
-            backend=(str(embedding_payload["backend"]) if embedding_payload.get("backend") else None),
-            command=(str(embedding_payload["command"]) if embedding_payload.get("command") else None),
-            provider=(str(embedding_payload["provider"]) if embedding_payload.get("provider") else None),
-            model=(str(embedding_payload["model"]) if embedding_payload.get("model") else None),
-            dimensions=(int(embedding_payload["dimensions"]) if embedding_payload.get("dimensions") is not None else None),
-            space_id=(str(embedding_payload["space_id"]) if embedding_payload.get("space_id") else None),
-        ),
+        embedding=embedding,
         fixture_dir=(Path(runtime["fixture_dir"]) if runtime.get("fixture_dir") else None),
         source_config_path=str(path),
         config_hash=config_hash(payload),
@@ -326,6 +329,33 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
           detail_json TEXT NOT NULL,
           created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS source_health (
+          source_id TEXT PRIMARY KEY,
+          last_status TEXT NOT NULL,
+          last_run_id TEXT NOT NULL,
+          last_checked_at TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          parse_status TEXT,
+          last_successful_fetch_at TEXT,
+          latest_item_published_at TEXT,
+          consecutive_failures INTEGER NOT NULL DEFAULT 0,
+          total_successes INTEGER NOT NULL DEFAULT 0,
+          total_failures INTEGER NOT NULL DEFAULT 0,
+          last_error_class TEXT,
+          last_error_message TEXT,
+          last_error TEXT,
+          health_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS source_run_status (
+          run_id TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          fetched_at TEXT,
+          http_status INTEGER,
+          failure_reason TEXT,
+          detail_json TEXT NOT NULL,
+          PRIMARY KEY (run_id, source_id)
+        );
         CREATE TABLE IF NOT EXISTS embeddings (
           report_id TEXT NOT NULL,
           embedding_space_id TEXT NOT NULL,
@@ -358,6 +388,7 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
           error_message TEXT,
           UNIQUE (publish_idempotency_key, attempt_number)
         );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_publish_success_once ON publish_attempts(publish_idempotency_key) WHERE status = 'succeeded';
         CREATE TABLE IF NOT EXISTS runtime_config_snapshots (
           snapshot_id TEXT PRIMARY KEY,
           config_hash TEXT NOT NULL,
@@ -470,11 +501,9 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
 def embedding_config_valid(config: EmbeddingConfig) -> bool:
     if config.backend == "disabled":
         return False
-    if not config.backend or not config.model or not config.dimensions or not config.space_id:
+    if not config.backend or not config.provider or not config.model or not config.dimensions or not config.space_id:
         return False
-    if config.backend == "cli" and not config.command:
-        return False
-    if config.backend != "cli" and not config.provider:
+    if not config.command:
         return False
     return True
 
@@ -563,9 +592,12 @@ def selected_dedupe_key_for_report(report: Dict[str, Any]) -> Tuple[str, str, st
     elif report.get("canonical_url"):
         key_type = "canonical_url"
         normalized_key_value = report["canonical_url"]
+    elif not normalize_title(report["title"]):
+        key_type = "missing_identity_key"
+        normalized_key_value = ""
     else:
         key_type = "normalized_title_date"
-        normalized_key_value = "{}\n{}".format(normalize_title(report["title"]), date_bucket(report.get("published_at")))
+        normalized_key_value = "{}\n{}".format(normalize_title(report["title"]), date_bucket(report.get("published_at") or report.get("fetched_at")))
     key_scope = "source:{}".format(report["source_id"])
     key_hash = "sha256:" + hashlib.sha256("dedupe:v0\n{}\n{}\n{}".format(key_scope, key_type, normalized_key_value).encode("utf-8")).hexdigest()
     return key_type, key_scope, normalized_key_value, key_hash
@@ -755,14 +787,24 @@ class ArgusServer:
         event = event_id("prime", now, requested_by)
         self.connection.execute("INSERT OR REPLACE INTO prime_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (event, iso_z(now), None, requested_by, None, None, "running", None, None))
         self.connection.commit()
-        exit_code, summary = self._run_cycle("prime", now, prime=True)
-        completed_at = iso_z(self.clock.now())
-        self.connection.execute(
-            "UPDATE prime_events SET completed_at = ?, run_id = ?, prime_watermark_run_id = ?, status = ? WHERE event_id = ?",
-            (completed_at, summary["run_id"], summary["run_id"], "succeeded" if exit_code == 0 else "failed", event),
-        )
-        self.connection.commit()
-        return exit_code, summary
+        try:
+            exit_code, summary = self._run_cycle("prime", now, prime=True)
+            completed_at = iso_z(self.clock.now())
+            self.connection.execute(
+                "UPDATE prime_events SET completed_at = ?, run_id = ?, prime_watermark_run_id = ?, status = ? WHERE event_id = ?",
+                (completed_at, summary["run_id"], summary["run_id"], "succeeded" if exit_code == 0 else "failed", event),
+            )
+            self.connection.commit()
+            return exit_code, summary
+        except Exception as exc:
+            row = self.connection.execute("SELECT run_id FROM runs WHERE run_kind = 'prime' ORDER BY started_at DESC, rowid DESC LIMIT 1").fetchone()
+            run_id = row["run_id"] if row else None
+            self.connection.execute(
+                "UPDATE prime_events SET completed_at = ?, run_id = ?, prime_watermark_run_id = NULL, status = ?, error_class = ?, error_message = ? WHERE event_id = ?",
+                (iso_z(self.clock.now()), run_id, "failed", exc.__class__.__name__, str(exc), event),
+            )
+            self.connection.commit()
+            raise
 
     def manual_cycle(self) -> Tuple[int, Dict[str, Any]]:
         return self._run_cycle("manual", self.clock.now(), prime=False)
@@ -838,8 +880,10 @@ class ArgusServer:
                 now,
                 fixture_dir=self.config.fixture_dir,
                 prime=prime,
-                state_path=self.config.output_dir / "state.json",
-                state_write=True,
+                state_path=None,
+                state_read=False,
+                state_write=False,
+                dedupe_in_pipeline=False,
                 package_candidates_artifact=".pre-package-candidates.jsonl",
                 publish_candidates_artifact=".pre-publish-candidates.jsonl",
             )
@@ -850,25 +894,37 @@ class ArgusServer:
                 self.reload()
             publish_snapshot = latest_snapshot(self.connection)
             summary["effective_publish_snapshot"] = cycle_snapshot
-            (output_dir / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
             self._store_run(run_id, run_kind, now, exit_code, output_dir, cycle_snapshot, summary)
+            (output_dir / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+            self._store_source_health(run_id, now, output_dir)
             if prime:
                 self._store_normalized_storage(run_id, now, output_dir, None)
+                self._write_decision_artifacts(run_id, output_dir)
                 self._write_prime_artifacts(output_dir)
             else:
                 package_candidates_path = output_dir / ".pre-package-candidates.jsonl"
                 package_candidate_rows = [json.loads(line) for line in package_candidates_path.read_text().splitlines() if line.strip()]
                 candidate_report_ids = {row["report_id"] for row in package_candidate_rows}
                 accepted_report_ids = self._store_normalized_storage(run_id, now, output_dir, candidate_report_ids)
-                accepted_candidate_rows = [row for row in package_candidate_rows if row["report_id"] in accepted_report_ids]
+                accepted_candidate_rows = []
+                seen_candidate_report_ids = set()
+                for row in package_candidate_rows:
+                    if row["report_id"] in accepted_report_ids and row["report_id"] not in seen_candidate_report_ids:
+                        accepted_candidate_rows.append(row)
+                        seen_candidate_report_ids.add(row["report_id"])
                 package_candidates_path.write_text("".join(json.dumps(row) + "\n" for row in accepted_candidate_rows))
-                package_payloads = self._store_packages_and_publish(run_id, now, package_candidates_path, cycle_snapshot, publish_snapshot)
+                package_payloads = self._store_packages_and_publish(run_id, now, output_dir, package_candidates_path, cycle_snapshot, publish_snapshot)
+                self._write_decision_artifacts(run_id, output_dir)
                 (output_dir / "package-candidates.jsonl").write_text("".join(json.dumps(row) + "\n" for row in package_payloads))
                 (output_dir / "publish-candidates.jsonl").write_text("".join(json.dumps(row) + "\n" for row in package_payloads))
             completed_at = self.clock.now()
             self._record_scheduler_completion(run_id, completed_at)
             self._record_scheduler_event("cycle_completed", run_id, "ok" if exit_code == 0 else "failed", {"run_kind": run_kind}, completed_at)
             return exit_code, summary
+        except Exception as exc:
+            self._mark_run_failed(run_id, run_kind, now, output_dir, cycle_snapshot, exc)
+            self._record_scheduler_event("cycle_completed", run_id, "failed", {"run_kind": run_kind, "error": str(exc)}, self.clock.now())
+            raise
         finally:
             self._cycle_running = False
             self.connection.execute(
@@ -883,16 +939,115 @@ class ArgusServer:
         (output_dir / "prime-normalized-items.jsonl").write_text((output_dir / "normalized-items.jsonl").read_text())
         (output_dir / "prime-baseline.md").write_text("# Argus Prime Baseline\n\nNo live publish work was created.\n")
 
+    def _write_decision_artifacts(self, run_id: str, output_dir: Path) -> None:
+        dedupe_rows = [
+            {
+                **dict(row),
+                "detail": json.loads(row["detail_json"]),
+            }
+            for row in self.connection.execute("SELECT * FROM dedupe_decisions WHERE run_id = ? ORDER BY source_id, report_id", (run_id,))
+        ]
+        skipped_rows = [
+            {
+                **dict(row),
+                "detail": json.loads(row["detail_json"]),
+            }
+            for row in self.connection.execute("SELECT * FROM skipped_items WHERE run_id = ? ORDER BY source_id, report_id, reason_code", (run_id,))
+        ]
+        (output_dir / "dedupe-decisions.json").write_text(json.dumps(dedupe_rows, indent=2, sort_keys=True) + "\n")
+        (output_dir / "skipped-items.json").write_text(json.dumps(skipped_rows, indent=2, sort_keys=True) + "\n")
+
     def _store_run(self, run_id: str, run_kind: str, now: datetime, exit_code: int, output_dir: Path, snapshot: Dict[str, Any], summary: Dict[str, Any]) -> None:
-        status = "succeeded" if exit_code == 0 else "failed"
+        status = "failed" if exit_code != 0 else "succeeded_with_source_errors" if summary.get("counts", {}).get("failed_sources", 0) else "succeeded"
         self.connection.execute(
             "INSERT OR REPLACE INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (run_id, run_kind, iso_z(now), iso_z(self.clock.now()), status, str(output_dir), snapshot["snapshot_id"], json.dumps(summary, sort_keys=True)),
         )
         self.connection.commit()
 
-    def _embedding_for_candidate(self, candidate: Dict[str, Any], now: datetime) -> Optional[Dict[str, Any]]:
-        if self.config.embedding.backend == "cli" and self.config.embedding.command:
+    def _mark_run_failed(self, run_id: str, run_kind: str, now: datetime, output_dir: Path, snapshot: Dict[str, Any], error: Exception) -> None:
+        row = self.connection.execute("SELECT summary_json FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        summary = json.loads(row["summary_json"]) if row else {"run_id": run_id, "run_kind": run_kind}
+        summary["post_pipeline_error"] = {"class": error.__class__.__name__, "message": str(error)}
+        if row is None:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (run_id, run_kind, iso_z(now), iso_z(self.clock.now()), "failed", str(output_dir), snapshot["snapshot_id"], json.dumps(summary, sort_keys=True)),
+            )
+        else:
+            self.connection.execute(
+                "UPDATE runs SET status = ?, completed_at = ?, summary_json = ? WHERE run_id = ?",
+                ("failed", iso_z(self.clock.now()), json.dumps(summary, sort_keys=True), run_id),
+            )
+        self.connection.commit()
+
+    def _store_source_health(self, run_id: str, now: datetime, output_dir: Path) -> None:
+        path = output_dir / "source-health.json"
+        health_rows = json.loads(path.read_text()) if path.exists() else []
+        for item in health_rows:
+            previous = self.connection.execute("SELECT * FROM source_health WHERE source_id = ?", (item["source_id"],)).fetchone()
+            failed = item.get("status") == "failed"
+            consecutive_failures = (int(previous["consecutive_failures"]) if previous else 0) + 1 if failed else 0
+            total_successes = int(previous["total_successes"]) if previous else 0
+            total_failures = int(previous["total_failures"]) if previous else 0
+            if failed:
+                total_failures += 1
+            else:
+                total_successes += 1
+            last_error = item.get("last_error") or {}
+            self.connection.execute(
+                """
+                INSERT INTO source_health VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_id) DO UPDATE SET
+                  last_status=excluded.last_status,
+                  last_run_id=excluded.last_run_id,
+                  last_checked_at=excluded.last_checked_at,
+                  enabled=excluded.enabled,
+                  parse_status=excluded.parse_status,
+                  last_successful_fetch_at=excluded.last_successful_fetch_at,
+                  latest_item_published_at=excluded.latest_item_published_at,
+                  consecutive_failures=excluded.consecutive_failures,
+                  total_successes=excluded.total_successes,
+                  total_failures=excluded.total_failures,
+                  last_error_class=excluded.last_error_class,
+                  last_error_message=excluded.last_error_message,
+                  last_error=excluded.last_error,
+                  health_json=excluded.health_json
+                """,
+                (
+                    item["source_id"],
+                    item.get("status") or "unknown",
+                    run_id,
+                    item.get("fetched_at") or iso_z(now),
+                    int(bool(item.get("enabled", True))),
+                    item.get("parse_status"),
+                    item.get("last_successful_fetch_at"),
+                    item.get("latest_item_published_at"),
+                    consecutive_failures,
+                    total_successes,
+                    total_failures,
+                    last_error.get("class"),
+                    last_error.get("message"),
+                    item.get("failure_reason"),
+                    json.dumps(item, sort_keys=True),
+                ),
+            )
+            self.connection.execute(
+                "INSERT OR REPLACE INTO source_run_status VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    item["source_id"],
+                    item.get("status") or "unknown",
+                    item.get("fetched_at"),
+                    item.get("http_status"),
+                    item.get("failure_reason"),
+                    json.dumps(item, sort_keys=True),
+                ),
+            )
+        self.connection.commit()
+
+    def _embedding_for_candidate(self, candidate: Dict[str, Any], now: datetime) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        if self.config.embedding.command:
             input_hash = embedded_text_hash(candidate)
             request_id = "sha256:" + hashlib.sha256(
                 "embed-request:v0\n{}\n{}\n{}".format(candidate["report_id"], self.config.embedding.space_id, input_hash).encode("utf-8")
@@ -914,19 +1069,41 @@ class ArgusServer:
                     text=True,
                 )
                 if completed.returncode != 0:
-                    return None
-                response = json.loads(completed.stdout)
-            except (OSError, ValueError):
-                return None
+                    failure_payload = None
+                    for stream in (completed.stdout, completed.stderr):
+                        try:
+                            failure_payload = json.loads(stream) if stream.strip() else None
+                        except ValueError:
+                            failure_payload = None
+                        if isinstance(failure_payload, dict):
+                            break
+                    if isinstance(failure_payload, dict):
+                        return None, {
+                            "class": str(failure_payload.get("error_class") or failure_payload.get("class") or "embed_backend_unavailable"),
+                            "message": str(failure_payload.get("message") or failure_payload.get("error") or "embedding backend exited non-zero"),
+                            "retry_eligible": bool(failure_payload.get("retry_eligible", True)),
+                        }
+                    return None, {
+                        "class": "embed_backend_unavailable",
+                        "message": completed.stderr.strip() or "embedding backend exited non-zero",
+                        "retry_eligible": True,
+                    }
+                try:
+                    response = json.loads(completed.stdout)
+                except ValueError as exc:
+                    return None, {"class": "embed_invalid_response", "message": str(exc), "retry_eligible": True}
+            except OSError as exc:
+                return None, {"class": "embed_backend_unavailable", "message": str(exc), "retry_eligible": True}
             if (
                 response.get("space_id") != self.config.embedding.space_id
+                or response.get("provider") != self.config.embedding.provider
                 or response.get("model") != self.config.embedding.model
                 or int(response.get("dimensions", -1)) != int(self.config.embedding.dimensions or -2)
             ):
-                return None
+                return None, {"class": "embed_invalid_response", "message": "embedding metadata mismatch", "retry_eligible": True}
             vector = response.get("vector")
             if not isinstance(vector, list):
-                return None
+                return None, {"class": "embed_invalid_response", "message": "embedding vector is not a list", "retry_eligible": True}
             vector_hash = "sha256:" + hashlib.sha256(json.dumps(vector, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
             return {
                 "space_id": self.config.embedding.space_id,
@@ -938,12 +1115,42 @@ class ArgusServer:
                 "vector": vector,
                 "backend_request_id": response.get("backend_request_id"),
                 "embedded_at": iso_z(now),
-            }
+            }, None
         supplied = supplied_embedding_for(candidate)
-        return supplied if supplied else None
+        if supplied:
+            return supplied, None
+        return None, {"class": "embed_backend_unavailable", "message": "no supplied embedding", "retry_eligible": True}
 
-    def _store_packages_and_publish(self, run_id: str, now: datetime, candidates_path: Path, cycle_snapshot: Dict[str, Any], publish_snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _record_embedding_failure(self, run_id: str, now: datetime, candidate: Dict[str, Any], failure: Dict[str, Any]) -> Dict[str, Any]:
+        failure = {
+            **failure,
+            "run_id": run_id,
+            "source_id": candidate["source_id"],
+            "report_id": candidate["report_id"],
+        }
+        self.connection.execute(
+            "INSERT OR REPLACE INTO embeddings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                candidate["report_id"],
+                self.config.embedding.space_id or "",
+                self.config.embedding.provider or "",
+                self.config.embedding.model or "",
+                int(self.config.embedding.dimensions or 0),
+                embedded_text_hash(candidate),
+                "",
+                "[]",
+                None,
+                "failed",
+                json.dumps(failure, sort_keys=True),
+                None,
+                iso_z(now),
+            ),
+        )
+        return failure
+
+    def _store_packages_and_publish(self, run_id: str, now: datetime, output_dir: Path, candidates_path: Path, cycle_snapshot: Dict[str, Any], publish_snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
         package_payloads: List[Dict[str, Any]] = []
+        embedding_failures: List[Dict[str, Any]] = []
         rows = [json.loads(line) for line in candidates_path.read_text().splitlines() if line.strip()]
         for candidate in rows:
             if self.reload_requested:
@@ -964,16 +1171,18 @@ class ArgusServer:
                 "SELECT first_effective_mode FROM accepted_reports WHERE report_id = ?",
                 (candidate["report_id"],),
             ).fetchone()
-            supplied_embeddings = self._embedding_for_candidate(candidate, now)
+            supplied_embeddings, embedding_failure = self._embedding_for_candidate(candidate, now)
             if supplied_embeddings is None and cycle_snapshot["require_embeddings"] and not cycle_snapshot["allow_non_embedded_fallback"]:
+                failure = embedding_failure or {"class": "embed_backend_unavailable", "message": "embedding unavailable", "retry_eligible": True}
+                embedding_failures.append(self._record_embedding_failure(run_id, now, candidate, failure))
                 self.connection.execute(
                     "INSERT INTO skipped_items VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         run_id,
                         candidate["source_id"],
                         candidate["report_id"],
-                        "embed_backend_unavailable",
-                        json.dumps({"report_id": candidate["report_id"], "source_id": candidate["source_id"]}, sort_keys=True),
+                        failure["class"],
+                        json.dumps({**failure, "report_id": candidate["report_id"], "source_id": candidate["source_id"]}, sort_keys=True),
                         iso_z(now),
                     ),
                 )
@@ -1026,17 +1235,21 @@ class ArgusServer:
             if publish_allowed:
                 target = "sha256:" + hashlib.sha256(("publish-target:v0\n" + str(self.config.publish.subspace_endpoint)).encode("utf-8")).hexdigest()
                 key = "sha256:" + hashlib.sha256(("publish:v0\n{}\n{}".format(package_id, target)).encode("utf-8")).hexdigest()
+                if self.connection.execute("SELECT 1 FROM publish_attempts WHERE publish_idempotency_key = ? AND status = 'succeeded'", (key,)).fetchone():
+                    continue
                 attempt = "sha256:" + hashlib.sha256(("publish-attempt:v0\n{}\n1".format(key)).encode("utf-8")).hexdigest()
                 self.connection.execute(
                     "INSERT OR IGNORE INTO publish_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (attempt, package_id, target, key, publish_snapshot["snapshot_id"], 1, publish_snapshot["effective_mode"], "pending", iso_z(now), None, None, None, None),
                 )
+        (output_dir / "embedding-failures.json").write_text(json.dumps(embedding_failures, indent=2, sort_keys=True) + "\n")
         self.connection.commit()
         return package_payloads
 
     def _store_normalized_storage(self, run_id: str, now: datetime, output_dir: Path, accepted_report_ids: Optional[set[str]]) -> set[str]:
         sqlite_accepted_report_ids: set[str] = set()
         rows = [json.loads(line) for line in (output_dir / "normalized-items.jsonl").read_text().splitlines() if line.strip()]
+        rows.sort(key=lambda row: (row["source_id"], row.get("published_at") is None, row.get("published_at") or row.get("fetched_at") or "", row["report_id"]))
         for report in rows:
             key_type, key_scope, normalized_key_value, key_hash = selected_dedupe_key_for_report(report)
             existing_report = self.connection.execute("SELECT report_id FROM normalized_reports WHERE report_id = ?", (report["report_id"],)).fetchone()
@@ -1044,8 +1257,31 @@ class ArgusServer:
                 "SELECT report_id FROM dedupe_keys WHERE key_type = ? AND key_scope = ? AND key_hash = ?",
                 (key_type, key_scope, key_hash),
             ).fetchone()
+            existing_seen_in_run = self.connection.execute(
+                "SELECT 1 FROM report_seen_runs WHERE report_id = ? AND run_id = ?",
+                (report["report_id"], run_id),
+            ).fetchone()
             is_accepted = accepted_report_ids is None or report["report_id"] in accepted_report_ids
-            if existing_report:
+            retry_failed_embedding = bool(
+                existing_report
+                and is_accepted
+                and self.connection.execute(
+                    "SELECT 1 FROM embeddings WHERE report_id = ? AND status = 'failed'",
+                    (report["report_id"],),
+                ).fetchone()
+                and not self.connection.execute(
+                    "SELECT 1 FROM packages WHERE report_id = ?",
+                    (report["report_id"],),
+                ).fetchone()
+            )
+            if key_type == "missing_identity_key":
+                decision = "missing_identity_key"
+            elif retry_failed_embedding:
+                decision = "seen_existing_report"
+                sqlite_accepted_report_ids.add(report["report_id"])
+            elif existing_key and existing_seen_in_run:
+                decision = "exact_duplicate"
+            elif existing_report:
                 decision = "seen_existing_report"
             elif existing_key:
                 decision = "exact_duplicate"
@@ -1054,15 +1290,15 @@ class ArgusServer:
                 sqlite_accepted_report_ids.add(report["report_id"])
             else:
                 decision = "skipped_not_package_candidate"
-            if decision in {"exact_duplicate", "skipped_not_package_candidate"}:
+            if decision in {"exact_duplicate", "skipped_not_package_candidate", "missing_identity_key"}:
                 detail = {
                     "source_id": report["source_id"],
                     "report_id": report["report_id"],
                     "duplicate_of_report_id": existing_key["report_id"] if existing_key else None,
-                    "duplicate_key_type": key_type,
+                    "duplicate_key_type": None if decision == "missing_identity_key" else key_type,
                     "duplicate_key_scope": key_scope,
-                    "duplicate_key_hash": key_hash,
-                    "duplicate_key_precedence": 1 if key_type == "feed_entry_id" else 2 if key_type == "canonical_url" else 3,
+                    "duplicate_key_hash": None if decision == "missing_identity_key" else key_hash,
+                    "duplicate_key_precedence": 1 if key_type == "feed_entry_id" else 2 if key_type == "canonical_url" else 3 if key_type == "normalized_title_date" else None,
                     "reason": decision,
                     "title": report["title"],
                     "canonical_url": report["canonical_url"],
@@ -1081,9 +1317,9 @@ class ArgusServer:
                         report["source_id"],
                         decision,
                         detail["duplicate_of_report_id"],
-                        key_type,
+                        detail["duplicate_key_type"],
                         key_scope,
-                        key_hash,
+                        detail["duplicate_key_hash"],
                         detail["duplicate_key_precedence"],
                         normalized_key_value.replace("\n", " ")[:160],
                         decision,
@@ -1141,9 +1377,17 @@ class ArgusServer:
             )
         skipped_path = output_dir / "skipped-items.json"
         for item in json.loads(skipped_path.read_text()) if skipped_path.exists() else []:
+            reason_code = item.get("reason_code") or "source_skipped_counts"
             self.connection.execute(
                 "INSERT INTO skipped_items VALUES (?, ?, ?, ?, ?, ?)",
-                (run_id, item["source_id"], None, "source_skipped_counts", json.dumps(item, sort_keys=True), iso_z(now)),
+                (
+                    run_id,
+                    item["source_id"],
+                    item.get("report_id"),
+                    reason_code,
+                    json.dumps(item.get("detail") or item, sort_keys=True),
+                    iso_z(now),
+                ),
             )
         self.connection.commit()
         return sqlite_accepted_report_ids
@@ -1151,12 +1395,14 @@ class ArgusServer:
     def _record_scheduler_config(self, scheduler: SchedulerConfig, now: datetime, recompute_next: bool) -> None:
         existing = self.connection.execute("SELECT mode, last_completed_at FROM scheduler_state WHERE id = 1").fetchone()
         last_completed_at = existing["last_completed_at"] if existing else None
+        previous_mode = existing["mode"] if existing else None
         if scheduler.mode == "manual":
             next_due_at = None
+        elif not last_completed_at and recompute_next and previous_mode == "manual":
+            next_due_at = iso_z(now + timedelta(seconds=scheduler.interval_seconds + self._jitter_offset("{}:{}".format(iso_z(now), scheduler.interval_seconds))))
         elif not last_completed_at and scheduler.run_on_startup_if_due:
             next_due_at = iso_z(now)
         elif last_completed_at:
-            previous_mode = existing["mode"] if existing else None
             base = now if recompute_next and previous_mode == "manual" else parse_now(last_completed_at)
             next_due_at = iso_z(base + timedelta(seconds=scheduler.interval_seconds + self._jitter_offset("{}:{}".format(iso_z(now), scheduler.interval_seconds))))
         else:
@@ -1290,13 +1536,20 @@ def _pid_matches_config(pid: int, config_path: Path) -> bool:
 
 
 def run_source_health(db_path: Path) -> List[Dict[str, Any]]:
-    status = run_status(db_path)
-    last_run = status.get("last_run")
-    if not last_run:
-        return []
-    output_dir = Path(last_run["output_dir"])
-    path = output_dir / "source-health.json"
-    return json.loads(path.read_text()) if path.exists() else []
+    connection = connect_database(db_path)
+    try:
+        return [
+            {
+                **json.loads(row["health_json"]),
+                "last_run_id": row["last_run_id"],
+                "consecutive_failures": row["consecutive_failures"],
+                "total_successes": row["total_successes"],
+                "total_failures": row["total_failures"],
+            }
+            for row in connection.execute("SELECT * FROM source_health ORDER BY source_id")
+        ]
+    finally:
+        connection.close()
 
 
 def explain_skip(db_path: Path, run_id: str) -> Dict[str, Any]:
@@ -1307,6 +1560,40 @@ def explain_skip(db_path: Path, run_id: str) -> Dict[str, Any]:
             raise PipelineError("Unknown run: {}".format(run_id))
         output_dir = Path(row["output_dir"])
         summary = json.loads((output_dir / "run-summary.json").read_text())
-        return {"run": dict(row), "summary": summary}
+        skipped_rows = connection.execute(
+            "SELECT * FROM skipped_items WHERE run_id = ? ORDER BY source_id, report_id, reason_code",
+            (run_id,),
+        ).fetchall()
+        duplicate_rows = connection.execute(
+            "SELECT * FROM dedupe_decisions WHERE run_id = ? AND decision = 'exact_duplicate' ORDER BY source_id, report_id",
+            (run_id,),
+        ).fetchall()
+        return {
+            "run": dict(row),
+            "summary": summary,
+            "skipped_items": [
+                {
+                    **dict(skipped),
+                    "detail": json.loads(skipped["detail_json"]),
+                }
+                for skipped in skipped_rows
+            ],
+            "exact_duplicates": [
+                {
+                    "source_id": duplicate["source_id"],
+                    "report_id": duplicate["report_id"],
+                    "duplicate_of_report_id": duplicate["duplicate_of_report_id"],
+                    "selected_key_type": duplicate["duplicate_key_type"],
+                    "selected_key_scope": duplicate["duplicate_key_scope"],
+                    "selected_key_hash": duplicate["duplicate_key_hash"],
+                    "selected_key_precedence": duplicate["duplicate_key_precedence"],
+                    "normalized_value_preview": duplicate["duplicate_key_value_preview"],
+                    "reason": duplicate["reason"],
+                    "candidate": json.loads(duplicate["detail_json"]),
+                    "cross_source_note": "source-local exact dedupe only; cross-source overlap is not suppressed",
+                }
+                for duplicate in duplicate_rows
+            ],
+        }
     finally:
         connection.close()

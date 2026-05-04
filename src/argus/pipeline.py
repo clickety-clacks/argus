@@ -8,11 +8,12 @@ import json
 import re
 import sys
 import time
+import posixpath
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 from xml.etree import ElementTree as ET
 
 import requests
@@ -28,29 +29,17 @@ DROP_QUERY_PARAMS = {
     "utm_term",
     "utm_content",
     "utm_id",
-    "utm_name",
-    "utm_cid",
-    "utm_reader",
-    "utm_viz_id",
-    "utm_pubreferrer",
-    "utm_swu",
-    "ref",
-    "ref_src",
-    "source",
-    "fbclid",
     "gclid",
+    "fbclid",
     "mc_cid",
     "mc_eid",
-    "ocid",
-    "guccounter",
-    "guce_referrer",
-    "guce_referrer_sig",
-    "ncid",
-    "trk",
-    "mkt_tok",
+    "igshid",
+    "ref",
+    "ref_src",
 }
 ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
+UNRESERVED_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 
 
 class HTMLStripper(HTMLParser):
@@ -285,22 +274,35 @@ def atom_child_text(node: ET.Element, name: str, ns: Dict[str, str]) -> Optional
 
 
 def normalize_title(text: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text.lower())).strip()
+    collapsed = re.sub(r"\s+", " ", text.lower()).strip()
+    return re.sub(r"^[^\w]+|[^\w]+$", "", collapsed).strip()
+
+
+def normalize_percent_escapes(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        char = chr(int(raw[1:], 16))
+        return char if char in UNRESERVED_CHARS else raw.upper()
+
+    return re.sub(r"%[0-9A-Fa-f]{2}", replace, value)
 
 
 def canonicalize_url(url: Optional[str]) -> Optional[str]:
     if not url:
         return None
     parsed = urlparse(url.strip())
-    if not parsed.scheme or not parsed.netloc:
-        return url.strip()
-    query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k.lower() not in DROP_QUERY_PARAMS]
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return None
+    query = sorted((k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k.lower() not in DROP_QUERY_PARAMS)
     netloc = parsed.netloc.lower()
     if (parsed.scheme == "https" and netloc.endswith(":443")) or (parsed.scheme == "http" and netloc.endswith(":80")):
         netloc = netloc.rsplit(":", 1)[0]
-    path = parsed.path or "/"
-    if path != "/":
-        path = path.rstrip("/")
+    path = posixpath.normpath(normalize_percent_escapes(parsed.path or "/"))
+    if not path.startswith("/"):
+        path = "/" + path
+    if (parsed.path or "/").endswith("/") and not path.endswith("/"):
+        path += "/"
+    path = normalize_percent_escapes(quote(path, safe="/-._~%"))
     return urlunparse((parsed.scheme.lower(), netloc, path, "", urlencode(query), ""))
 
 
@@ -339,7 +341,7 @@ def parse_rss(xml_text: str, source: SourceConfig) -> List[RawEntry]:
             RawEntry(
                 source=source,
                 feed_entry_id=child_text(item, "guid") or child_text(item, "id"),
-                title=child_text(item, "title") or "(untitled)",
+                title=child_text(item, "title") or "",
                 canonical_url=link,
                 raw_url=link,
                 published_at=child_text(item, "pubDate") or child_text(item, "published") or child_text(item, "dc:date"),
@@ -359,7 +361,7 @@ def parse_atom(xml_text: str, source: SourceConfig) -> List[RawEntry]:
             RawEntry(
                 source=source,
                 feed_entry_id=atom_child_text(item, "atom:id", ATOM_NS),
-                title=atom_child_text(item, "atom:title", ATOM_NS) or "(untitled)",
+                title=atom_child_text(item, "atom:title", ATOM_NS) or "",
                 canonical_url=choose_link(item, "atom"),
                 raw_url=choose_link(item, "atom"),
                 published_at=atom_child_text(item, "atom:published", ATOM_NS) or atom_child_text(item, "atom:updated", ATOM_NS),
@@ -381,7 +383,7 @@ def parse_arxiv_atom(xml_text: str, source: SourceConfig) -> List[RawEntry]:
             RawEntry(
                 source=source,
                 feed_entry_id=atom_child_text(item, "atom:id", ARXIV_NS),
-                title=atom_child_text(item, "atom:title", ARXIV_NS) or "(untitled)",
+                title=atom_child_text(item, "atom:title", ARXIV_NS) or "",
                 canonical_url=choose_link(item, "arxiv_atom"),
                 raw_url=choose_link(item, "arxiv_atom"),
                 published_at=atom_child_text(item, "atom:published", ARXIV_NS) or atom_child_text(item, "atom:updated", ARXIV_NS),
@@ -430,11 +432,13 @@ def report_identity_input(feed_entry_id: Optional[str], canonical_url: Optional[
         return "feed_entry_id", normalize_feed_entry_id(feed_entry_id)
     if canonical_url:
         return "canonical_url", canonical_url
+    if not normalize_title(title):
+        return "missing_identity_key", ""
     return "normalized_title_date", "{}\n{}".format(normalize_title(title), date_bucket(published_at))
 
 
-def report_id_for(source_id: str, feed_entry_id: Optional[str], canonical_url: Optional[str], title: str, published_at: Optional[str]) -> str:
-    input_type, input_value = report_identity_input(feed_entry_id, canonical_url, title, published_at)
+def report_id_for(source_id: str, feed_entry_id: Optional[str], canonical_url: Optional[str], title: str, identity_timestamp: Optional[str]) -> str:
+    input_type, input_value = report_identity_input(feed_entry_id, canonical_url, title, identity_timestamp)
     basis = "report:v0\n{}\n{}\n{}".format(source_id, input_type, input_value)
     return "sha256:" + hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
@@ -445,11 +449,13 @@ def date_bucket(timestamp: Optional[str]) -> str:
 
 def dedupe_key(report: Dict[str, Any]) -> Tuple[str, str, str]:
     source_id = report["source_id"]
+    if report.get("report_id_input_type") == "missing_identity_key":
+        return source_id, "missing_identity_key", ""
     if report.get("feed_entry_id"):
         return source_id, "feed_entry_id", normalize_feed_entry_id(report["feed_entry_id"])
     if report.get("canonical_url"):
         return source_id, "canonical_url", report["canonical_url"]
-    return source_id, "normalized_title_date", "{}\n{}".format(normalize_title(report["title"]), date_bucket(report.get("published_at")))
+    return source_id, "normalized_title_date", "{}\n{}".format(normalize_title(report["title"]), date_bucket(report.get("published_at") or report.get("fetched_at")))
 
 
 def persistent_identities_for(report: Dict[str, Any]) -> List[Tuple[str, str]]:
@@ -458,12 +464,13 @@ def persistent_identities_for(report: Dict[str, Any]) -> List[Tuple[str, str]]:
         identities.append(("feed_entry_id", normalize_feed_entry_id(report["feed_entry_id"])))
     if report.get("canonical_url"):
         identities.append(("canonical_url", report["canonical_url"]))
-    identities.append(
-        (
-            "normalized_title_date",
-            "{}\n{}".format(normalize_title(report["title"]), date_bucket(report.get("published_at"))),
+    if normalize_title(report["title"]) and report.get("report_id_input_type") != "missing_identity_key":
+        identities.append(
+            (
+                "normalized_title_date",
+                "{}\n{}".format(normalize_title(report["title"]), date_bucket(report.get("published_at") or report.get("fetched_at"))),
+            )
         )
-    )
     return identities
 
 
@@ -476,10 +483,14 @@ def normalize_entry(entry: RawEntry, fetched_at: str) -> Dict[str, Any]:
     raw_url = canonicalize_url(entry.raw_url) if entry.raw_url else canonical_url
     clean_summary_value = clean_text(entry.raw_summary)
     published_at = normalize_timestamp(entry.published_at)
-    report_id = report_id_for(entry.source.id, entry.feed_entry_id, canonical_url, entry.title, published_at)
+    identity_timestamp = published_at or fetched_at
+    report_input_type, report_input_value = report_identity_input(entry.feed_entry_id, canonical_url, entry.title, identity_timestamp)
+    report_id = report_id_for(entry.source.id, entry.feed_entry_id, canonical_url, entry.title, identity_timestamp)
     return {
         "schema_version": SCHEMA_VERSION,
         "report_id": report_id,
+        "report_id_input_type": report_input_type,
+        "report_id_input_value": report_input_value,
         "source_id": entry.source.id,
         "source_name": entry.source.name,
         "source_class": entry.source.source_class,
@@ -578,7 +589,9 @@ def run_pipeline(
     dry_run: bool = False,
     prime: bool = False,
     state_path: Optional[Path] = None,
+    state_read: bool = True,
     state_write: bool = True,
+    dedupe_in_pipeline: bool = True,
     package_candidates_artifact: str = "package-candidates.jsonl",
     publish_candidates_artifact: str = "publish-candidates.jsonl",
 ) -> Tuple[int, Dict[str, Any]]:
@@ -592,7 +605,9 @@ def run_pipeline(
         dry_run=dry_run,
         prime=prime,
         state_path=state_path,
+        state_read=state_read,
         state_write=state_write,
+        dedupe_in_pipeline=dedupe_in_pipeline,
         package_candidates_artifact=package_candidates_artifact,
         publish_candidates_artifact=publish_candidates_artifact,
     )
@@ -607,19 +622,22 @@ def run_pipeline_for_sources(
     dry_run: bool = False,
     prime: bool = False,
     state_path: Optional[Path] = None,
+    state_read: bool = True,
     state_write: bool = True,
+    dedupe_in_pipeline: bool = True,
     package_candidates_artifact: str = "package-candidates.jsonl",
     publish_candidates_artifact: str = "publish-candidates.jsonl",
 ) -> Tuple[int, Dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     effective_state_path = state_path or default_state_path(output_dir)
-    state = load_state(effective_state_path)
+    state = load_state(effective_state_path) if state_read else {"schema_version": STATE_SCHEMA_VERSION, "sources": {}}
     next_state = json.loads(json.dumps(state))
 
     source_health: List[Dict[str, Any]] = []
     normalized_rows: List[Dict[str, Any]] = []
     clusters: List[Dict[str, Any]] = []
     publish_candidates: List[Dict[str, Any]] = []
+    skipped_item_details: List[Dict[str, Any]] = []
     primed_candidates = 0
     duplicate_count = 0
     fetched_sources = 0
@@ -639,6 +657,10 @@ def run_pipeline_for_sources(
                     "source_id": source.id,
                     "source_name": source.name,
                     "status": "disabled",
+                    "enabled": False,
+                    "parse_status": "skipped",
+                    "last_successful_fetch_at": None,
+                    "latest_item_published_at": None,
                     "feed_url": source.feed_url,
                     "fetched_at": None,
                     "http_status": None,
@@ -648,6 +670,7 @@ def run_pipeline_for_sources(
                     "emitted_candidate_count": 0,
                     "skipped_previously_seen_count": 0,
                     "failure_reason": None,
+                    "last_error": None,
                     "elapsed_ms": 0,
                     "etag": validator_view.get("etag"),
                     "last_modified": validator_view.get("last_modified"),
@@ -674,6 +697,10 @@ def run_pipeline_for_sources(
                         "source_id": source.id,
                         "source_name": source.name,
                         "status": "not_modified",
+                        "enabled": True,
+                        "parse_status": "not_modified",
+                        "last_successful_fetch_at": fetched_at,
+                        "latest_item_published_at": None,
                         "feed_url": source.feed_url,
                         "fetched_at": fetched_at,
                         "http_status": fetch_result.status_code,
@@ -683,6 +710,7 @@ def run_pipeline_for_sources(
                         "emitted_candidate_count": 0,
                         "skipped_previously_seen_count": 0,
                         "failure_reason": None,
+                        "last_error": None,
                         "elapsed_ms": fetch_result.elapsed_ms,
                         "etag": state_after["validators"].get("etag"),
                         "last_modified": state_after["validators"].get("last_modified"),
@@ -701,6 +729,22 @@ def run_pipeline_for_sources(
             for entry in entries:
                 report = normalize_entry(entry, fetched_at)
                 identity = dedupe_key(report)
+                if identity[1] == "missing_identity_key":
+                    skipped_item_details.append(
+                        {
+                            "source_id": source.id,
+                            "report_id": report["report_id"],
+                            "reason_code": "missing_identity_key",
+                            "detail": {
+                                "source_id": source.id,
+                                "title": report["title"],
+                                "canonical_url": report.get("canonical_url"),
+                                "feed_entry_id": report.get("feed_entry_id"),
+                                "published_at": report.get("published_at"),
+                            },
+                        }
+                    )
+                    continue
                 normalized_rows.append(report)
                 normalized_count += 1
                 if identity in seen:
@@ -720,7 +764,8 @@ def run_pipeline_for_sources(
                         }
                         source_clusters.append(cluster)
                     cluster["report_ids"].append(report["report_id"])
-                    continue
+                    if dedupe_in_pipeline:
+                        continue
 
                 seen[identity] = report
 
@@ -755,6 +800,10 @@ def run_pipeline_for_sources(
                     "source_id": source.id,
                     "source_name": source.name,
                     "status": status,
+                    "enabled": True,
+                    "parse_status": "ok",
+                    "last_successful_fetch_at": fetched_at,
+                    "latest_item_published_at": max((row.get("published_at") for row in normalized_rows if row["source_id"] == source.id and row.get("published_at")), default=None),
                     "feed_url": source.feed_url,
                     "fetched_at": fetched_at,
                     "http_status": fetch_result.status_code,
@@ -765,6 +814,7 @@ def run_pipeline_for_sources(
                     "skipped_previously_seen_count": skipped_seen_count,
                     "skipped_stale_count": skipped_stale_count,
                     "failure_reason": None,
+                    "last_error": None,
                     "elapsed_ms": fetch_result.elapsed_ms,
                     "etag": state_after["validators"].get("etag"),
                     "last_modified": state_after["validators"].get("last_modified"),
@@ -777,6 +827,10 @@ def run_pipeline_for_sources(
                     "source_id": source.id,
                     "source_name": source.name,
                     "status": "failed",
+                    "enabled": True,
+                    "parse_status": "failed",
+                    "last_successful_fetch_at": None,
+                    "latest_item_published_at": None,
                     "feed_url": source.feed_url,
                     "fetched_at": fetched_at,
                     "http_status": getattr(getattr(exc, "response", None), "status_code", None),
@@ -786,6 +840,7 @@ def run_pipeline_for_sources(
                     "emitted_candidate_count": 0,
                     "skipped_previously_seen_count": 0,
                     "failure_reason": str(exc),
+                    "last_error": {"class": exc.__class__.__name__, "message": str(exc)},
                     "elapsed_ms": 0,
                     "etag": validator_view.get("etag"),
                     "last_modified": validator_view.get("last_modified"),
@@ -793,10 +848,7 @@ def run_pipeline_for_sources(
             )
 
     enabled_sources = [source for source in sources if source.enabled]
-    if succeeded_sources == 0:
-        exit_status = "failed"
-        exit_code = 1
-    elif failed_sources > 0:
+    if failed_sources > 0:
         exit_status = "partial_failure"
         exit_code = 0
     else:
@@ -841,7 +893,8 @@ def run_pipeline_for_sources(
         "publish_performed": False,
         "state": {
             "path": str(effective_state_path),
-            "loaded": effective_state_path.exists(),
+            "loaded": bool(state_read and effective_state_path.exists()),
+            "read_enabled": state_read,
             "write_enabled": state_write,
             "write_performed": bool(state_write and exit_code == 0),
         },
@@ -853,9 +906,10 @@ def run_pipeline_for_sources(
     write_jsonl(output_dir / "normalized-items.jsonl", normalized_rows)
     write_jsonl(output_dir / "clusters.jsonl", clusters)
     write_json(output_dir / "dedupe-decisions.json", clusters)
-    skipped_items = [
+    skipped_items = skipped_item_details + [
         {
             "source_id": row["source_id"],
+            "reason_code": "source_skipped_counts",
             "skipped_previously_seen_count": row.get("skipped_previously_seen_count", 0),
             "skipped_stale_count": row.get("skipped_stale_count", 0),
         }
