@@ -23,6 +23,9 @@ MIN_INTERVAL_SECONDS = 15 * 60
 MAX_INTERVAL_SECONDS = 24 * 60 * 60
 DEFAULT_INTERVAL_SECONDS = 60 * 60
 SOURCE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+SOURCE_CLASSES = {"official", "research", "editorial", "community", "adapter"}
+FEED_ADAPTERS = {"rss", "atom"}
+API_ADAPTERS = {"api", "arxiv_atom"}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,6 +64,7 @@ class RuntimeConfig:
     scheduler: SchedulerConfig
     publish: PublishConfig
     embedding: EmbeddingConfig
+    source_fetch_concurrency: int = 4
     fixture_dir: Optional[Path] = None
     source_config_path: str = "<config>"
     config_hash: str = ""
@@ -71,6 +75,35 @@ class ServiceRegistration:
     pid: int
     database_path: str
     config_path: str
+
+
+def runtime_service_pid(config_path: Path) -> Optional[int]:
+    temp_registration_path = Path(tempfile.gettempdir()) / "argus-{}.service.json".format(hashlib.sha256(str(config_path).encode("utf-8")).hexdigest()[:24])
+    registration_path = config_path.with_name(config_path.name + ".service.json")
+    effective_registration_path = registration_path if registration_path.exists() else temp_registration_path
+    if effective_registration_path.exists():
+        registration = json.loads(effective_registration_path.read_text())
+        pid = int(registration["pid"])
+        if _pid_matches_config(pid, config_path):
+            return pid
+    try:
+        config = load_runtime_config(config_path)
+    except Exception:
+        return None
+    if not config.database_path.exists():
+        return None
+    connection = connect_database_readonly(config.database_path)
+    try:
+        try:
+            row = connection.execute("SELECT * FROM service_state WHERE id = 1").fetchone()
+        except sqlite3.OperationalError:
+            return None
+        if row is None:
+            return None
+        pid = int(row["pid"])
+        return pid if _pid_matches_config(pid, config_path) else None
+    finally:
+        connection.close()
 
 
 class Clock:
@@ -155,23 +188,54 @@ def source_from_runtime(row: Dict[str, Any]) -> SourceConfig:
     source_id = str(row["id"])
     if not SOURCE_ID_RE.match(source_id):
         raise PipelineError("Invalid source id: {}".format(source_id))
-    feed_url = row.get("feed_url") or row.get("api_url")
+    enabled = bool(row.get("enabled", True))
+    has_feed_url = bool(row.get("feed_url"))
+    has_api_url = bool(row.get("api_url"))
+    required = ["display_name", "source_class", "site_url", "adapter", "freshness_window_hours", "authority_score"]
+    missing = [field for field in required if row.get(field) is None or row.get(field) == ""]
+    if enabled and missing:
+        raise PipelineError("Enabled source missing required fields for {}: {}".format(source_id, ", ".join(missing)))
+    if not enabled and not (has_feed_url or has_api_url or row.get("fixture_payload_path")):
+        raise PipelineError("Disabled source must set an endpoint or fixture_payload_path: {}".format(source_id))
+    if enabled and has_feed_url == has_api_url:
+        raise PipelineError("Enabled source must set exactly one fetch endpoint family: {}".format(source_id))
     adapter = str(row.get("adapter", "rss"))
+    if adapter in FEED_ADAPTERS and has_api_url:
+        raise PipelineError("Feed adapter source must use feed_url: {}".format(source_id))
+    if adapter in API_ADAPTERS and has_feed_url:
+        raise PipelineError("API adapter source must use api_url: {}".format(source_id))
+    if adapter not in FEED_ADAPTERS | API_ADAPTERS:
+        raise PipelineError("Invalid source adapter for {}: {}".format(source_id, adapter))
+    source_class = str(row["source_class"])
+    if source_class not in SOURCE_CLASSES:
+        raise PipelineError("Invalid source_class for {}: {}".format(source_id, source_class))
+    feed_url = row.get("feed_url") or row.get("api_url")
     feed_type = {"rss": "rss", "atom": "atom", "arxiv_atom": "arxiv_atom", "generic_rss": "rss"}.get(adapter, adapter)
+    authority_score = row.get("authority_score")
+    if authority_score is not None and not 0 <= float(authority_score) <= 1:
+        raise PipelineError("Invalid authority_score for {}: {}".format(row.get("id"), authority_score))
+    fixture_payload_path = row.get("fixture_payload_path")
+    if fixture_payload_path is not None:
+        fixture_payload_path = str(fixture_payload_path)
+        if Path(fixture_payload_path).is_absolute() or not fixture_payload_path.startswith("testdata/feeds/"):
+            raise PipelineError("Invalid fixture_payload_path for {}: {}".format(row.get("id"), fixture_payload_path))
     return SourceConfig(
         id=source_id,
         name=str(row.get("display_name") or row.get("name") or source_id),
-        source_class=str(row["source_class"]),
-        source_category=str(row.get("source_category") or row.get("source_class")),
+        source_class=source_class,
+        source_category=str(row.get("source_category") or source_class),
         feed_type=feed_type,
         feed_url=str(feed_url),
         site_url=str(row.get("site_url") or feed_url),
-        enabled=bool(row.get("enabled", True)),
+        enabled=enabled,
         tier=int(row.get("tier", 1)),
         freshness_window_hours=(int(row["freshness_window_hours"]) if row.get("freshness_window_hours") is not None else None),
         adapter=adapter,
         request_headers={str(k): str(v) for k, v in (row.get("headers") or row.get("request_headers") or {}).items()},
         notes=str(row["notes"]) if row.get("notes") is not None else None,
+        cadence_interval_seconds=(parse_duration_seconds(row["cadence_override"]) if row.get("cadence_override") is not None else None),
+        authority_score=(float(authority_score) if authority_score is not None else None),
+        fixture_payload_path=fixture_payload_path,
     )
 
 
@@ -186,6 +250,9 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
     output_dir = runtime.get("output_dir") or payload.get("output_dir")
     if not database_path or not output_dir:
         raise PipelineError("runtime.database_path and runtime.output_dir are required")
+    source_fetch_concurrency = int(runtime.get("source_fetch_concurrency", 4))
+    if source_fetch_concurrency < 1 or source_fetch_concurrency > 16:
+        raise PipelineError("runtime.source_fetch_concurrency must be in range 1..16")
     sources_payload = payload.get("sources")
     if not isinstance(sources_payload, list):
         raise PipelineError("sources must be a list")
@@ -229,6 +296,7 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
         scheduler=validate_scheduler(payload.get("schedule") or {}),
         publish=publish,
         embedding=embedding,
+        source_fetch_concurrency=source_fetch_concurrency,
         fixture_dir=(Path(runtime["fixture_dir"]) if runtime.get("fixture_dir") else None),
         source_config_path=str(path),
         config_hash=config_hash(payload),
@@ -239,7 +307,19 @@ def connect_database(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout = 5000")
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA foreign_keys = ON")
     apply_migrations(connection)
+    return connection
+
+
+def connect_database_readonly(path: Path) -> sqlite3.Connection:
+    if not path.exists():
+        raise PipelineError("Argus database does not exist: {}".format(path))
+    connection = sqlite3.connect("file:{}?mode=ro".format(path), uri=True)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout = 5000")
     return connection
 
 
@@ -255,6 +335,30 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
           output_dir TEXT NOT NULL,
           effective_snapshot_id TEXT,
           summary_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS config_snapshots (
+          config_hash TEXT PRIMARY KEY,
+          captured_at TEXT NOT NULL,
+          config_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS source_config_snapshots (
+          run_id TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          source_config_json TEXT NOT NULL,
+          PRIMARY KEY (run_id, source_id)
+        );
+        CREATE TABLE IF NOT EXISTS raw_fetches (
+          fetch_id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL,
+          source_id TEXT NOT NULL,
+          url TEXT NOT NULL,
+          fetched_at TEXT NOT NULL,
+          http_status INTEGER,
+          duration_ms INTEGER,
+          payload_hash TEXT,
+          payload_ref TEXT,
+          error_class TEXT,
+          error_message TEXT
         );
         CREATE TABLE IF NOT EXISTS packages (
           package_id TEXT PRIMARY KEY,
@@ -409,6 +513,18 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
           config_hash TEXT,
           snapshot_id TEXT,
           status TEXT NOT NULL,
+          error_class TEXT,
+          error_message TEXT
+        );
+        CREATE TABLE IF NOT EXISTS control_requests (
+          request_id TEXT PRIMARY KEY,
+          requested_at TEXT NOT NULL,
+          action TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          status TEXT NOT NULL,
+          started_at TEXT,
+          completed_at TEXT,
+          result_json TEXT,
           error_class TEXT,
           error_message TEXT
         );
@@ -665,20 +781,52 @@ class ArgusServer:
         self.running = False
         self.reload_requested = False
         self._cycle_running = False
+        self._persisted_activation_observed_at: Optional[str] = None
         if self.register_service:
             self.start()
         else:
             self._ensure_control_state()
 
+    def _apply_persisted_publish_state(self) -> None:
+        row = self.connection.execute(
+            "SELECT snapshot_json FROM runtime_config_snapshots ORDER BY observed_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return
+        snapshot = json.loads(row["snapshot_json"])
+        self._persisted_activation_observed_at = snapshot.get("activation_observed_at")
+        requested_mode = snapshot.get("requested_mode")
+        if requested_mode in {"inactive", "active"}:
+            self.config = dataclasses.replace(
+                self.config,
+                publish=dataclasses.replace(self.config.publish, state=requested_mode),
+            )
+
+    def _build_publish_snapshot(self, now: datetime, force_inactive: bool = False, error: Optional[str] = None) -> Dict[str, Any]:
+        snapshot = build_publish_snapshot(self.config, now, force_inactive=force_inactive, error=error)
+        if not force_inactive and snapshot.get("requested_mode") == "active":
+            try:
+                previous = latest_snapshot(self.connection)
+            except PipelineError:
+                previous = None
+            activation_observed_at = (previous or {}).get("activation_observed_at") if (previous or {}).get("requested_mode") == "active" else None
+            if activation_observed_at:
+                snapshot["activation_observed_at"] = activation_observed_at
+        return snapshot
+
     def _ensure_control_state(self) -> None:
         now = self.clock.now()
-        store_runtime_snapshot(self.connection, build_publish_snapshot(self.config, now), "control_start", "ok")
+        self._store_config_snapshot(now)
+        self._apply_persisted_publish_state()
+        store_runtime_snapshot(self.connection, self._build_publish_snapshot(now), "control_start", "ok")
         if self.connection.execute("SELECT 1 FROM scheduler_state WHERE id = 1").fetchone() is None:
             self._record_scheduler_config(self.config.scheduler, now, recompute_next=True)
 
     def start(self) -> None:
         now = self.clock.now()
-        snapshot = build_publish_snapshot(self.config, now)
+        self._store_config_snapshot(now)
+        self._apply_persisted_publish_state()
+        snapshot = self._build_publish_snapshot(now)
         store_runtime_snapshot(self.connection, snapshot, "service_start" if self.register_service else "control_start", "ok")
         if self.register_service:
             self.connection.execute(
@@ -688,6 +836,7 @@ class ArgusServer:
             self._write_service_registration()
             stale = self.connection.execute("SELECT running_run_id FROM scheduler_state WHERE id = 1").fetchone()
             if stale and stale["running_run_id"]:
+                self._mark_stale_run_failed(stale["running_run_id"], now)
                 self.connection.execute(
                     "UPDATE scheduler_state SET running_run_id = NULL, updated_at = ? WHERE id = 1",
                     (iso_z(now),),
@@ -696,6 +845,26 @@ class ArgusServer:
                 self._record_scheduler_event("cycle_recovered_after_restart", stale["running_run_id"], "failed", {}, now)
         self._record_scheduler_config(self.config.scheduler, now, recompute_next=True)
         self._record_scheduler_event("scheduler_ready", None, "ok", {"mode": self.config.scheduler.mode}, now)
+
+    def _store_config_snapshot(self, now: datetime) -> None:
+        config_path = Path(self.config.source_config_path)
+        payload = yaml.safe_load(config_path.read_text())
+        self.connection.execute(
+            "INSERT OR REPLACE INTO config_snapshots VALUES (?, ?, ?)",
+            (self.config.config_hash, iso_z(now), json.dumps(payload, sort_keys=True, default=str)),
+        )
+        self.connection.commit()
+
+    def _mark_stale_run_failed(self, run_id: str, now: datetime) -> None:
+        row = self.connection.execute("SELECT summary_json FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            return
+        summary = json.loads(row["summary_json"])
+        summary["post_pipeline_error"] = {"class": "RuntimeError", "message": "cycle recovered after restart"}
+        self.connection.execute(
+            "UPDATE runs SET status = ?, completed_at = ?, summary_json = ? WHERE run_id = ?",
+            ("failed", iso_z(now), json.dumps(summary, sort_keys=True), run_id),
+        )
 
     def _write_service_registration(self) -> None:
         registration = {
@@ -735,12 +904,13 @@ class ArgusServer:
             if is_scheduler_reload_error(exc) and self._reload_publish_inputs_unchanged():
                 self._record_scheduler_event("scheduler_reload_failed", None, "failed", {"error": str(exc)}, now)
                 return
-            snapshot = build_publish_snapshot(self.config, now, force_inactive=True, error=str(exc))
+            snapshot = self._build_publish_snapshot(now, force_inactive=True, error=str(exc))
             store_runtime_snapshot(self.connection, snapshot, "reload_failed", "failed", str(exc))
             self._record_scheduler_event("scheduler_reload_failed", None, "failed", {"error": str(exc)}, now)
             return
         self.config = new_config
-        snapshot = build_publish_snapshot(new_config, now)
+        self._store_config_snapshot(now)
+        snapshot = self._build_publish_snapshot(now)
         store_runtime_snapshot(self.connection, snapshot, "reload", "ok")
         self._record_scheduler_config(new_config.scheduler, now, recompute_next=True)
         self._record_scheduler_event("scheduler_reload", None, "ok", {"mode": new_config.scheduler.mode}, now)
@@ -775,7 +945,7 @@ class ArgusServer:
         if state not in {"inactive", "active"}:
             raise PipelineError("Invalid publish state: {}".format(state))
         self.config = dataclasses.replace(self.config, publish=dataclasses.replace(self.config.publish, state=state))
-        snapshot = build_publish_snapshot(self.config, self.clock.now())
+        snapshot = self._build_publish_snapshot(self.clock.now())
         store_runtime_snapshot(self.connection, snapshot, "set_publish_state", "ok")
         return snapshot
 
@@ -813,6 +983,9 @@ class ArgusServer:
         if self.reload_requested:
             self.reload_requested = False
             self.reload()
+        control_result = self._process_control_requests()
+        if control_result is not None:
+            return control_result
         now = self.clock.now()
         state = self._scheduler_state()
         if state["mode"] == "manual":
@@ -849,6 +1022,43 @@ class ArgusServer:
             "last_run": self._last_run(),
         }
 
+    def _process_control_requests(self) -> Optional[Tuple[int, Dict[str, Any]]]:
+        row = self.connection.execute(
+            "SELECT * FROM control_requests WHERE status = 'pending' ORDER BY requested_at, rowid LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        now = self.clock.now()
+        self.connection.execute(
+            "UPDATE control_requests SET status = ?, started_at = ? WHERE request_id = ?",
+            ("running", iso_z(now), row["request_id"]),
+        )
+        self.connection.commit()
+        payload = json.loads(row["payload_json"])
+        try:
+            if row["action"] == "prime":
+                result = self.prime(requested_by=str(payload.get("requested_by", "cli")))
+            elif row["action"] == "run-cycle":
+                result = self.manual_cycle()
+            elif row["action"] == "set-publish-state":
+                snapshot = self.set_publish_state(str(payload["state"]))
+                result = (0, snapshot)
+            else:
+                raise PipelineError("Unknown control request action: {}".format(row["action"]))
+            self.connection.execute(
+                "UPDATE control_requests SET status = ?, completed_at = ?, result_json = ? WHERE request_id = ?",
+                ("succeeded", iso_z(self.clock.now()), json.dumps(result[1], sort_keys=True, default=str), row["request_id"]),
+            )
+            self.connection.commit()
+            return result
+        except Exception as exc:
+            self.connection.execute(
+                "UPDATE control_requests SET status = ?, completed_at = ?, error_class = ?, error_message = ? WHERE request_id = ?",
+                ("failed", iso_z(self.clock.now()), exc.__class__.__name__, str(exc), row["request_id"]),
+            )
+            self.connection.commit()
+            raise
+
     def _run_cycle(self, run_kind: str, now: datetime, prime: bool = False) -> Tuple[int, Dict[str, Any]]:
         state = self._scheduler_state()
         if self._cycle_running or state["running_run_id"]:
@@ -859,6 +1069,10 @@ class ArgusServer:
                 "exit_status": "skipped",
                 "skip_reason": "cycle_already_running",
             }
+        cycle_sources = self._sources_due_for_cycle(run_kind, now)
+        if not cycle_sources and run_kind == "scheduled":
+            self._record_scheduler_event("cycle_skipped_no_sources_due", None, "skipped", {"run_kind": run_kind}, now)
+            return 0, {"run_kind": run_kind, "exit_status": "skipped", "skip_reason": "no_sources_due"}
         self._cycle_running = True
         run_id = "{}-{}-{}".format(
             now.strftime("%Y%m%dT%H%M%SZ"),
@@ -871,10 +1085,12 @@ class ArgusServer:
             "UPDATE scheduler_state SET running_run_id = ?, last_started_run_id = ?, updated_at = ? WHERE id = 1",
             (run_id, run_id, iso_z(now)),
         )
-        self.connection.commit()
+        self._store_source_config_snapshots(run_id)
+        self._store_run_started(run_id, run_kind, now, output_dir, cycle_snapshot)
         try:
+            cycle_embedding = self.config.embedding
             exit_code, summary = run_pipeline_for_sources(
-                self.config.sources,
+                cycle_sources,
                 self.config.source_config_path,
                 output_dir,
                 now,
@@ -894,13 +1110,14 @@ class ArgusServer:
                 self.reload()
             publish_snapshot = latest_snapshot(self.connection)
             summary["effective_publish_snapshot"] = cycle_snapshot
-            self._store_run(run_id, run_kind, now, exit_code, output_dir, cycle_snapshot, summary)
-            (output_dir / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
             self._store_source_health(run_id, now, output_dir)
             if prime:
                 self._store_normalized_storage(run_id, now, output_dir, None)
                 self._write_decision_artifacts(run_id, output_dir)
+                self._store_run(run_id, run_kind, now, exit_code, output_dir, cycle_snapshot, summary)
+                (output_dir / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
                 self._write_prime_artifacts(output_dir)
+                self.connection.commit()
             else:
                 package_candidates_path = output_dir / ".pre-package-candidates.jsonl"
                 package_candidate_rows = [json.loads(line) for line in package_candidates_path.read_text().splitlines() if line.strip()]
@@ -913,15 +1130,26 @@ class ArgusServer:
                         accepted_candidate_rows.append(row)
                         seen_candidate_report_ids.add(row["report_id"])
                 package_candidates_path.write_text("".join(json.dumps(row) + "\n" for row in accepted_candidate_rows))
-                package_payloads = self._store_packages_and_publish(run_id, now, output_dir, package_candidates_path, cycle_snapshot, publish_snapshot)
+                package_payloads = self._store_packages_and_publish(run_id, now, output_dir, package_candidates_path, cycle_snapshot, publish_snapshot, cycle_embedding)
+                self._rewrite_source_health_final_counts(run_id, output_dir, package_payloads)
+                self._store_source_health(run_id, now, output_dir, update_totals=False)
                 self._write_decision_artifacts(run_id, output_dir)
                 (output_dir / "package-candidates.jsonl").write_text("".join(json.dumps(row) + "\n" for row in package_payloads))
                 (output_dir / "publish-candidates.jsonl").write_text("".join(json.dumps(row) + "\n" for row in package_payloads))
+                summary["counts"]["package_candidates"] = len(package_payloads)
+                summary["counts"]["publish_candidates"] = len(package_payloads)
+                summary["counts"]["embedding_failures"] = len(json.loads((output_dir / "embedding-failures.json").read_text()))
+                summary["artifact_paths"]["embedding_failures"] = "embedding-failures.json"
+                self._write_digest_artifacts(run_id, output_dir, package_payloads)
+                self._store_run(run_id, run_kind, now, exit_code, output_dir, cycle_snapshot, summary)
+                (output_dir / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+                self.connection.commit()
             completed_at = self.clock.now()
             self._record_scheduler_completion(run_id, completed_at)
             self._record_scheduler_event("cycle_completed", run_id, "ok" if exit_code == 0 else "failed", {"run_kind": run_kind}, completed_at)
             return exit_code, summary
         except Exception as exc:
+            self.connection.rollback()
             self._mark_run_failed(run_id, run_kind, now, output_dir, cycle_snapshot, exc)
             self._record_scheduler_event("cycle_completed", run_id, "failed", {"run_kind": run_kind, "error": str(exc)}, self.clock.now())
             raise
@@ -932,6 +1160,37 @@ class ArgusServer:
                 (iso_z(self.clock.now()), run_id),
             )
             self.connection.commit()
+
+    def _sources_due_for_cycle(self, run_kind: str, now: datetime) -> List[SourceConfig]:
+        if run_kind != "scheduled":
+            return self.config.sources
+        due_sources = []
+        for source in self.config.sources:
+            if not source.enabled or source.cadence_interval_seconds is None:
+                due_sources.append(source)
+                continue
+            row = self.connection.execute(
+                "SELECT fetched_at FROM source_run_status WHERE source_id = ? AND status IN ('ok', 'empty', 'not_modified') ORDER BY fetched_at DESC LIMIT 1",
+                (source.id,),
+            ).fetchone()
+            if row is None or not row["fetched_at"] or now >= parse_now(row["fetched_at"]) + timedelta(seconds=source.cadence_interval_seconds):
+                due_sources.append(source)
+        return due_sources
+
+    def _store_source_config_snapshots(self, run_id: str) -> None:
+        for source in self.config.sources:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO source_config_snapshots VALUES (?, ?, ?)",
+                (run_id, source.id, json.dumps(dataclasses.asdict(source), sort_keys=True, default=str)),
+            )
+
+    def _store_run_started(self, run_id: str, run_kind: str, now: datetime, output_dir: Path, snapshot: Dict[str, Any]) -> None:
+        summary = {"run_id": run_id, "run_kind": run_kind, "exit_status": "running"}
+        self.connection.execute(
+            "INSERT OR REPLACE INTO runs VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
+            (run_id, run_kind, iso_z(now), "running", str(output_dir), snapshot["snapshot_id"], json.dumps(summary, sort_keys=True)),
+        )
+        self.connection.commit()
 
     def _write_prime_artifacts(self, output_dir: Path) -> None:
         (output_dir / "prime-baseline.json").write_text((output_dir / "run-summary.json").read_text())
@@ -957,6 +1216,34 @@ class ArgusServer:
         (output_dir / "dedupe-decisions.json").write_text(json.dumps(dedupe_rows, indent=2, sort_keys=True) + "\n")
         (output_dir / "skipped-items.json").write_text(json.dumps(skipped_rows, indent=2, sort_keys=True) + "\n")
 
+    def _write_digest_artifacts(self, run_id: str, output_dir: Path, package_payloads: List[Dict[str, Any]]) -> None:
+        source_health_path = output_dir / "source-health.json"
+        source_health = json.loads(source_health_path.read_text()) if source_health_path.exists() else []
+        digest = {
+            "run_id": run_id,
+            "candidate_count": len(package_payloads),
+            "source_health": source_health,
+        }
+        lines = ["# Argus Review Digest", "", "Run: `{}`".format(run_id), "", "Package candidates: {}".format(len(package_payloads)), ""]
+        for package in package_payloads:
+            body = package.get("body", {})
+            lines.append("- [{}]({}) — {}".format(body.get("title", "(untitled)"), body.get("url", ""), body.get("source_name", "")))
+        (output_dir / "digest.json").write_text(json.dumps(digest, indent=2, sort_keys=True) + "\n")
+        (output_dir / "digest.md").write_text("\n".join(lines).rstrip() + "\n")
+
+    def _rewrite_source_health_final_counts(self, run_id: str, output_dir: Path, package_payloads: List[Dict[str, Any]]) -> None:
+        path = output_dir / "source-health.json"
+        health_rows = json.loads(path.read_text()) if path.exists() else []
+        counts: Dict[str, int] = {}
+        for package in package_payloads:
+            source_id = package.get("provenance", {}).get("source_id")
+            if source_id:
+                counts[source_id] = counts.get(source_id, 0) + 1
+        for row in health_rows:
+            row["emitted_candidate_count"] = counts.get(row["source_id"], 0)
+            row["final_package_candidate_count"] = counts.get(row["source_id"], 0)
+        path.write_text(json.dumps(health_rows, indent=2, sort_keys=True) + "\n")
+
     def _store_run(self, run_id: str, run_kind: str, now: datetime, exit_code: int, output_dir: Path, snapshot: Dict[str, Any], summary: Dict[str, Any]) -> None:
         status = "failed" if exit_code != 0 else "succeeded_with_source_errors" if summary.get("counts", {}).get("failed_sources", 0) else "succeeded"
         self.connection.execute(
@@ -981,19 +1268,21 @@ class ArgusServer:
             )
         self.connection.commit()
 
-    def _store_source_health(self, run_id: str, now: datetime, output_dir: Path) -> None:
+    def _store_source_health(self, run_id: str, now: datetime, output_dir: Path, update_totals: bool = True) -> None:
         path = output_dir / "source-health.json"
         health_rows = json.loads(path.read_text()) if path.exists() else []
         for item in health_rows:
             previous = self.connection.execute("SELECT * FROM source_health WHERE source_id = ?", (item["source_id"],)).fetchone()
             failed = item.get("status") == "failed"
-            consecutive_failures = (int(previous["consecutive_failures"]) if previous else 0) + 1 if failed else 0
+            previous_consecutive_failures = int(previous["consecutive_failures"]) if previous else 0
+            consecutive_failures = previous_consecutive_failures + 1 if failed and update_totals else 0 if not failed and update_totals else previous_consecutive_failures
             total_successes = int(previous["total_successes"]) if previous else 0
             total_failures = int(previous["total_failures"]) if previous else 0
-            if failed:
-                total_failures += 1
-            else:
-                total_successes += 1
+            if update_totals:
+                if failed:
+                    total_failures += 1
+                else:
+                    total_successes += 1
             last_error = item.get("last_error") or {}
             self.connection.execute(
                 """
@@ -1044,25 +1333,44 @@ class ArgusServer:
                     json.dumps(item, sort_keys=True),
                 ),
             )
+            fetch_id = "sha256:" + hashlib.sha256("fetch:v0\n{}\n{}\n{}".format(run_id, item["source_id"], item.get("feed_url")).encode("utf-8")).hexdigest()
+            last_error = item.get("last_error") or {}
+            self.connection.execute(
+                "INSERT OR REPLACE INTO raw_fetches VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    fetch_id,
+                    run_id,
+                    item["source_id"],
+                    item.get("feed_url") or "",
+                    item.get("fetched_at") or iso_z(now),
+                    item.get("http_status"),
+                    item.get("elapsed_ms"),
+                    None,
+                    None,
+                    last_error.get("class"),
+                    last_error.get("message"),
+                ),
+            )
         self.connection.commit()
 
-    def _embedding_for_candidate(self, candidate: Dict[str, Any], now: datetime) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-        if self.config.embedding.command:
+    def _embedding_for_candidate(self, candidate: Dict[str, Any], now: datetime, embedding_config: Optional[EmbeddingConfig] = None) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        embedding = embedding_config or self.config.embedding
+        if embedding.command:
             input_hash = embedded_text_hash(candidate)
             request_id = "sha256:" + hashlib.sha256(
-                "embed-request:v0\n{}\n{}\n{}".format(candidate["report_id"], self.config.embedding.space_id, input_hash).encode("utf-8")
+                "embed-request:v0\n{}\n{}\n{}".format(candidate["report_id"], embedding.space_id, input_hash).encode("utf-8")
             ).hexdigest()
             request = {
                 "request_id": request_id,
-                "space_id": self.config.embedding.space_id,
-                "provider": self.config.embedding.provider,
-                "model": self.config.embedding.model,
-                "dimensions": self.config.embedding.dimensions,
+                "space_id": embedding.space_id,
+                "provider": embedding.provider,
+                "model": embedding.model,
+                "dimensions": embedding.dimensions,
                 "text": candidate.get("metadata", {}).get("embedding_text") or "",
             }
             try:
                 completed = subprocess.run(
-                    [self.config.embedding.command, "--input-json", "-"],
+                    [embedding.command, "--input-json", "-"],
                     input=json.dumps(request),
                     capture_output=True,
                     check=False,
@@ -1095,10 +1403,10 @@ class ArgusServer:
             except OSError as exc:
                 return None, {"class": "embed_backend_unavailable", "message": str(exc), "retry_eligible": True}
             if (
-                response.get("space_id") != self.config.embedding.space_id
-                or response.get("provider") != self.config.embedding.provider
-                or response.get("model") != self.config.embedding.model
-                or int(response.get("dimensions", -1)) != int(self.config.embedding.dimensions or -2)
+                response.get("space_id") != embedding.space_id
+                or response.get("provider") != embedding.provider
+                or response.get("model") != embedding.model
+                or int(response.get("dimensions", -1)) != int(embedding.dimensions or -2)
             ):
                 return None, {"class": "embed_invalid_response", "message": "embedding metadata mismatch", "retry_eligible": True}
             vector = response.get("vector")
@@ -1106,10 +1414,10 @@ class ArgusServer:
                 return None, {"class": "embed_invalid_response", "message": "embedding vector is not a list", "retry_eligible": True}
             vector_hash = "sha256:" + hashlib.sha256(json.dumps(vector, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
             return {
-                "space_id": self.config.embedding.space_id,
-                "provider": response.get("provider") or self.config.embedding.provider or "cli",
-                "model": self.config.embedding.model,
-                "dimensions": self.config.embedding.dimensions,
+                "space_id": embedding.space_id,
+                "provider": response.get("provider") or embedding.provider or "cli",
+                "model": embedding.model,
+                "dimensions": embedding.dimensions,
                 "input_hash": input_hash,
                 "vector_hash": vector_hash,
                 "vector": vector,
@@ -1148,7 +1456,7 @@ class ArgusServer:
         )
         return failure
 
-    def _store_packages_and_publish(self, run_id: str, now: datetime, output_dir: Path, candidates_path: Path, cycle_snapshot: Dict[str, Any], publish_snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _store_packages_and_publish(self, run_id: str, now: datetime, output_dir: Path, candidates_path: Path, cycle_snapshot: Dict[str, Any], publish_snapshot: Dict[str, Any], cycle_embedding: EmbeddingConfig) -> List[Dict[str, Any]]:
         package_payloads: List[Dict[str, Any]] = []
         embedding_failures: List[Dict[str, Any]] = []
         rows = [json.loads(line) for line in candidates_path.read_text().splitlines() if line.strip()]
@@ -1171,7 +1479,7 @@ class ArgusServer:
                 "SELECT first_effective_mode FROM accepted_reports WHERE report_id = ?",
                 (candidate["report_id"],),
             ).fetchone()
-            supplied_embeddings, embedding_failure = self._embedding_for_candidate(candidate, now)
+            supplied_embeddings, embedding_failure = self._embedding_for_candidate(candidate, now, cycle_embedding)
             if supplied_embeddings is None and cycle_snapshot["require_embeddings"] and not cycle_snapshot["allow_non_embedded_fallback"]:
                 failure = embedding_failure or {"class": "embed_backend_unavailable", "message": "embedding unavailable", "retry_eligible": True}
                 embedding_failures.append(self._record_embedding_failure(run_id, now, candidate, failure))
@@ -1243,12 +1551,18 @@ class ArgusServer:
                     (attempt, package_id, target, key, publish_snapshot["snapshot_id"], 1, publish_snapshot["effective_mode"], "pending", iso_z(now), None, None, None, None),
                 )
         (output_dir / "embedding-failures.json").write_text(json.dumps(embedding_failures, indent=2, sort_keys=True) + "\n")
-        self.connection.commit()
         return package_payloads
 
     def _store_normalized_storage(self, run_id: str, now: datetime, output_dir: Path, accepted_report_ids: Optional[set[str]]) -> set[str]:
         sqlite_accepted_report_ids: set[str] = set()
         rows = [json.loads(line) for line in (output_dir / "normalized-items.jsonl").read_text().splitlines() if line.strip()]
+        skipped_path = output_dir / "skipped-items.json"
+        skipped_payload = json.loads(skipped_path.read_text()) if skipped_path.exists() else []
+        preexisting_skips = {
+            item.get("report_id"): item
+            for item in skipped_payload
+            if item.get("report_id")
+        }
         rows.sort(key=lambda row: (row["source_id"], row.get("published_at") is None, row.get("published_at") or row.get("fetched_at") or "", row["report_id"]))
         for report in rows:
             key_type, key_scope, normalized_key_value, key_hash = selected_dedupe_key_for_report(report)
@@ -1288,10 +1602,12 @@ class ArgusServer:
             elif is_accepted:
                 decision = "accepted"
                 sqlite_accepted_report_ids.add(report["report_id"])
+            elif report["report_id"] in preexisting_skips:
+                decision = str(preexisting_skips[report["report_id"]].get("reason_code") or "skipped_not_package_candidate")
             else:
                 decision = "skipped_not_package_candidate"
-            if decision in {"exact_duplicate", "skipped_not_package_candidate", "missing_identity_key"}:
-                detail = {
+            if decision in {"exact_duplicate", "skipped_not_package_candidate", "missing_identity_key", "stale_by_freshness_window"}:
+                detail = preexisting_skips.get(report["report_id"], {}).get("detail") or {
                     "source_id": report["source_id"],
                     "report_id": report["report_id"],
                     "duplicate_of_report_id": existing_key["report_id"] if existing_key else None,
@@ -1305,6 +1621,10 @@ class ArgusServer:
                     "feed_entry_id": report.get("feed_entry_id"),
                     "published_at": report.get("published_at"),
                 }
+                detail.setdefault("duplicate_of_report_id", existing_key["report_id"] if existing_key else None)
+                detail.setdefault("duplicate_key_type", None if decision == "missing_identity_key" else key_type)
+                detail.setdefault("duplicate_key_hash", None if decision == "missing_identity_key" else key_hash)
+                detail.setdefault("duplicate_key_precedence", 1 if key_type == "feed_entry_id" else 2 if key_type == "canonical_url" else 3 if key_type == "normalized_title_date" else None)
                 self.connection.execute(
                     "INSERT INTO skipped_items VALUES (?, ?, ?, ?, ?, ?)",
                     (run_id, report["source_id"], report["report_id"], decision, json.dumps(detail, sort_keys=True), iso_z(now)),
@@ -1377,6 +1697,8 @@ class ArgusServer:
             )
         skipped_path = output_dir / "skipped-items.json"
         for item in json.loads(skipped_path.read_text()) if skipped_path.exists() else []:
+            if item.get("report_id") in preexisting_skips and item.get("reason_code") == "stale_by_freshness_window":
+                continue
             reason_code = item.get("reason_code") or "source_skipped_counts"
             self.connection.execute(
                 "INSERT INTO skipped_items VALUES (?, ?, ?, ?, ?, ?)",
@@ -1389,7 +1711,6 @@ class ArgusServer:
                     iso_z(now),
                 ),
             )
-        self.connection.commit()
         return sqlite_accepted_report_ids
 
     def _record_scheduler_config(self, scheduler: SchedulerConfig, now: datetime, recompute_next: bool) -> None:
@@ -1487,15 +1808,43 @@ class ArgusServer:
 
 
 def run_status(db_path: Path) -> Dict[str, Any]:
-    connection = connect_database(db_path)
+    connection = connect_database_readonly(db_path)
     try:
         snapshot_row = connection.execute("SELECT snapshot_json FROM runtime_config_snapshots ORDER BY observed_at DESC, rowid DESC LIMIT 1").fetchone()
         scheduler_row = connection.execute("SELECT * FROM scheduler_state WHERE id = 1").fetchone()
         run_row = connection.execute("SELECT * FROM runs ORDER BY started_at DESC, rowid DESC LIMIT 1").fetchone()
+        prime_row = connection.execute("SELECT * FROM prime_events ORDER BY requested_at DESC, rowid DESC LIMIT 1").fetchone()
+        runtime_event_row = connection.execute("SELECT * FROM runtime_events ORDER BY observed_at DESC, rowid DESC LIMIT 1").fetchone()
+        reload_failure_row = connection.execute(
+            "SELECT * FROM runtime_events WHERE event_type LIKE '%reload%' AND status = 'failed' ORDER BY observed_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        scheduler_reload_failure_row = connection.execute(
+            "SELECT * FROM scheduler_events WHERE event_type LIKE '%reload%' AND status = 'failed' ORDER BY observed_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        package_count = connection.execute("SELECT COUNT(*) FROM packages").fetchone()[0]
+        publish_counts = {
+            row["status"]: row["count"]
+            for row in connection.execute("SELECT status, COUNT(*) AS count FROM publish_attempts GROUP BY status")
+        }
+        skipped_counts = {
+            row["reason_code"]: row["count"]
+            for row in connection.execute("SELECT reason_code, COUNT(*) AS count FROM skipped_items GROUP BY reason_code")
+        }
+        embedding_failure_count = connection.execute("SELECT COUNT(*) FROM embeddings WHERE status = 'failed'").fetchone()[0]
+        last_summary = json.loads(run_row["summary_json"]) if run_row and run_row["summary_json"] else None
         return {
             "publish": json.loads(snapshot_row["snapshot_json"]) if snapshot_row else None,
             "scheduler": dict(scheduler_row) if scheduler_row else None,
-            "last_run": dict(run_row) if run_row else None,
+            "last_run": ({**dict(run_row), "summary": last_summary} if run_row else None),
+            "counts": {
+                "packages": package_count,
+                "publish_attempts_by_status": publish_counts,
+                "skipped_items_by_reason": skipped_counts,
+                "embedding_failures": embedding_failure_count,
+            },
+            "prime": dict(prime_row) if prime_row else None,
+            "last_runtime_event": dict(runtime_event_row) if runtime_event_row else None,
+            "last_reload_failure": dict(reload_failure_row or scheduler_reload_failure_row) if (reload_failure_row or scheduler_reload_failure_row) else None,
         }
     finally:
         connection.close()
@@ -1526,6 +1875,28 @@ def request_process_reload(config_path: Path) -> Dict[str, Any]:
         connection.close()
 
 
+def request_control_action(config_path: Path, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    pid = runtime_service_pid(config_path)
+    if pid is None:
+        raise PipelineError("No running Argus service is recorded")
+    config = load_runtime_config(config_path)
+    connection = connect_database(config.database_path)
+    now = utc_now()
+    request_id = "sha256:" + hashlib.sha256(
+        "control:v0\n{}\n{}\n{}".format(action, iso_z(now), time.monotonic_ns()).encode("utf-8")
+    ).hexdigest()
+    try:
+        connection.execute(
+            "INSERT INTO control_requests VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL)",
+            (request_id, iso_z(now), action, json.dumps(payload, sort_keys=True), "pending"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    os.kill(pid, signal.SIGHUP)
+    return {"request_id": request_id, "action": action, "status": "pending", "pid": pid}
+
+
 def _pid_matches_config(pid: int, config_path: Path) -> bool:
     try:
         completed = subprocess.run(["ps", "-p", str(pid), "-o", "command="], check=False, capture_output=True, text=True)
@@ -1536,7 +1907,7 @@ def _pid_matches_config(pid: int, config_path: Path) -> bool:
 
 
 def run_source_health(db_path: Path) -> List[Dict[str, Any]]:
-    connection = connect_database(db_path)
+    connection = connect_database_readonly(db_path)
     try:
         return [
             {
@@ -1553,13 +1924,12 @@ def run_source_health(db_path: Path) -> List[Dict[str, Any]]:
 
 
 def explain_skip(db_path: Path, run_id: str) -> Dict[str, Any]:
-    connection = connect_database(db_path)
+    connection = connect_database_readonly(db_path)
     try:
         row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         if row is None:
             raise PipelineError("Unknown run: {}".format(run_id))
-        output_dir = Path(row["output_dir"])
-        summary = json.loads((output_dir / "run-summary.json").read_text())
+        summary = json.loads(row["summary_json"])
         skipped_rows = connection.execute(
             "SELECT * FROM skipped_items WHERE run_id = ? ORDER BY source_id, report_id, reason_code",
             (run_id,),

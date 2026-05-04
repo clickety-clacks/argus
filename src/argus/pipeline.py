@@ -70,6 +70,9 @@ class SourceConfig:
     adapter: str
     request_headers: Dict[str, str]
     notes: Optional[str] = None
+    cadence_interval_seconds: Optional[int] = None
+    authority_score: Optional[float] = None
+    fixture_payload_path: Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -167,6 +170,8 @@ def read_source_config(path: Path) -> List[SourceConfig]:
                 adapter=str(row["adapter"]),
                 request_headers={str(k): str(v) for k, v in (row.get("request_headers") or {}).items()},
                 notes=str(row["notes"]) if row.get("notes") is not None else None,
+                authority_score=(float(row["authority_score"]) if row.get("authority_score") is not None else None),
+                fixture_payload_path=(str(row["fixture_payload_path"]) if row.get("fixture_payload_path") is not None else None),
             )
         )
     return sources
@@ -520,7 +525,17 @@ def cluster_id_for(source_id: str, identity_type: str, identity_value: str) -> s
 
 def candidate_for(report: Dict[str, Any], dedupe_identity: Dict[str, str]) -> Dict[str, Any]:
     candidate_basis = "{}|{}".format(report["report_id"], report["canonical_url"] or "")
-    embedding_text = " ".join(part for part in [report["title"], report["clean_summary"]] if part).strip()
+    embedding_text = "\n".join(
+        "{}: {}".format(label, value)
+        for label, value in [
+            ("Title", report["title"]),
+            ("Source", report["source_name"]),
+            ("Published", report["published_at"]),
+            ("URL", report["canonical_url"]),
+            ("Summary", report["clean_summary"]),
+        ]
+        if value
+    ).strip()
     return {
         "schema_version": SCHEMA_VERSION,
         "candidate_id": hashlib.sha256(candidate_basis.encode("utf-8")).hexdigest()[:24],
@@ -559,7 +574,7 @@ def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
 
 
 def read_fixture_feed(fixture_dir: Path, source: SourceConfig, validators: Optional[Dict[str, str]] = None) -> FetchResult:
-    feed_path = fixture_dir / "{}.xml".format(source.id)
+    feed_path = Path(source.fixture_payload_path) if source.fixture_payload_path else fixture_dir / "{}.xml".format(source.id)
     meta_path = fixture_dir / "{}.meta.json".format(source.id)
     if not feed_path.exists():
         raise PipelineError("Missing fixture for {}: {}".format(source.id, feed_path))
@@ -777,6 +792,21 @@ def run_pipeline_for_sources(
                     published_at = parse_now(report["published_at"])
                     if published_at < now - time_delta_hours(source.freshness_window_hours):
                         skipped_stale_count += 1
+                        skipped_item_details.append(
+                            {
+                                "source_id": source.id,
+                                "report_id": report["report_id"],
+                                "reason_code": "stale_by_freshness_window",
+                                "detail": {
+                                    "source_id": source.id,
+                                    "title": report["title"],
+                                    "canonical_url": report.get("canonical_url"),
+                                    "feed_entry_id": report.get("feed_entry_id"),
+                                    "published_at": report.get("published_at"),
+                                    "freshness_window_hours": source.freshness_window_hours,
+                                },
+                            }
+                        )
                         seen_identities.add(identity_key)
                         continue
 
@@ -986,7 +1016,7 @@ def build_command_parser() -> argparse.ArgumentParser:
 
 
 def command_main(argv: List[str]) -> int:
-    from .server import ArgusServer, explain_skip, request_process_reload, run_source_health, run_status
+    from .server import ArgusServer, explain_skip, request_control_action, request_process_reload, run_source_health, run_status, runtime_service_pid
 
     args = build_command_parser().parse_args(argv)
     try:
@@ -1001,6 +1031,9 @@ def command_main(argv: List[str]) -> int:
             finally:
                 server.close()
         if args.command == "prime":
+            if runtime_service_pid(args.config) is not None:
+                print(json.dumps(request_control_action(args.config, "prime", {"requested_by": "cli"}), indent=2))
+                return 0
             server = ArgusServer(args.config, register_service=False)
             try:
                 exit_code, summary = server.prime()
@@ -1009,6 +1042,9 @@ def command_main(argv: List[str]) -> int:
             finally:
                 server.close()
         if args.command == "run-cycle":
+            if runtime_service_pid(args.config) is not None:
+                print(json.dumps(request_control_action(args.config, "run-cycle", {"reason": args.reason}), indent=2))
+                return 0
             server = ArgusServer(args.config, register_service=False)
             try:
                 exit_code, summary = server.manual_cycle()
@@ -1017,6 +1053,9 @@ def command_main(argv: List[str]) -> int:
             finally:
                 server.close()
         if args.command == "set-publish-state":
+            if runtime_service_pid(args.config) is not None:
+                print(json.dumps(request_control_action(args.config, "set-publish-state", {"state": args.state}), indent=2))
+                return 0
             server = ArgusServer(args.config, register_service=False)
             try:
                 print(json.dumps(server.set_publish_state(args.state), indent=2))

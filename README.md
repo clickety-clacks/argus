@@ -1,6 +1,6 @@
 # Argus
 
-Argus is the local-only RSS/news ingestion worker for `swarm.channel`.
+Argus is the RSS/news ingestion server for `swarm.channel`.
 
 Argus uses RSS, Atom, and arXiv feeds as input adapters. Its job is to turn scattered source feeds into source-grounded publish candidates that can later become Subspace messages. It is deliberately a transport/provenance layer: it fetches feeds, parses entries, normalizes fields, dedupes within each source, remembers per-source seen items across runs, records source health, and writes inspectable artifacts.
 
@@ -8,7 +8,9 @@ Argus does **not** decide what matters. It does **not** write digests, rankings,
 
 ## Status
 
-Early local worker. It is runnable and fixture-tested, and it has an explicit dry-run mode. It does not deploy itself, schedule itself, or publish to Subspace yet.
+Server-mode MVP. The production target is a long-running `argus serve` process with an internal scheduler. Host supervisors may restart the process, but cron/systemd timers/launchd timers must not schedule fetches.
+
+The default server config is inactive: `publish.state: inactive` and no live approval. Active mode is controlled by runtime config/publish state reloads and is forward-only from the activation snapshot.
 
 ## What it produces
 
@@ -16,15 +18,16 @@ A run writes these artifacts to the output directory:
 
 - `run-summary.json` — run metadata, source counts, artifact paths, exit status
 - `source-health.json` — per-source fetch/parse status, validator info, and failure reason if any
-- `normalized.jsonl` — normalized source entries with provenance
-- `clusters.jsonl` — source-local duplicate clusters only
-- `publish-candidates.jsonl` — only unseen candidate messages for a future Subspace publisher
-- `state.json` by default (or your explicit `--state` path) — persistent per-source HTTP validators and seen-item identities
+- `normalized-items.jsonl` — normalized source entries with provenance
+- `dedupe-decisions.json` — accepted/skipped item decisions
+- `package-candidates.jsonl` — package payloads eligible for review/publish handling
+- SQLite runtime state — scheduler state, source health, config snapshots, packages, attempts, and dedupe authority
 
 ## Repository layout
 
 ```text
 bin/argus              shell wrapper for local runs
+config/argus.example.yaml server-mode example config
 config/sources.yaml    default v0 source configuration
 src/argus/             Python implementation
 tests/                 deterministic fixture-backed tests
@@ -50,28 +53,32 @@ python -m pip install -U pip
 python -m pip install -e .
 ```
 
-## Run against live feeds
+## Server-mode runtime
 
 ```bash
 cd ~/src/argus
 . .venv/bin/activate
-argus \
-  --dry-run \
-  --sources config/sources.yaml \
-  --out /tmp/argus-out \
-  --state /tmp/argus-state.json
+argus serve --config config/argus.example.yaml
 ```
 
-Equivalent module form:
+Operator command surface:
 
 ```bash
-PYTHONPATH=src python -m argus.cli \
-  --dry-run \
-  --sources config/sources.yaml \
-  --out /tmp/argus-out
+argus serve --config /etc/argus/argus.yaml --once
+argus prime --config /etc/argus/argus.yaml
+argus run-cycle --config /etc/argus/argus.yaml --reason manual
+argus reload --config /etc/argus/argus.yaml
+argus set-publish-state --config /etc/argus/argus.yaml --state inactive
+argus status --db /var/lib/argus/argus.sqlite3
+argus source-health --db /var/lib/argus/argus.sqlite3
+argus explain-skip --db /var/lib/argus/argus.sqlite3 --run <run_id>
 ```
 
-For deterministic run IDs/timestamps during verification, pass `--now`:
+`serve --once` runs one scheduler decision for deterministic readiness checks. Long-running production uses plain `serve`.
+
+## Legacy one-shot CLI
+
+The legacy one-shot CLI is preserved for local artifact inspection:
 
 ```bash
 PYTHONPATH=src python -m argus.cli \
@@ -82,41 +89,23 @@ PYTHONPATH=src python -m argus.cli \
 ```
 
 
-## Persistent feed state
+## SQLite runtime state
 
-Argus now keeps RSS-reader-style per-source state so recurring runs do not re-emit old candidates.
+Server mode keeps RSS-reader-style per-source state in SQLite so recurring runs do not re-emit old candidates.
 
 State includes:
 
 - HTTP validators per source (`ETag`, `Last-Modified`) sent back as `If-None-Match` / `If-Modified-Since`
 - persistent seen-item identities per source using feed GUID/id first, canonical URL second, and normalized title + date bucket as fallback
 
-CLI behavior:
-
-- `--state PATH` selects the durable state file explicitly
-- if `--state` is omitted, Argus defaults to `<out parent>/state.json`
-- normal runs read and update state only after a successful run
-- `--dry-run` still reads state for realistic filtering, but does **not** write state
-- `--no-state-write` disables durable state mutation for any run while still letting you inspect what Argus would emit against the current cursor
-
-That means the safe verification path is:
-
-```bash
-OUT=/tmp/argus-dry-run-$(date -u +%Y%m%dT%H%M%SZ)
-STATE=/tmp/argus-state.json
-argus --dry-run --sources config/sources.yaml --out "$OUT" --state "$STATE"
-```
-
 If a source returns `304 Not Modified`, Argus records that as a healthy no-change source health result and emits no new candidates for that source.
 
 ## Prime mode
 
-Use `--prime` for the first safe baseline fetch before activating a future publisher. Prime mode fetches sources, writes normal inspection artifacts, advances durable HTTP validators and seen-item state, but emits no publish candidates and never publishes to Subspace.
+Prime is optional/manual baseline tooling only. It is not required for scheduled or manual jobs and is not an active/inactive gate. Prime creates no live attempts, no ordinary package rows/candidates, and no active-eligible work.
 
 ```bash
-OUT=/var/lib/argus/runs/prime-$(date -u +%Y%m%dT%H%M%SZ)
-argus --prime --sources /etc/argus/sources.yaml --state /var/lib/argus/state.json --out "$OUT"
-python3 -m json.tool "$OUT/run-summary.json"
+argus prime --config /etc/argus/argus.yaml
 ```
 
 `--prime` and `--dry-run` are mutually exclusive:
@@ -136,7 +125,7 @@ python3 -m json.tool "$OUT/run-summary.json"
 head -20 "$OUT/publish-candidates.jsonl"
 ```
 
-Current code is local-artifact-only, so `--dry-run` is explicit operator intent plus run metadata. Future publisher work must keep this flag as the safe verification path.
+Server-mode safety is `publish.state: inactive` by default. `--dry-run` remains available only on the legacy one-shot CLI.
 
 ## Run tests
 
@@ -194,26 +183,23 @@ It does not include digest copy, ranking, lane assignment, scores, or recommenda
 
 Failure details are written to `source-health.json`.
 
-## Current verified live run
+## Racter readiness
 
-On Racter, the current dry run against `config/sources.yaml` verified:
+The checked-in server-mode example config contains 13 enabled sources, default `1h` internal scheduling, inactive publish state, and embedding configuration placeholders. Racter readiness uses:
 
-- 13 configured/enabled/fetched sources
-- 0 failed sources
-- 1,906 raw entries
-- 1,906 normalized entries
-- 1,906 publish candidates
-- `publish_performed: false`
+```bash
+argus serve --config /etc/argus/argus.yaml --once
+argus status --db /var/lib/argus/argus.sqlite3
+argus source-health --db /var/lib/argus/argus.sqlite3
+```
 
 ## Install/deploy
 
-See [`docs/DEPLOY.md`](docs/DEPLOY.md) for the official install layout, Racter target layout, scheduling options, verification gate, upgrade, and rollback notes.
+See [`docs/DEPLOY.md`](docs/DEPLOY.md) for the official install layout, Racter target layout, runtime command surface, and readiness gate.
 
 ## Non-goals for this repo right now
 
-- no cron or scheduler
 - no daemon/service install
-- no live Subspace publish
 - no digest generation
 - no ranking/lane/scoring logic
 - no subscriber interpretation

@@ -1,0 +1,174 @@
+runtime:
+  database_path: /var/lib/argus/argus.sqlite3
+  output_dir: /var/lib/argus
+  source_fetch_concurrency: 4
+
+schedule:
+  mode: interval
+  interval: 1h
+  jitter_seconds: 0
+  run_on_startup_if_due: true
+  missed_tick_policy: coalesce_one
+
+publish:
+  state: inactive
+  live_approval: false
+  require_embeddings: true
+
+embedding:
+  backend: subspace-embedding-cli
+  command: /usr/local/bin/subspace-embed
+  provider: subspace
+  model: swarm-channel-news-v0
+  dimensions: 1536
+  space_id: subspace:swarm-channel-news-v0:1536:v1
+
+sources:
+  - id: openai
+    display_name: OpenAI
+    source_class: official
+    source_category: official_lab
+    feed_url: https://openai.com/news/rss.xml
+    site_url: https://openai.com/news
+    adapter: rss
+    enabled: true
+    freshness_window_hours: 72
+    authority_score: 0.75
+    fixture_payload_path: testdata/feeds/openai.rss.xml
+  - id: google-deepmind
+    display_name: Google DeepMind
+    source_class: official
+    source_category: official_lab
+    feed_url: https://deepmind.google/blog/rss.xml
+    site_url: https://deepmind.google/blog
+    adapter: rss
+    enabled: true
+    freshness_window_hours: 72
+    authority_score: 0.75
+    fixture_payload_path: testdata/feeds/google-deepmind.rss.xml
+  - id: google-ai
+    display_name: Google AI
+    source_class: official
+    source_category: official_lab
+    feed_url: https://blog.google/innovation-and-ai/technology/ai/rss/
+    site_url: https://blog.google/technology/ai/
+    adapter: rss
+    enabled: true
+    freshness_window_hours: 72
+    authority_score: 0.75
+    fixture_payload_path: testdata/feeds/google-ai.rss.xml
+  - id: huggingface
+    display_name: Hugging Face
+    source_class: official
+    source_category: official_platform
+    feed_url: https://huggingface.co/blog/feed.xml
+    site_url: https://huggingface.co/blog
+    adapter: rss
+    enabled: true
+    freshness_window_hours: 96
+    authority_score: 0.75
+    fixture_payload_path: testdata/feeds/huggingface.atom.xml
+  - id: arxiv-cs-ai
+    display_name: arXiv cs.AI
+    source_class: research
+    source_category: research_arxiv
+    api_url: https://export.arxiv.org/api/query?search_query=cat:cs.AI&sortBy=submittedDate&sortOrder=descending&max_results=5
+    site_url: https://arxiv.org/list/cs.AI/recent
+    adapter: arxiv_atom
+    enabled: true
+    freshness_window_hours: 120
+    authority_score: 0.75
+    fixture_payload_path: testdata/feeds/arxiv-cs-ai.atom.xml
+  - id: arxiv-cs-cl
+    display_name: arXiv cs.CL
+    source_class: research
+    source_category: research_arxiv
+    api_url: https://export.arxiv.org/api/query?search_query=cat:cs.CL&sortBy=submittedDate&sortOrder=descending&max_results=5
+    site_url: https://arxiv.org/list/cs.CL/recent
+    adapter: arxiv_atom
+    enabled: true
+    freshness_window_hours: 120
+    authority_score: 0.75
+    fixture_payload_path: testdata/feeds/arxiv-cs-cl.atom.xml
+  - id: arxiv-cs-lg
+    display_name: arXiv cs.LG
+    source_class: research
+    source_category: research_arxiv
+    api_url: https://export.arxiv.org/api/query?search_query=cat:cs.LG&sortBy=submittedDate&sortOrder=descending&max_results=5
+    site_url: https://arxiv.org/list/cs.LG/recent
+    adapter: arxiv_atom
+    enabled: true
+    freshness_window_hours: 120
+    authority_score: 0.75
+    fixture_payload_path: testdata/feeds/arxiv-cs-lg.atom.xml
+  - id: the-decoder
+    display_name: The Decoder
+    source_class: editorial
+    source_category: trusted_editorial
+    feed_url: https://the-decoder.com/feed/
+    site_url: https://the-decoder.com/
+    adapter: rss
+    enabled: true
+    freshness_window_hours: 72
+    authority_score: 0.75
+    fixture_payload_path: testdata/feeds/the-decoder.rss.xml
+  - id: techcrunch-ai
+    display_name: TechCrunch AI
+    source_class: editorial
+    source_category: trusted_editorial
+    feed_url: https://techcrunch.com/category/artificial-intelligence/feed/
+    site_url: https://techcrunch.com/category/artificial-intelligence/
+    adapter: rss
+    enabled: true
+    freshness_window_hours: 72
+    authority_score: 0.75
+    fixture_payload_path: testdata/feeds/techcrunch-ai.rss.xml
+  - id: the-verge-ai
+    display_name: The Verge AI
+    source_class: editorial
+    source_category: trusted_editorial
+    feed_url: https://www.theverge.com/rss/ai-artificial-intelligence/index.xml
+    site_url: https://www.theverge.com/ai-artificial-intelligence
+    adapter: rss
+    enabled: true
+    freshness_window_hours: 72
+    authority_score: 0.75
+    fixture_payload_path: testdata/feeds/the-verge-ai.rss.xml
+  - id: ars-technica-ai
+    display_name: Ars Technica AI
+    source_class: editorial
+    source_category: trusted_editorial
+    feed_url: https://arstechnica.com/ai/feed/
+    site_url: https://arstechnica.com/ai/
+    adapter: rss
+    enabled: true
+    freshness_window_hours: 96
+    authority_score: 0.75
+    fixture_payload_path: testdata/feeds/ars-technica-ai.rss.xml
+  - id: hn-ai
+    display_name: Hacker News AI Search
+    source_class: community
+    source_category: community_hn
+    feed_url: https://hnrss.org/newest?q=AI
+    site_url: https://news.ycombinator.com/
+    adapter: rss
+    enabled: true
+    freshness_window_hours: 48
+    authority_score: 0.75
+    fixture_payload_path: testdata/feeds/hn-ai.rss.xml
+    request_headers:
+      User-Agent: "Argus server RSS ingestion (contact: operator)"
+  - id: reddit-localllama
+    display_name: Reddit LocalLLaMA
+    source_class: community
+    source_category: community_reddit
+    feed_url: https://www.reddit.com/r/LocalLLaMA/.rss
+    site_url: https://www.reddit.com/r/LocalLLaMA/
+    adapter: rss
+    enabled: true
+    freshness_window_hours: 72
+    authority_score: 0.75
+    fixture_payload_path: testdata/feeds/reddit-localllama.rss.xml
+    cadence_override: 2h
+    request_headers:
+      User-Agent: "Argus server RSS ingestion (contact: operator)"

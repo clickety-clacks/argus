@@ -1,280 +1,95 @@
-# Deploy and install runbook
+# Argus server-mode deploy and Racter readiness runbook
 
-This repo ships a local news-feed ingestion worker. It is not a hosted service yet. A proper deploy means installing the worker on a machine, giving it a source config, choosing an output directory, and scheduling or supervising runs.
-
-The worker currently produces local artifacts only. It does **not** publish to Subspace, run a daemon, install a cron job, or manage credentials by itself.
-
-## Official installation model
-
-Use the platform's normal application data locations instead of cloning into random scratch directories.
-
-### macOS / Linux single-user install
-
-Recommended layout:
-
-```text
-~/src/argus                         # source checkout for operators/developers
-~/.local/bin/argus                  # executable shim or symlink
-~/.config/argus/sources.yaml        # operator config
-~/.local/state/argus/state.json     # persistent feed cursor / validators
-~/.local/state/argus/runs/          # run outputs/artifacts
-~/.local/state/argus/logs/          # logs if supervised
-```
-
-For a checked-out install:
+Argus production target is a long-running server process:
 
 ```bash
-cd ~/src
-git clone https://github.com/clickety-clacks/argus.git
-cd argus
+argus serve --config /etc/argus/argus.yaml
+```
+
+The host supervisor may start this process on Racter reboot. It must not schedule ingestion. Fetch cadence is owned by Argus' internal scheduler from `schedule:` config; the default interval is `1h`.
+
+This runbook is a readiness/install guide only. Do not deploy from review agents unless Flynn explicitly asks for that exact deployment.
+
+## Racter filesystem layout
+
+```text
+/opt/argus/                    # checkout or release tree
+/usr/local/bin/argus           # wrapper/symlink to the installed CLI
+/etc/argus/argus.yaml          # server-mode runtime config
+/var/lib/argus/argus.sqlite3   # SQLite state
+/var/lib/argus/runs/           # per-cycle artifacts
+/var/log/argus/                # supervisor stdout/stderr logs
+```
+
+## Install/update steps
+
+```bash
+cd /opt/argus
+git pull
 python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -U pip
-python -m pip install -e .
-mkdir -p ~/.local/bin ~/.config/argus ~/.local/state/argus/runs
-cp config/sources.yaml ~/.config/argus/sources.yaml
-ln -sf "$PWD/bin/argus" ~/.local/bin/argus
-```
-
-Run it:
-
-```bash
-~/.local/bin/argus \
-  --sources ~/.config/argus/sources.yaml \
-  --state ~/.local/state/argus/state.json \
-  --out ~/.local/state/argus/runs/$(date -u +%Y%m%dT%H%M%SZ)
-```
-
-### Linux system install
-
-For a shared/server install, use `/opt` for code, `/etc` for config, and `/var/lib` for state:
-
-```text
-/opt/argus/                         # source checkout / release tree
-/usr/local/bin/argus                # executable shim or symlink
-/etc/argus/sources.yaml             # system config
-/var/lib/argus/state.json           # persistent feed cursor / validators
-/var/lib/argus/runs/                # run outputs/artifacts
-/var/log/argus/                     # logs if supervised
-```
-
-Suggested service user:
-
-```bash
-sudo useradd --system --home /var/lib/argus --shell /usr/sbin/nologin argus
-```
-
-Install:
-
-```bash
-sudo mkdir -p /opt /etc/argus /var/lib/argus/runs /var/log/argus
-git clone https://github.com/clickety-clacks/argus.git /opt/argus
-cd /opt/argus
-sudo python3 -m venv .venv
-sudo .venv/bin/python -m pip install -U pip
-sudo .venv/bin/python -m pip install -e .
-sudo cp config/sources.yaml /etc/argus/sources.yaml
+.venv/bin/python -m pip install -U pip
+.venv/bin/python -m pip install -e .
+sudo mkdir -p /etc/argus /var/lib/argus/runs /var/log/argus
+sudo cp config/argus.example.yaml /etc/argus/argus.yaml
 sudo ln -sf /opt/argus/bin/argus /usr/local/bin/argus
-# The wrapper automatically uses /opt/argus/.venv/bin/python when present.
-sudo chown -R argus:argus /var/lib/argus /var/log/argus
 ```
 
-Run once:
+Edit `/etc/argus/argus.yaml` for host-local paths and the embedding command. Default config keeps `publish.state: inactive` and `publish.live_approval: false`; that is the safety boundary.
+
+## Runtime commands
+
+Start the long-running process manually for readiness checks:
 
 ```bash
-sudo -u argus /usr/local/bin/argus \
-  --sources /etc/argus/sources.yaml \
-  --state /var/lib/argus/state.json \
-  --out /var/lib/argus/runs/$(date -u +%Y%m%dT%H%M%SZ)
+argus serve --config /etc/argus/argus.yaml
 ```
 
-## Racter target install
-
-Racter is the intended first always-on runtime host for this project.
-
-Recommended Racter layout:
-
-```text
-/opt/argus/
-/etc/argus/sources.yaml
-/var/lib/argus/state.json
-/var/lib/argus/runs/
-/var/log/argus/
-/usr/local/bin/argus
-```
-
-Racter deploy should be treated as an operator deployment, not a code checkout experiment:
-
-1. Pull or clone `https://github.com/clickety-clacks/argus.git` into `/opt/argus`.
-2. Create/update the Python virtualenv under `/opt/argus/.venv`.
-3. Install the package editable or from the checked-out tree.
-4. Install `/etc/argus/sources.yaml` from `config/sources.yaml`, then edit only config in `/etc`.
-5. Write run artifacts under `/var/lib/argus/runs/<timestamp>/`.
-6. Log supervisor output under `/var/log/argus/`.
-7. Only after the Subspace publisher exists, add publisher config separately; do not overload the scraper config with subscriber interpretation.
-
-Argus state notes:
-
-- Point `--state` at a stable path outside the timestamped run directory.
-- If omitted, Argus defaults to `<out parent>/state.json`, which works well when runs live under `/var/lib/argus/runs/<timestamp>`.
-- `--dry-run` reads existing state but does not advance it.
-- `--no-state-write` is the escape hatch for inspection runs that should not mutate the cursor.
-
-
-## Current Racter install evidence
-
-Current verified Racter install:
-
-```text
-code: /opt/argus
-config: /etc/argus/sources.yaml
-output root: /var/lib/argus/runs/
-command: /usr/local/bin/argus
-run user: argus
-verified commit: fd286a4
-latest verified dry run: /var/lib/argus/runs/dry-run-20260430T185205Z
-```
-
-Latest verified dry run result:
-
-```text
-dry_run: true
-publish_performed: false
-exit_status: success
-configured/enabled/fetched sources: 13/13/13
-failed sources: 0
-normalized entries: 1,906
-publish candidates: 1,906
-```
-
-No scheduler/timer and no Subspace publisher are installed yet.
-
-## Scheduling options
-
-No scheduler is installed by default. Choose one per platform.
-
-### systemd timer, Linux
-
-Example service:
-
-```ini
-# /etc/systemd/system/argus.service
-[Unit]
-Description=Argus RSS feed ingestion
-
-[Service]
-Type=oneshot
-User=argus
-Group=argus
-WorkingDirectory=/opt/argus
-ExecStart=/usr/local/bin/argus --sources /etc/argus/sources.yaml --out /var/lib/argus/runs/%N-%H
-```
-
-Example timer:
-
-```ini
-# /etc/systemd/system/argus.timer
-[Unit]
-Description=Run Argus RSS feed ingestion periodically
-
-[Timer]
-OnBootSec=5m
-OnUnitActiveSec=15m
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
-Enable:
+Deterministic one-decision smoke check without deploying a supervisor:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now argus.timer
+argus serve --config /etc/argus/argus.yaml --once
 ```
 
-The `ExecStart` output path should usually be replaced with a wrapper script that creates a UTC timestamped directory. The raw unit above is a shape example, not the final Racter service.
-
-### launchd, macOS
-
-Use launchd only for Mac hosts. Keep config in `~/.config/argus` and output in `~/.local/state/argus` for single-user installs.
-
-## Prime before first publisher activation
-
-Before enabling any future Subspace publisher, run one `--prime` pass against the durable production state path. This fetches all configured sources, advances HTTP validators and seen-item identities, writes inspection artifacts, emits no publish candidates, and performs no Subspace publish. Subsequent active runs using the same state should only see items that arrived after the priming fetch.
+Operator controls:
 
 ```bash
-OUT=/var/lib/argus/runs/prime-$(date -u +%Y%m%dT%H%M%SZ)
-argus --prime --sources /etc/argus/sources.yaml --state /var/lib/argus/state.json --out "$OUT"
-python3 -m json.tool "$OUT/run-summary.json"
+argus prime --config /etc/argus/argus.yaml
+argus run-cycle --config /etc/argus/argus.yaml --reason manual
+argus reload --config /etc/argus/argus.yaml
+argus set-publish-state --config /etc/argus/argus.yaml --state inactive
+argus set-publish-state --config /etc/argus/argus.yaml --state active
+argus status --db /var/lib/argus/argus.sqlite3
+argus source-health --db /var/lib/argus/argus.sqlite3
+argus explain-skip --db /var/lib/argus/argus.sqlite3 --run <run_id>
 ```
 
-Do not use `--dry-run` for priming; dry-run intentionally does not mutate durable state.
+`prime` is optional/manual baseline tooling only. Normal scheduled/manual cycles do not require prime and do not use prime as an active/inactive gate.
 
-## Dry-run before deploy
+## Racter readiness checks
 
-Dry-run is the official pre-publish verification mode. It fetches real RSS sources and writes the same local artifacts, but performs no Subspace publish:
+Before declaring Racter ready, verify:
 
 ```bash
-OUT=/var/lib/argus/runs/dry-run-$(date -u +%Y%m%dT%H%M%SZ)
-argus --dry-run --sources /etc/argus/sources.yaml --state /var/lib/argus/state.json --out "$OUT"
-python3 -m json.tool "$OUT/run-summary.json"
-head -20 "$OUT/publish-candidates.jsonl"
+argus serve --config /etc/argus/argus.yaml --once
+argus status --db /var/lib/argus/argus.sqlite3
+argus source-health --db /var/lib/argus/argus.sqlite3
 ```
 
-For Racter, run this after install and before enabling any scheduler or publisher. The current worker has no publisher, so all runs are non-publishing; the flag exists to make the safety boundary explicit and durable.
-
-## Verification gate
-
-Before calling any install healthy:
+Then inspect the newest run directory under `/var/lib/argus/runs/` and confirm required inactive artifacts exist:
 
 ```bash
-argus --dry-run --sources <config-path> --out <fresh-output-dir>
+test -s /var/lib/argus/runs/<run-id>/run-summary.json
+test -s /var/lib/argus/runs/<run-id>/source-health.json
+test -s /var/lib/argus/runs/<run-id>/digest.md
+test -s /var/lib/argus/runs/<run-id>/digest.json
+test -s /var/lib/argus/runs/<run-id>/normalized-items.jsonl
+test -s /var/lib/argus/runs/<run-id>/dedupe-decisions.json
+test -s /var/lib/argus/runs/<run-id>/skipped-items.json
+test -s /var/lib/argus/runs/<run-id>/package-candidates.jsonl
 ```
 
-Then verify:
+A healthy inactive deployment has no `publish_attempts` rows unless `publish.state: active`, live approval, and Subspace endpoint config are all present.
 
-```bash
-test -s <fresh-output-dir>/run-summary.json
-test -s <fresh-output-dir>/source-health.json
-test -s <fresh-output-dir>/normalized.jsonl
-test -s <fresh-output-dir>/publish-candidates.jsonl
-python3 -m json.tool <fresh-output-dir>/run-summary.json >/dev/null
-```
+## Supervisor boundary
 
-Expected current live baseline from the default config is roughly 13 enabled sources and about 1.9k publish candidates. Counts will drift as feeds change.
-
-## Upgrade
-
-For source installs:
-
-```bash
-cd /opt/argus   # or ~/src/argus
-git pull --ff-only
-. .venv/bin/activate
-python -m pip install -e .
-```
-
-Run the verification gate after upgrade.
-
-## Rollback
-
-For source installs:
-
-```bash
-cd /opt/argus
-git log --oneline --max-count=10
-git checkout <known-good-sha>
-. .venv/bin/activate
-python -m pip install -e .
-```
-
-Keep previous run artifacts; do not delete `/var/lib/argus/runs/` during rollback.
-
-## Current hard boundaries
-
-- No live Subspace publish yet.
-- No digest generation here.
-- No ranking, scoring, lane assignment, or interpretation here.
-- No credentials should be needed for the current public-feed worker.
-- Racter deploy needs a concrete scheduler/supervisor decision before it is called production.
+A supervisor may keep `argus serve --config /etc/argus/argus.yaml` running after Racter reboot. It must not be configured as a timer that periodically invokes one-shot ingestion. No cron, systemd timer, launchd timer, or equivalent external schedule is part of the production model.
