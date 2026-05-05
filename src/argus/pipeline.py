@@ -1020,11 +1020,15 @@ def build_command_parser() -> argparse.ArgumentParser:
     explain = subparsers.add_parser("explain-skip", help="Print run explanation details")
     explain.add_argument("--db", required=True, type=Path)
     explain.add_argument("--run", required=True)
+
+    embedding_doctor = subparsers.add_parser("embedding-doctor", help="Verify model-backed OpenAI embedding configuration")
+    embedding_doctor.add_argument("--config", required=True, type=Path)
+    embedding_doctor.add_argument("--text", default="Argus embedding doctor probe for Subspace receptor compatibility.")
     return parser
 
 
 def command_main(argv: List[str]) -> int:
-    from .server import ArgusServer, explain_skip, request_control_action, request_process_reload, run_source_health, run_status, runtime_service_pid
+    from .server import ArgusServer, explain_skip, request_control_action, request_process_reload, run_embedding_doctor, run_source_health, run_status, runtime_service_pid
 
     args = build_command_parser().parse_args(argv)
     try:
@@ -1085,6 +1089,9 @@ def command_main(argv: List[str]) -> int:
         if args.command == "explain-skip":
             print(json.dumps(explain_skip(args.db, args.run), indent=2))
             return 0
+        if args.command == "embedding-doctor":
+            print(json.dumps(run_embedding_doctor(args.config, args.text), indent=2))
+            return 0
     except PipelineError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -1093,7 +1100,7 @@ def command_main(argv: List[str]) -> int:
 
 def main(argv: Optional[List[str]] = None) -> int:
     argv = list(argv if argv is not None else sys.argv[1:])
-    if not argv or argv[0] in {"-h", "--help", "serve", "prime", "run-cycle", "set-publish-state", "reload", "status", "source-health", "explain-skip"}:
+    if not argv or argv[0] in {"-h", "--help", "serve", "prime", "run-cycle", "set-publish-state", "reload", "status", "source-health", "explain-skip", "embedding-doctor"}:
         return command_main(argv)
     args = build_parser().parse_args(argv)
     if args.dry_run and args.prime:

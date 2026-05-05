@@ -73,11 +73,12 @@ argus set-publish-state --config /etc/argus/argus.yaml --state inactive
 argus status --db /var/lib/argus/argus.sqlite3
 argus source-health --db /var/lib/argus/argus.sqlite3
 argus explain-skip --db /var/lib/argus/argus.sqlite3 --run <run_id>
+argus embedding-doctor --config /etc/argus/argus.yaml
 ```
 
 `serve --once` runs one scheduler decision for deterministic readiness checks. Long-running production uses plain `serve`.
 
-Active publishing posts package JSON to `subspace-daemon` over the configured Unix socket/API path. The package JSON keeps canonical `supplied_embeddings`; the daemon request also carries the stable `publish_idempotency_key` and daemon-compatible embedding vectors. Use the checked-in canary config only with explicit Flynn approval before any externally visible send.
+Active publishing posts package JSON to `subspace-daemon` over the configured Unix socket/API path. The package JSON keeps canonical `supplied_embeddings`; the daemon request also carries the stable `publish_idempotency_key` and daemon-compatible embedding vectors. Production configs use Argus' built-in OpenAI embedding backend with `provider=openai`, `model=text-embedding-3-small`, `dimensions=1536`, and `space_id=openai:text-embedding-3-small:1536:v1`, which is compatible with Subspace daemon receptor matching. Use the checked-in canary config only with explicit Flynn approval before any externally visible send.
 
 ## Legacy one-shot CLI
 
@@ -188,9 +189,10 @@ Failure details are written to `source-health.json`.
 
 ## Racter readiness
 
-The checked-in server-mode example config contains 13 enabled sources, default `1h` internal scheduling, inactive publish state, and embedding configuration placeholders. Racter readiness uses:
+The checked-in server-mode example config contains 13 enabled sources, default `1h` internal scheduling, inactive publish state, and the production OpenAI embedding space expected by shrdlu receptors. Racter readiness uses:
 
 ```bash
+argus embedding-doctor --config /etc/argus/argus.yaml
 argus serve --config /etc/argus/argus.yaml --once
 argus status --db /var/lib/argus/argus.sqlite3
 argus source-health --db /var/lib/argus/argus.sqlite3

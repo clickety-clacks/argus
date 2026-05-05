@@ -1,0 +1,20 @@
+{
+  "pack_id": "argus-shrdlu-e2e",
+  "version": "1.0.0",
+  "receptors": [
+    {
+      "receptor_id": "argus_news_positive_e2e",
+      "class": "broad",
+      "query": "Argus source-grounded AI research and platform news canary messages for Subspace E2E verification",
+      "threshold": 0.72,
+      "space_id": "openai:text-embedding-3-small:1536:v1"
+    },
+    {
+      "receptor_id": "argus_promotional_veto_e2e",
+      "class": "veto",
+      "query": "spam, coupons, affiliate links, shopping deals, retail promotions, giveaways, product sale pitches, and discount offers",
+      "threshold": 0.82,
+      "space_id": "openai:text-embedding-3-small:1536:v1"
+    }
+  ]
+}

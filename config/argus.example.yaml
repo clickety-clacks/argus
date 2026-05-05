@@ -18,12 +18,11 @@ publish:
   require_embeddings: true
 
 embedding:
-  backend: subspace-embedding-cli
-  command: /usr/local/bin/subspace-embed
-  provider: subspace
-  model: swarm-channel-news-v0
+  backend: openai
+  provider: openai
+  model: text-embedding-3-small
   dimensions: 1536
-  space_id: subspace:swarm-channel-news-v0:1536:v1
+  space_id: openai:text-embedding-3-small:1536:v1
 
 sources:
   - id: openai

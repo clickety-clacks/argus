@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import yaml
+import requests
 
 from .pipeline import PipelineError, SourceConfig, date_bucket, iso_z, normalize_feed_entry_id, normalize_title, parse_now, run_pipeline_for_sources, utc_now
 
@@ -29,6 +30,10 @@ FEED_ADAPTERS = {"rss", "atom"}
 API_ADAPTERS = {"api", "arxiv_atom"}
 DEFAULT_SUBSPACE_DAEMON_SOCKET = "~/.openclaw/subspace-daemon/daemon.sock"
 DEFAULT_SUBSPACE_DAEMON_API_PATH = "/v1/messages"
+OPENAI_EMBEDDING_PROVIDER = "openai"
+OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
+OPENAI_EMBEDDING_DIMENSIONS = 1536
+OPENAI_EMBEDDING_SPACE_ID = "openai:text-embedding-3-small:1536:v1"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -605,6 +610,9 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
         elif config.publish.require_embeddings and not config.publish.allow_non_embedded_fallback and not embedding_config_valid(config.embedding):
             effective = "blocked"
             blocked_reason = "missing_embedding_config"
+        elif config.publish.require_embeddings and not config.publish.allow_non_embedded_fallback and not production_embedding_config_allowed(config.embedding):
+            effective = "blocked"
+            blocked_reason = "non_production_embedding_backend"
         else:
             effective = "active"
             activation_observed_at = iso_z(observed_at)
@@ -630,9 +638,26 @@ def embedding_config_valid(config: EmbeddingConfig) -> bool:
         return False
     if not config.backend or not config.provider or not config.model or not config.dimensions or not config.space_id:
         return False
+    if config.backend == "openai":
+        return (
+            config.provider == OPENAI_EMBEDDING_PROVIDER
+            and config.model == OPENAI_EMBEDDING_MODEL
+            and int(config.dimensions) == OPENAI_EMBEDDING_DIMENSIONS
+            and config.space_id == OPENAI_EMBEDDING_SPACE_ID
+        )
     if not config.command:
         return False
     return True
+
+
+def production_embedding_config_allowed(config: EmbeddingConfig) -> bool:
+    return (
+        config.backend == "openai"
+        and config.provider == OPENAI_EMBEDDING_PROVIDER
+        and config.model == OPENAI_EMBEDDING_MODEL
+        and int(config.dimensions or 0) == OPENAI_EMBEDDING_DIMENSIONS
+        and config.space_id == OPENAI_EMBEDDING_SPACE_ID
+    )
 
 
 def store_runtime_snapshot(connection: sqlite3.Connection, snapshot: Dict[str, Any], event_type: str, status: str, error: Optional[str] = None) -> None:
@@ -745,6 +770,43 @@ def canonical_embedding_record(candidate: Dict[str, Any]) -> Dict[str, Any]:
 
 def embedded_text_hash(candidate: Dict[str, Any]) -> str:
     return "sha256:" + hashlib.sha256((candidate.get("metadata", {}).get("embedding_text") or "").encode("utf-8")).hexdigest()
+
+
+def openai_api_key() -> Optional[str]:
+    value = os.environ.get("OPENAI_API_KEY")
+    return value.strip() if value and value.strip() else None
+
+
+def sanitize_openai_error_message(message: str) -> str:
+    return re.sub(r"sk-[A-Za-z0-9_.*-]+", "[redacted-openai-key]", message)
+
+
+def request_openai_embedding(text: str, model: str, dimensions: int, api_key: str) -> Dict[str, Any]:
+    response = requests.post(
+        "https://api.openai.com/v1/embeddings",
+        headers={
+            "Authorization": "Bearer {}".format(api_key),
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "input": text,
+            "dimensions": dimensions,
+            "encoding_format": "float",
+        },
+        timeout=30,
+    )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {"error": {"message": response.text}}
+    if response.status_code < 200 or response.status_code >= 300:
+        error = payload.get("error") if isinstance(payload, dict) else None
+        message = error.get("message") if isinstance(error, dict) else response.text
+        raise PipelineError("OpenAI embedding request failed: {}".format(sanitize_openai_error_message(str(message))))
+    if isinstance(payload, dict):
+        payload["backend_request_id"] = response.headers.get("x-request-id") or response.headers.get("openai-request-id")
+    return payload
 
 
 def package_payload_for(candidate: Dict[str, Any], package_id: str) -> Dict[str, Any]:
@@ -1490,11 +1552,44 @@ class ArgusServer:
 
     def _embedding_for_candidate(self, candidate: Dict[str, Any], now: datetime, embedding_config: Optional[EmbeddingConfig] = None) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
         embedding = embedding_config or self.config.embedding
+        input_hash = embedded_text_hash(candidate)
+        request_id = "sha256:" + hashlib.sha256(
+            "embed-request:v0\n{}\n{}\n{}".format(candidate["report_id"], embedding.space_id, input_hash).encode("utf-8")
+        ).hexdigest()
+        if embedding.backend == "openai":
+            api_key = openai_api_key()
+            if not api_key:
+                return None, {"class": "embed_backend_unavailable", "message": "OPENAI_API_KEY is missing or empty", "retry_eligible": True}
+            try:
+                response = request_openai_embedding(
+                    candidate.get("metadata", {}).get("embedding_text") or "",
+                    embedding.model or "",
+                    int(embedding.dimensions or 0),
+                    api_key,
+                )
+            except PipelineError as exc:
+                return None, {"class": "embed_backend_unavailable", "message": str(exc), "retry_eligible": True}
+            data = response.get("data") if isinstance(response, dict) else None
+            vector = data[0].get("embedding") if isinstance(data, list) and data and isinstance(data[0], dict) else None
+            if response.get("model") != embedding.model:
+                return None, {"class": "embed_invalid_response", "message": "embedding metadata mismatch", "retry_eligible": True}
+            if not isinstance(vector, list):
+                return None, {"class": "embed_invalid_response", "message": "embedding vector is not a list", "retry_eligible": True}
+            if len(vector) != int(embedding.dimensions or 0):
+                return None, {"class": "embed_invalid_response", "message": "embedding vector dimensions mismatch", "retry_eligible": True}
+            vector_hash = "sha256:" + hashlib.sha256(json.dumps(vector, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+            return {
+                "space_id": embedding.space_id,
+                "provider": embedding.provider,
+                "model": embedding.model,
+                "dimensions": embedding.dimensions,
+                "input_hash": input_hash,
+                "vector_hash": vector_hash,
+                "vector": vector,
+                "backend_request_id": response.get("backend_request_id") or request_id,
+                "embedded_at": iso_z(now),
+            }, None
         if embedding.command:
-            input_hash = embedded_text_hash(candidate)
-            request_id = "sha256:" + hashlib.sha256(
-                "embed-request:v0\n{}\n{}\n{}".format(candidate["report_id"], embedding.space_id, input_hash).encode("utf-8")
-            ).hexdigest()
             request = {
                 "request_id": request_id,
                 "space_id": embedding.space_id,
@@ -1547,6 +1642,9 @@ class ArgusServer:
             vector = response.get("vector")
             if not isinstance(vector, list):
                 return None, {"class": "embed_invalid_response", "message": "embedding vector is not a list", "retry_eligible": True}
+            backend_request_id = str(response.get("backend_request_id") or "")
+            if backend_request_id.startswith("local-deterministic-"):
+                return None, {"class": "embed_invalid_response", "message": "deterministic fake embedding backend is not allowed", "retry_eligible": False}
             vector_hash = "sha256:" + hashlib.sha256(json.dumps(vector, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
             return {
                 "space_id": embedding.space_id,
@@ -2155,6 +2253,44 @@ def run_source_health(db_path: Path) -> List[Dict[str, Any]]:
         ]
     finally:
         connection.close()
+
+
+def run_embedding_doctor(config_path: Path, text: str) -> Dict[str, Any]:
+    server = ArgusServer(config_path, register_service=False)
+    try:
+        candidate = {
+            "report_id": "sha256:" + hashlib.sha256(("embedding-doctor:v0\n" + text).encode("utf-8")).hexdigest(),
+            "metadata": {"embedding_text": text},
+            "supplied_embeddings": [],
+        }
+        embedding, failure = server._embedding_for_candidate(candidate, server.clock.now())
+        if failure:
+            raise PipelineError("embedding doctor failed: {}: {}".format(failure.get("class"), failure.get("message")))
+        if embedding is None:
+            raise PipelineError("embedding doctor failed: no embedding returned")
+        real_model_backed = (
+            server.config.embedding.backend == "openai"
+            and embedding.get("provider") == OPENAI_EMBEDDING_PROVIDER
+            and embedding.get("model") == OPENAI_EMBEDDING_MODEL
+            and int(embedding.get("dimensions") or 0) == OPENAI_EMBEDDING_DIMENSIONS
+            and embedding.get("space_id") == OPENAI_EMBEDDING_SPACE_ID
+            and bool(embedding.get("vector"))
+        )
+        if not real_model_backed:
+            raise PipelineError("embedding doctor failed: embedding is not OpenAI model-backed")
+        return {
+            "ok": True,
+            "real_model_backed": True,
+            "provider": embedding.get("provider"),
+            "model": embedding.get("model"),
+            "dimensions": embedding.get("dimensions"),
+            "space_id": embedding.get("space_id"),
+            "vector_hash": embedding.get("vector_hash"),
+            "input_hash": embedding.get("input_hash"),
+            "backend_request_id": embedding.get("backend_request_id"),
+        }
+    finally:
+        server.close()
 
 
 def explain_skip(db_path: Path, run_id: str) -> Dict[str, Any]:

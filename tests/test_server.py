@@ -42,12 +42,11 @@ def write_config(root: Path, *, mode: str = "interval", interval: str = "1h", pu
         "publish": publish or {"state": "inactive"},
         "embedding": (
             {
-                "backend": "cli",
-                "command": str(write_fake_embedder(root)),
-                "provider": "fake",
-                "model": "argus-local-v0",
-                "dimensions": 1,
-                "space_id": "argus-local-v0",
+                "backend": "openai",
+                "provider": "openai",
+                "model": "text-embedding-3-small",
+                "dimensions": 1536,
+                "space_id": "openai:text-embedding-3-small:1536:v1",
             }
             if embedding is None
             else ({} if embedding is False else embedding)
@@ -134,6 +133,31 @@ sys.exit(2)
 
 
 class ServerTests(unittest.TestCase):
+    def setUp(self):
+        self._original_request_openai_embedding = server_module.request_openai_embedding
+        self._original_openai_api_key = server_module.openai_api_key
+        server_module.openai_api_key = lambda: "test-openai-key"
+        server_module.request_openai_embedding = self._fake_openai_embedding
+
+    def tearDown(self):
+        server_module.request_openai_embedding = self._original_request_openai_embedding
+        server_module.openai_api_key = self._original_openai_api_key
+
+    @staticmethod
+    def _fake_openai_embedding(text, model, dimensions, api_key):
+        return {
+            "object": "list",
+            "model": model,
+            "backend_request_id": "req_test_openai",
+            "data": [
+                {
+                    "object": "embedding",
+                    "index": 0,
+                    "embedding": [float((sum(ord(ch) for ch in text) + index) % 23) / 23.0 for index in range(dimensions)],
+                }
+            ],
+        }
+
     def test_default_scheduler_is_interval_one_hour_inactive(self):
         with TemporaryDirectory() as tmpdir:
             path = write_config(Path(tmpdir), mode="interval", publish={"state": "inactive"})
@@ -150,6 +174,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 0)
         self.assertIn("serve", output.getvalue())
         self.assertIn("run-cycle", output.getvalue())
+        self.assertIn("embedding-doctor", output.getvalue())
 
     def test_checked_in_server_config_is_racter_ready_and_inactive(self):
         config = load_runtime_config(Path("config/argus.example.yaml"))
@@ -162,7 +187,11 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(config.publish.require_embeddings)
         self.assertEqual(config.publish.subspace_daemon_socket, "~/.openclaw/subspace-daemon/daemon.sock")
         self.assertEqual(config.publish.subspace_daemon_api_path, "/v1/messages")
-        self.assertEqual(config.embedding.backend, "subspace-embedding-cli")
+        self.assertEqual(config.embedding.backend, "openai")
+        self.assertEqual(config.embedding.provider, "openai")
+        self.assertEqual(config.embedding.model, "text-embedding-3-small")
+        self.assertEqual(config.embedding.dimensions, 1536)
+        self.assertEqual(config.embedding.space_id, "openai:text-embedding-3-small:1536:v1")
         self.assertEqual(len(config.sources), 13)
         self.assertTrue(all(server_module.SOURCE_ID_RE.match(source.id) for source in config.sources))
         self.assertTrue(any(source.cadence_interval_seconds == 7200 for source in config.sources))
@@ -196,6 +225,11 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(config.publish.subspace_endpoint, "https://subspace.swarm.channel")
         self.assertEqual(config.publish.subspace_daemon_socket, "~/.openclaw/subspace-daemon/daemon.sock")
         self.assertEqual(config.publish.subspace_daemon_api_path, "/v1/messages")
+        self.assertEqual(config.embedding.backend, "openai")
+        self.assertEqual(config.embedding.provider, "openai")
+        self.assertEqual(config.embedding.model, "text-embedding-3-small")
+        self.assertEqual(config.embedding.dimensions, 1536)
+        self.assertEqual(config.embedding.space_id, "openai:text-embedding-3-small:1536:v1")
         self.assertEqual(config.fixture_dir, Path("testdata/feeds"))
         self.assertEqual(len(config.sources), 1)
         self.assertEqual(config.sources[0].fixture_payload_path, "testdata/feeds/argus-e2e-canary.rss.xml")
@@ -214,6 +248,16 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(summary["counts"]["normalized_entries"], 1)
 
+    def test_checked_in_shrdlu_receptor_pack_uses_openai_space_and_veto(self):
+        pack = json.loads(Path("config/receptors/argus-shrdlu-e2e-receptors.json").read_text())
+        receptors = pack["receptors"]
+        self.assertEqual({receptor["space_id"] for receptor in receptors}, {"openai:text-embedding-3-small:1536:v1"})
+        self.assertIn("veto", {receptor["class"] for receptor in receptors})
+        self.assertIn("broad", {receptor["class"] for receptor in receptors})
+        self.assertTrue(all("query" in receptor and "threshold" in receptor for receptor in receptors))
+        self.assertFalse(any("negative_examples" in receptor for receptor in receptors))
+        self.assertNotIn("anti_receptor", {receptor["class"] for receptor in receptors})
+
     def test_e2e_canary_config_can_emit_exactly_one_guarded_live_attempt(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -222,15 +266,6 @@ class ServerTests(unittest.TestCase):
             config["runtime"]["output_dir"] = str(root / "out")
             config["publish"]["state"] = "active"
             config["publish"]["live_approval"] = True
-            embedder = write_fake_embedder(root)
-            config["embedding"] = {
-                "backend": "cli",
-                "command": str(embedder),
-                "provider": "fake",
-                "model": "argus-local-v0",
-                "dimensions": 1,
-                "space_id": "argus-local-v0",
-            }
             path = root / "canary.yaml"
             path.write_text(yaml.safe_dump(config))
             calls = []
@@ -734,7 +769,7 @@ class ServerTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "missing_embedding_config"):
                 ArgusServer(path, clock=FakeClock(NOW))
 
-    def test_configured_embedding_backend_does_not_imply_candidate_embeddings(self):
+    def test_fake_embedding_backend_blocks_active_live_config(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             path = write_config(
@@ -758,7 +793,8 @@ class ServerTests(unittest.TestCase):
             path.write_text(yaml.safe_dump(config))
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
-                self.assertEqual(server.status()["publish"]["effective_mode"], "active")
+                self.assertEqual(server.status()["publish"]["effective_mode"], "blocked")
+                self.assertEqual(server.status()["publish"]["blocked_reason"], "non_production_embedding_backend")
                 server.tick()
             finally:
                 server.close()
@@ -781,6 +817,111 @@ class ServerTests(unittest.TestCase):
             path.write_text(yaml.safe_dump(config))
             with self.assertRaisesRegex(Exception, "missing_embedding_config"):
                 ArgusServer(path, clock=FakeClock(NOW))
+
+    def test_openai_embedding_backend_records_model_backed_vector(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive", "require_embeddings": True})
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server.close()
+            embedding_rows = rows(root / "argus.sqlite3", "embeddings")
+            self.assertEqual({row["provider"] for row in embedding_rows}, {"openai"})
+            self.assertEqual({row["model"] for row in embedding_rows}, {"text-embedding-3-small"})
+            self.assertEqual({row["embedding_space_id"] for row in embedding_rows}, {"openai:text-embedding-3-small:1536:v1"})
+            self.assertEqual({row["dimensions"] for row in embedding_rows}, {1536})
+            self.assertTrue(all(len(json.loads(row["vector_json"])) == 1536 for row in embedding_rows))
+
+    def test_embedding_doctor_proves_real_model_backed_openai_metadata(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive", "require_embeddings": True})
+            result = server_module.run_embedding_doctor(path, "Argus receptor-compatible embedding doctor")
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["real_model_backed"])
+            self.assertEqual(result["provider"], "openai")
+            self.assertEqual(result["model"], "text-embedding-3-small")
+            self.assertEqual(result["dimensions"], 1536)
+            self.assertEqual(result["space_id"], "openai:text-embedding-3-small:1536:v1")
+            self.assertTrue(result["vector_hash"].startswith("sha256:"))
+
+    def test_openai_embedding_errors_redact_api_key_material(self):
+        class Response:
+            status_code = 401
+            text = "Incorrect API key provided: sk-proj-sensitive-fragment"
+            headers = {}
+
+            @staticmethod
+            def json():
+                return {"error": {"message": "Incorrect API key provided: sk-proj-sensitive-fragment"}}
+
+        original_post = server_module.requests.post
+        server_module.requests.post = lambda *args, **kwargs: Response()
+        try:
+            with self.assertRaisesRegex(Exception, r"\[redacted-openai-key\]"):
+                self._original_request_openai_embedding("text", "text-embedding-3-small", 1536, "sk-proj-sensitive-fragment")
+        finally:
+            server_module.requests.post = original_post
+
+    def test_embedding_doctor_rejects_fake_cli_backend(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                embedding={
+                    "backend": "subspace-embedding-cli",
+                    "command": str(write_fake_embedder(root)),
+                    "provider": "fake",
+                    "model": "argus-local-v0",
+                    "dimensions": 1,
+                    "space_id": "argus-local-v0",
+                },
+                publish={"state": "inactive", "require_embeddings": True},
+            )
+            with self.assertRaisesRegex(Exception, "not OpenAI model-backed"):
+                server_module.run_embedding_doctor(path, "fake")
+
+    def test_local_deterministic_backend_response_is_rejected(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            script = root / "deterministic_stub.py"
+            script.write_text(
+                """#!/usr/bin/env python3
+import json
+import sys
+request = json.loads(sys.stdin.read())
+print(json.dumps({
+    "space_id": request["space_id"],
+    "provider": request["provider"],
+    "model": request["model"],
+    "dimensions": request["dimensions"],
+    "vector": [0.0],
+    "backend_request_id": "local-deterministic-test"
+}))
+"""
+            )
+            script.chmod(0o755)
+            path = write_config(
+                root,
+                embedding={
+                    "backend": "subspace-embedding-cli",
+                    "command": str(script),
+                    "provider": "fake",
+                    "model": "argus-local-v0",
+                    "dimensions": 1,
+                    "space_id": "argus-local-v0",
+                },
+                publish={"state": "inactive", "require_embeddings": True},
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server.close()
+            failures = [json.loads(row["failure_json"]) for row in rows(root / "argus.sqlite3", "embeddings")]
+            self.assertEqual({failure["message"] for failure in failures}, {"deterministic fake embedding backend is not allowed"})
 
     def test_embedding_failure_records_failed_embedding_and_artifact(self):
         with TemporaryDirectory() as tmpdir:
@@ -1380,17 +1521,6 @@ class ServerTests(unittest.TestCase):
                     "require_embeddings": True,
                 },
             )
-            config = yaml.safe_load(path.read_text())
-            embedder = write_fake_embedder(root)
-            config["embedding"] = {
-                "backend": "cli",
-                "command": str(embedder),
-                "provider": "fake",
-                "model": "argus-local-v0",
-                "dimensions": 1,
-                "space_id": "argus-local-v0",
-            }
-            path.write_text(yaml.safe_dump(config))
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
                 server.tick()
@@ -1400,7 +1530,7 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(package["schema"], "swarm.channel.news.report.v0")
             self.assertTrue(package["package_id"].startswith("sha256:"))
             self.assertIsInstance(package["supplied_embeddings"], list)
-            self.assertEqual(package["supplied_embeddings"][0]["space_id"], "argus-local-v0")
+            self.assertEqual(package["supplied_embeddings"][0]["space_id"], "openai:text-embedding-3-small:1536:v1")
             self.assertNotIn("suppliedEmbeddings", package)
             self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 2)
 
@@ -1485,11 +1615,11 @@ class ServerTests(unittest.TestCase):
             attempts = rows(root / "argus.sqlite3", "publish_attempts")
             self.assertEqual({call["idempotency_key"] for call in calls}, {row["publish_idempotency_key"] for row in attempts})
             self.assertTrue(all(call["embeddings"] for call in calls))
-            self.assertEqual({call["embeddings"][0]["space_id"] for call in calls}, {"argus-local-v0"})
+            self.assertEqual({call["embeddings"][0]["space_id"] for call in calls}, {"openai:text-embedding-3-small:1536:v1"})
             self.assertTrue(all(isinstance(call["embeddings"][0]["vector"], list) for call in calls))
             packages = [json.loads(call["text"]) for call in calls]
             self.assertTrue(all(package["schema"] == "swarm.channel.news.report.v0" for package in packages))
-            self.assertTrue(all(package["supplied_embeddings"][0]["space_id"] == "argus-local-v0" for package in packages))
+            self.assertTrue(all(package["supplied_embeddings"][0]["space_id"] == "openai:text-embedding-3-small:1536:v1" for package in packages))
             self.assertTrue(all(package["supplied_embeddings"][0]["vector"] == call["embeddings"][0]["vector"] for package, call in zip(packages, calls)))
 
     def test_live_publisher_daemon_failure_records_failed_attempt(self):

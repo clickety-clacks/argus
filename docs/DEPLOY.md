@@ -34,7 +34,18 @@ sudo cp config/argus.example.yaml /etc/argus/argus.yaml
 sudo ln -sf /opt/argus/bin/argus /usr/local/bin/argus
 ```
 
-Edit `/etc/argus/argus.yaml` for host-local paths and the embedding command. Default config keeps `publish.state: inactive` and `publish.live_approval: false`; that is the safety boundary.
+Edit `/etc/argus/argus.yaml` only for host-local paths and source choices. Production embedding is first-class in Argus and must remain:
+
+```yaml
+embedding:
+  backend: openai
+  provider: openai
+  model: text-embedding-3-small
+  dimensions: 1536
+  space_id: openai:text-embedding-3-small:1536:v1
+```
+
+The host must provide `OPENAI_API_KEY` through the operator environment or host secret mechanism; do not put the token in YAML or logs. Default config keeps `publish.state: inactive` and `publish.live_approval: false`; that is the safety boundary.
 
 ## Runtime commands
 
@@ -62,6 +73,7 @@ argus set-publish-state --config /etc/argus/argus.yaml --state active
 argus status --db /var/lib/argus/argus.sqlite3
 argus source-health --db /var/lib/argus/argus.sqlite3
 argus explain-skip --db /var/lib/argus/argus.sqlite3 --run <run_id>
+argus embedding-doctor --config /etc/argus/argus.yaml
 ```
 
 `prime` is optional/manual baseline tooling only. Normal scheduled/manual cycles do not require prime and do not use prime as an active/inactive gate.
@@ -71,10 +83,13 @@ argus explain-skip --db /var/lib/argus/argus.sqlite3 --run <run_id>
 Before declaring Racter ready, verify:
 
 ```bash
+argus embedding-doctor --config /etc/argus/argus.yaml
 argus serve --config /etc/argus/argus.yaml --once
 argus status --db /var/lib/argus/argus.sqlite3
 argus source-health --db /var/lib/argus/argus.sqlite3
 ```
+
+`embedding-doctor` must return `real_model_backed: true` with `provider=openai`, `model=text-embedding-3-small`, `dimensions=1536`, and `space_id=openai:text-embedding-3-small:1536:v1`. A deterministic or fake CLI embedder is test-only and is not product readiness evidence.
 
 Then inspect the newest run directory under `/var/lib/argus/runs/` and confirm required inactive artifacts exist:
 
@@ -105,6 +120,12 @@ publish:
   subspace_daemon_socket: ~/.openclaw/subspace-daemon/daemon.sock
   subspace_daemon_api_path: /v1/messages
   require_embeddings: true
+embedding:
+  backend: openai
+  provider: openai
+  model: text-embedding-3-small
+  dimensions: 1536
+  space_id: openai:text-embedding-3-small:1536:v1
 ```
 
 Use a canary-local database/output directory such as `/var/lib/argus-e2e/`, and verify the canary source list still has exactly one enabled source before activation:
@@ -119,6 +140,15 @@ sqlite3 /var/lib/argus-e2e/argus.sqlite3 'select status, subspace_message_id, re
 The checked-in canary config is fixture-backed by design so it emits exactly one operator-controlled package rather than live feed contents. The `--max-live-publishes 1` guard fails the cycle before any daemon POST if more than one active-eligible live send would be emitted. shrdlu-side receipt is verified outside Argus by observing the expected Subspace inbound message with the recorded `subspace_message_id` and package `package_id`.
 
 Rollback is to set the canary config back to `publish.state: inactive` and `publish.live_approval: false`, then rerun status checks. Do not delete the canary SQLite file before capturing the `publish_attempts` evidence.
+
+## shrdlu receptor readiness
+
+Before live receptor E2E, install `config/receptors/argus-shrdlu-e2e-receptors.json` into a shrdlu-local receptor pack path such as `~/.openclaw/subspace-daemon/receptors/packs/argus-e2e/argus-shrdlu-e2e-receptors.json`, then point the Subetha `servers[].local_pack_paths` entry at that directory. The pack is intentionally scoped to `openai:text-embedding-3-small:1536:v1` and includes:
+
+- `argus_news_positive_e2e`: positive receptor for Argus news canaries.
+- `argus_promotional_veto_e2e`: veto receptor for promotional/spam canaries.
+
+Do not run live Subetha sends until Flynn approves the exact live-send count. A receptor-aware product E2E needs separate positive-match, negative-no-match/no-wake, and veto-no-wake cases, with shrdlu daemon logs/runtime/session evidence for each.
 
 ## Supervisor boundary
 
