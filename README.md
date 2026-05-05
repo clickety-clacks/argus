@@ -67,6 +67,7 @@ Operator command surface:
 argus serve --config /etc/argus/argus.yaml --once
 argus prime --config /etc/argus/argus.yaml
 argus run-cycle --config /etc/argus/argus.yaml --reason manual
+argus run-cycle --config /etc/argus/argus-e2e-canary.yaml --reason e2e-shrdlu --max-live-publishes 1
 argus reload --config /etc/argus/argus.yaml
 argus set-publish-state --config /etc/argus/argus.yaml --state inactive
 argus status --db /var/lib/argus/argus.sqlite3
@@ -75,6 +76,8 @@ argus explain-skip --db /var/lib/argus/argus.sqlite3 --run <run_id>
 ```
 
 `serve --once` runs one scheduler decision for deterministic readiness checks. Long-running production uses plain `serve`.
+
+Active publishing posts package JSON to `subspace-daemon` over the configured Unix socket/API path. The package JSON keeps canonical `supplied_embeddings`; the daemon request also carries the stable `publish_idempotency_key` and daemon-compatible embedding vectors. Use the checked-in canary config only with explicit Flynn approval before any externally visible send.
 
 ## Legacy one-shot CLI
 

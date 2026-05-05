@@ -6,6 +6,7 @@ import json
 import os
 import re
 import signal
+import socket
 import sqlite3
 import subprocess
 import tempfile
@@ -26,6 +27,8 @@ SOURCE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 SOURCE_CLASSES = {"official", "research", "editorial", "community", "adapter"}
 FEED_ADAPTERS = {"rss", "atom"}
 API_ADAPTERS = {"api", "arxiv_atom"}
+DEFAULT_SUBSPACE_DAEMON_SOCKET = "~/.openclaw/subspace-daemon/daemon.sock"
+DEFAULT_SUBSPACE_DAEMON_API_PATH = "/v1/messages"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -42,6 +45,8 @@ class PublishConfig:
     state: str = "inactive"
     live_approval: bool = False
     subspace_endpoint: Optional[str] = None
+    subspace_daemon_socket: str = DEFAULT_SUBSPACE_DAEMON_SOCKET
+    subspace_daemon_api_path: str = DEFAULT_SUBSPACE_DAEMON_API_PATH
     require_embeddings: bool = True
     allow_non_embedded_fallback: bool = False
 
@@ -274,6 +279,8 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
         state=str(publish_payload.get("state", "inactive")),
         live_approval=bool(publish_payload.get("live_approval", False)),
         subspace_endpoint=(str(publish_payload["subspace_endpoint"]) if publish_payload.get("subspace_endpoint") else None),
+        subspace_daemon_socket=str(publish_payload.get("subspace_daemon_socket") or publish_payload.get("daemon_socket_path") or DEFAULT_SUBSPACE_DAEMON_SOCKET),
+        subspace_daemon_api_path=str(publish_payload.get("subspace_daemon_api_path") or publish_payload.get("daemon_api_path") or DEFAULT_SUBSPACE_DAEMON_API_PATH),
         require_embeddings=bool(publish_payload.get("require_embeddings", True)),
         allow_non_embedded_fallback=bool(publish_payload.get("allow_non_embedded_fallback", False)),
     )
@@ -487,6 +494,7 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
           status TEXT NOT NULL,
           attempted_at TEXT NOT NULL,
           completed_at TEXT,
+          subspace_message_id TEXT,
           response_json TEXT,
           error_class TEXT,
           error_message TEXT,
@@ -574,6 +582,9 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
         );
         """
     )
+    publish_columns = {row["name"] for row in connection.execute("PRAGMA table_info(publish_attempts)")}
+    if "subspace_message_id" not in publish_columns:
+        connection.execute("ALTER TABLE publish_attempts ADD COLUMN subspace_message_id TEXT")
     connection.commit()
 
 
@@ -771,6 +782,98 @@ def package_payload_for(candidate: Dict[str, Any], package_id: str) -> Dict[str,
     }
 
 
+class PublishTransportError(PipelineError):
+    def __init__(self, message: str, response: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.response = response
+
+
+def canonical_embedding_for_daemon(supplied_embedding: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "space_id": supplied_embedding.get("space_id"),
+        "vector": supplied_embedding.get("vector") or [],
+    }
+
+
+def subspace_message_id_from_response(response: Dict[str, Any]) -> Optional[str]:
+    for result in response.get("results") or []:
+        if result.get("sent"):
+            return result.get("subspace_message_id")
+    return None
+
+
+def post_json_over_unix_socket(socket_path: Path, api_path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    request = (
+        "POST {} HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: {}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).format(api_path, len(encoded)).encode("utf-8") + encoded
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(10)
+        try:
+            client.connect(str(socket_path))
+            client.sendall(request)
+            chunks = []
+            while True:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            client.close()
+    except OSError as exc:
+        raise PublishTransportError(str(exc)) from exc
+    raw = b"".join(chunks)
+    header_bytes, _, body_bytes = raw.partition(b"\r\n\r\n")
+    status_line = header_bytes.splitlines()[0].decode("utf-8", errors="replace") if header_bytes else ""
+    try:
+        status = int(status_line.split()[1])
+    except (IndexError, ValueError):
+        raise PublishTransportError("invalid daemon response")
+    headers: Dict[str, str] = {}
+    for line in header_bytes.splitlines()[1:]:
+        name, separator, value = line.partition(b":")
+        if separator:
+            headers[name.decode("ascii", errors="ignore").lower()] = value.decode("ascii", errors="ignore").strip()
+    if headers.get("transfer-encoding", "").lower() == "chunked":
+        decoded = bytearray()
+        remaining = body_bytes
+        while True:
+            line, separator, remaining = remaining.partition(b"\r\n")
+            if not separator:
+                raise PublishTransportError("invalid chunked daemon response")
+            try:
+                size = int(line.split(b";", 1)[0], 16)
+            except ValueError as exc:
+                raise PublishTransportError("invalid chunked daemon response") from exc
+            if size == 0:
+                body_bytes = bytes(decoded)
+                break
+            if len(remaining) < size + 2:
+                raise PublishTransportError("invalid chunked daemon response")
+            decoded.extend(remaining[:size])
+            remaining = remaining[size + 2 :]
+    elif headers.get("content-length"):
+        try:
+            body_bytes = body_bytes[: int(headers["content-length"])]
+        except ValueError as exc:
+            raise PublishTransportError("invalid daemon content-length") from exc
+    try:
+        body = json.loads(body_bytes.decode("utf-8")) if body_bytes.strip() else {}
+    except ValueError as exc:
+        raise PublishTransportError("invalid daemon JSON response") from exc
+    if status < 200 or status >= 300 or not body.get("ok"):
+        error = body.get("error") if isinstance(body.get("error"), dict) else {}
+        message = error.get("message") or "daemon publish failed"
+        raise PublishTransportError(str(message), body)
+    return body
+
+
 class ArgusServer:
     def __init__(self, config_path: Path, clock: Optional[Clock] = None, register_service: bool = True) -> None:
         self.config_path = config_path
@@ -865,6 +968,14 @@ class ArgusServer:
             "UPDATE runs SET status = ?, completed_at = ?, summary_json = ? WHERE run_id = ?",
             ("failed", iso_z(now), json.dumps(summary, sort_keys=True), run_id),
         )
+        self.connection.execute(
+            """
+            UPDATE publish_attempts
+            SET status = ?, completed_at = ?, error_class = ?, error_message = ?
+            WHERE status = 'pending'
+            """,
+            ("unknown", iso_z(now), "RuntimeError", "cycle recovered after restart before publish result was recorded"),
+        )
 
     def _write_service_registration(self) -> None:
         registration = {
@@ -928,6 +1039,8 @@ class ArgusServer:
             state=str(publish_payload.get("state", "inactive")),
             live_approval=bool(publish_payload.get("live_approval", False)),
             subspace_endpoint=(str(publish_payload["subspace_endpoint"]) if publish_payload.get("subspace_endpoint") else None),
+            subspace_daemon_socket=str(publish_payload.get("subspace_daemon_socket") or publish_payload.get("daemon_socket_path") or DEFAULT_SUBSPACE_DAEMON_SOCKET),
+            subspace_daemon_api_path=str(publish_payload.get("subspace_daemon_api_path") or publish_payload.get("daemon_api_path") or DEFAULT_SUBSPACE_DAEMON_API_PATH),
             require_embeddings=bool(publish_payload.get("require_embeddings", True)),
             allow_non_embedded_fallback=bool(publish_payload.get("allow_non_embedded_fallback", False)),
         )
@@ -976,8 +1089,8 @@ class ArgusServer:
             self.connection.commit()
             raise
 
-    def manual_cycle(self) -> Tuple[int, Dict[str, Any]]:
-        return self._run_cycle("manual", self.clock.now(), prime=False)
+    def manual_cycle(self, max_live_publishes: Optional[int] = None) -> Tuple[int, Dict[str, Any]]:
+        return self._run_cycle("manual", self.clock.now(), prime=False, max_live_publishes=max_live_publishes)
 
     def tick(self) -> Optional[Tuple[int, Dict[str, Any]]]:
         if self.reload_requested:
@@ -1039,7 +1152,8 @@ class ArgusServer:
             if row["action"] == "prime":
                 result = self.prime(requested_by=str(payload.get("requested_by", "cli")))
             elif row["action"] == "run-cycle":
-                result = self.manual_cycle()
+                max_live_publishes = payload.get("max_live_publishes")
+                result = self.manual_cycle(max_live_publishes=int(max_live_publishes) if max_live_publishes is not None else None)
             elif row["action"] == "set-publish-state":
                 snapshot = self.set_publish_state(str(payload["state"]))
                 result = (0, snapshot)
@@ -1059,7 +1173,7 @@ class ArgusServer:
             self.connection.commit()
             raise
 
-    def _run_cycle(self, run_kind: str, now: datetime, prime: bool = False) -> Tuple[int, Dict[str, Any]]:
+    def _run_cycle(self, run_kind: str, now: datetime, prime: bool = False, max_live_publishes: Optional[int] = None) -> Tuple[int, Dict[str, Any]]:
         state = self._scheduler_state()
         if self._cycle_running or state["running_run_id"]:
             self._record_scheduler_event("cycle_skipped_already_running", state["running_run_id"], "skipped", {"requested_run_kind": run_kind}, now)
@@ -1130,7 +1244,16 @@ class ArgusServer:
                         accepted_candidate_rows.append(row)
                         seen_candidate_report_ids.add(row["report_id"])
                 package_candidates_path.write_text("".join(json.dumps(row) + "\n" for row in accepted_candidate_rows))
-                package_payloads = self._store_packages_and_publish(run_id, now, output_dir, package_candidates_path, cycle_snapshot, publish_snapshot, cycle_embedding)
+                package_payloads = self._store_packages_and_publish(
+                    run_id,
+                    now,
+                    output_dir,
+                    package_candidates_path,
+                    cycle_snapshot,
+                    publish_snapshot,
+                    cycle_embedding,
+                    max_live_publishes=max_live_publishes,
+                )
                 self._rewrite_source_health_final_counts(run_id, output_dir, package_payloads)
                 self._store_source_health(run_id, now, output_dir, update_totals=False, commit=False)
                 self._write_decision_artifacts(run_id, output_dir)
@@ -1468,9 +1591,21 @@ class ArgusServer:
         )
         return failure
 
-    def _store_packages_and_publish(self, run_id: str, now: datetime, output_dir: Path, candidates_path: Path, cycle_snapshot: Dict[str, Any], publish_snapshot: Dict[str, Any], cycle_embedding: EmbeddingConfig) -> List[Dict[str, Any]]:
+    def _store_packages_and_publish(
+        self,
+        run_id: str,
+        now: datetime,
+        output_dir: Path,
+        candidates_path: Path,
+        cycle_snapshot: Dict[str, Any],
+        publish_snapshot: Dict[str, Any],
+        cycle_embedding: EmbeddingConfig,
+        max_live_publishes: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         package_payloads: List[Dict[str, Any]] = []
         embedding_failures: List[Dict[str, Any]] = []
+        publishable: List[Tuple[str, str, str, Dict[str, Any], Dict[str, Any]]] = []
+        queued_publish_keys: set[str] = set()
         rows = [json.loads(line) for line in candidates_path.read_text().splitlines() if line.strip()]
         for candidate in rows:
             if self.reload_requested:
@@ -1557,13 +1692,100 @@ class ArgusServer:
                 key = "sha256:" + hashlib.sha256(("publish:v0\n{}\n{}".format(package_id, target)).encode("utf-8")).hexdigest()
                 if self.connection.execute("SELECT 1 FROM publish_attempts WHERE publish_idempotency_key = ? AND status = 'succeeded'", (key,)).fetchone():
                     continue
-                attempt = "sha256:" + hashlib.sha256(("publish-attempt:v0\n{}\n1".format(key)).encode("utf-8")).hexdigest()
+                queued_publish_keys.add(key)
+                publishable.append((package_id, target, key, package_payload, supplied_embeddings))
+        if publish_snapshot["effective_mode"] == "active":
+            target = "sha256:" + hashlib.sha256(("publish-target:v0\n" + str(self.config.publish.subspace_endpoint)).encode("utf-8")).hexdigest()
+            for row in self.connection.execute(
+                """
+                SELECT package_id, package_json
+                FROM packages
+                WHERE active_eligible = 1
+                ORDER BY created_at, package_id
+                """
+            ):
+                package_id = row["package_id"]
+                key = "sha256:" + hashlib.sha256(("publish:v0\n{}\n{}".format(package_id, target)).encode("utf-8")).hexdigest()
+                if key in queued_publish_keys:
+                    continue
+                latest_attempt = self.connection.execute(
+                    """
+                    SELECT status
+                    FROM publish_attempts
+                    WHERE publish_idempotency_key = ?
+                    ORDER BY attempt_number DESC
+                    LIMIT 1
+                    """,
+                    (key,),
+                ).fetchone()
+                if latest_attempt is None or latest_attempt["status"] != "failed":
+                    continue
+                package_payload = json.loads(row["package_json"])
+                supplied_embeddings = supplied_embedding_for(package_payload)
+                queued_publish_keys.add(key)
+                publishable.append((package_id, target, key, package_payload, supplied_embeddings))
+        if max_live_publishes is not None and len(publishable) > max_live_publishes:
+            raise PipelineError("canary publish limit exceeded: {} > {}".format(len(publishable), max_live_publishes))
+        if publishable:
+            self.connection.commit()
+        for package_id, target, key, package_payload, supplied_embeddings in publishable:
+            previous_attempt = self.connection.execute(
+                "SELECT MAX(attempt_number) AS attempt_number FROM publish_attempts WHERE publish_idempotency_key = ?",
+                (key,),
+            ).fetchone()
+            attempt_number = int(previous_attempt["attempt_number"] or 0) + 1
+            attempt = "sha256:" + hashlib.sha256(("publish-attempt:v0\n{}\n{}".format(key, attempt_number)).encode("utf-8")).hexdigest()
+            attempted_at = iso_z(now)
+            self.connection.execute(
+                """
+                INSERT INTO publish_attempts
+                (attempt_id, package_id, publish_target_key, publish_idempotency_key, effective_publish_snapshot_id,
+                 attempt_number, mode, status, attempted_at, completed_at, subspace_message_id, response_json, error_class, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (attempt, package_id, target, key, publish_snapshot["snapshot_id"], attempt_number, publish_snapshot["effective_mode"], "pending", attempted_at, None, None, None, None, None),
+            )
+            self.connection.commit()
+            try:
+                response = self._publish_package_to_subspace(package_payload, key, supplied_embeddings)
+                message_id = subspace_message_id_from_response(response)
+                if not message_id:
+                    raise PublishTransportError("daemon response missing subspace_message_id", response)
                 self.connection.execute(
-                    "INSERT OR IGNORE INTO publish_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (attempt, package_id, target, key, publish_snapshot["snapshot_id"], 1, publish_snapshot["effective_mode"], "pending", iso_z(now), None, None, None, None),
+                    """
+                    UPDATE publish_attempts
+                    SET status = ?, completed_at = ?, subspace_message_id = ?, response_json = ?, error_class = NULL, error_message = NULL
+                    WHERE attempt_id = ?
+                    """,
+                    ("succeeded", iso_z(self.clock.now()), message_id, json.dumps(response, sort_keys=True), attempt),
                 )
+                self.connection.commit()
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                self.connection.execute(
+                    """
+                    UPDATE publish_attempts
+                    SET status = ?, completed_at = ?, response_json = ?, error_class = ?, error_message = ?
+                    WHERE attempt_id = ?
+                    """,
+                    ("failed", iso_z(self.clock.now()), json.dumps(response, sort_keys=True) if response is not None else None, exc.__class__.__name__, str(exc), attempt),
+                )
+                self.connection.commit()
         (output_dir / "embedding-failures.json").write_text(json.dumps(embedding_failures, indent=2, sort_keys=True) + "\n")
         return package_payloads
+
+    def _publish_package_to_subspace(self, package_payload: Dict[str, Any], idempotency_key: str, supplied_embedding: Dict[str, Any]) -> Dict[str, Any]:
+        request = {
+            "server": self.config.publish.subspace_endpoint,
+            "text": json.dumps(package_payload, sort_keys=True, separators=(",", ":")),
+            "idempotency_key": idempotency_key,
+            "embeddings": [canonical_embedding_for_daemon(supplied_embedding)] if supplied_embedding else [],
+        }
+        return post_json_over_unix_socket(
+            Path(os.path.expanduser(self.config.publish.subspace_daemon_socket)),
+            self.config.publish.subspace_daemon_api_path,
+            request,
+        )
 
     def _store_normalized_storage(self, run_id: str, now: datetime, output_dir: Path, accepted_report_ids: Optional[set[str]]) -> set[str]:
         sqlite_accepted_report_ids: set[str] = set()

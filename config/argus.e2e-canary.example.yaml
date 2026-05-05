@@ -1,0 +1,42 @@
+runtime:
+  database_path: /var/lib/argus-e2e/argus.sqlite3
+  output_dir: /var/lib/argus-e2e
+  fixture_dir: testdata/feeds
+  source_fetch_concurrency: 1
+
+schedule:
+  mode: manual
+  interval: 1h
+  jitter_seconds: 0
+  run_on_startup_if_due: false
+  missed_tick_policy: coalesce_one
+
+publish:
+  state: inactive
+  live_approval: false
+  subspace_endpoint: https://subspace.swarm.channel
+  subspace_daemon_socket: ~/.openclaw/subspace-daemon/daemon.sock
+  subspace_daemon_api_path: /v1/messages
+  require_embeddings: true
+  allow_non_embedded_fallback: false
+
+embedding:
+  backend: subspace-embedding-cli
+  command: /usr/local/bin/subspace-embed
+  provider: subspace
+  model: swarm-channel-news-v0
+  dimensions: 1536
+  space_id: subspace:swarm-channel-news-v0:1536:v1
+
+sources:
+  - id: argus-e2e-canary
+    display_name: Argus E2E Canary
+    source_class: adapter
+    source_category: adapter
+    feed_url: https://argus.invalid/e2e-canary.xml
+    site_url: https://argus.invalid/e2e-canary
+    adapter: rss
+    enabled: true
+    freshness_window_hours: 87600
+    authority_score: 0.01
+    fixture_payload_path: testdata/feeds/argus-e2e-canary.rss.xml

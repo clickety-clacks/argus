@@ -55,6 +55,7 @@ Operator controls:
 ```bash
 argus prime --config /etc/argus/argus.yaml
 argus run-cycle --config /etc/argus/argus.yaml --reason manual
+argus run-cycle --config /etc/argus/argus-e2e-canary.yaml --reason e2e-shrdlu --max-live-publishes 1
 argus reload --config /etc/argus/argus.yaml
 argus set-publish-state --config /etc/argus/argus.yaml --state inactive
 argus set-publish-state --config /etc/argus/argus.yaml --state active
@@ -89,6 +90,35 @@ test -s /var/lib/argus/runs/<run-id>/package-candidates.jsonl
 ```
 
 A healthy inactive deployment has no `publish_attempts` rows unless `publish.state: active`, live approval, and Subspace endpoint config are all present.
+
+## Controlled Subetha/Subspace E2E canary
+
+Do not run a live E2E send without explicit Flynn approval. Active publish is externally visible.
+
+Prepare a separate one-item canary config from `config/argus.e2e-canary.example.yaml`; keep the production `/etc/argus/argus.yaml` inactive while testing. Required live values after approval:
+
+```yaml
+publish:
+  state: active
+  live_approval: true
+  subspace_endpoint: https://subspace.swarm.channel
+  subspace_daemon_socket: ~/.openclaw/subspace-daemon/daemon.sock
+  subspace_daemon_api_path: /v1/messages
+  require_embeddings: true
+```
+
+Use a canary-local database/output directory such as `/var/lib/argus-e2e/`, and verify the canary source list still has exactly one enabled source before activation:
+
+```bash
+grep -A80 '^sources:' /etc/argus/argus-e2e-canary.yaml
+argus run-cycle --config /etc/argus/argus-e2e-canary.yaml --reason e2e-shrdlu --max-live-publishes 1
+argus status --db /var/lib/argus-e2e/argus.sqlite3
+sqlite3 /var/lib/argus-e2e/argus.sqlite3 'select status, subspace_message_id, response_json from publish_attempts;'
+```
+
+The checked-in canary config is fixture-backed by design so it emits exactly one operator-controlled package rather than live feed contents. The `--max-live-publishes 1` guard fails the cycle before any daemon POST if more than one active-eligible live send would be emitted. shrdlu-side receipt is verified outside Argus by observing the expected Subspace inbound message with the recorded `subspace_message_id` and package `package_id`.
+
+Rollback is to set the canary config back to `publish.state: inactive` and `publish.live_approval: false`, then rerun status checks. Do not delete the canary SQLite file before capturing the `publish_attempts` evidence.
 
 ## Supervisor boundary
 

@@ -22,6 +22,7 @@ import yaml
 SCHEMA_VERSION = 1
 STATE_SCHEMA_VERSION = 1
 REQUEST_TIMEOUT_SECONDS = 20
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DROP_QUERY_PARAMS = {
     "utm_source",
     "utm_medium",
@@ -574,8 +575,14 @@ def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
 
 
 def read_fixture_feed(fixture_dir: Path, source: SourceConfig, validators: Optional[Dict[str, str]] = None) -> FetchResult:
-    feed_path = Path(source.fixture_payload_path) if source.fixture_payload_path else fixture_dir / "{}.xml".format(source.id)
-    meta_path = fixture_dir / "{}.meta.json".format(source.id)
+    resolved_fixture_dir = fixture_dir if fixture_dir.is_absolute() else PROJECT_ROOT / fixture_dir
+    if source.fixture_payload_path:
+        feed_path = Path(source.fixture_payload_path)
+        if not feed_path.is_absolute():
+            feed_path = PROJECT_ROOT / feed_path
+    else:
+        feed_path = resolved_fixture_dir / "{}.xml".format(source.id)
+    meta_path = resolved_fixture_dir / "{}.meta.json".format(source.id)
     if not feed_path.exists():
         raise PipelineError("Missing fixture for {}: {}".format(source.id, feed_path))
     metadata: Dict[str, Any] = {}
@@ -995,6 +1002,7 @@ def build_command_parser() -> argparse.ArgumentParser:
     run_cycle = subparsers.add_parser("run-cycle", help="Run one normal manual cycle")
     run_cycle.add_argument("--config", required=True, type=Path)
     run_cycle.add_argument("--reason", default="manual")
+    run_cycle.add_argument("--max-live-publishes", type=int, default=None, help="Fail the cycle before publishing if more than this many live sends would be emitted.")
 
     set_publish = subparsers.add_parser("set-publish-state", help="Record a publish-state snapshot")
     set_publish.add_argument("--config", required=True, type=Path)
@@ -1043,11 +1051,14 @@ def command_main(argv: List[str]) -> int:
                 server.close()
         if args.command == "run-cycle":
             if runtime_service_pid(args.config) is not None:
-                print(json.dumps(request_control_action(args.config, "run-cycle", {"reason": args.reason}), indent=2))
+                payload = {"reason": args.reason}
+                if args.max_live_publishes is not None:
+                    payload["max_live_publishes"] = args.max_live_publishes
+                print(json.dumps(request_control_action(args.config, "run-cycle", payload), indent=2))
                 return 0
             server = ArgusServer(args.config, register_service=False)
             try:
-                exit_code, summary = server.manual_cycle()
+                exit_code, summary = server.manual_cycle(max_live_publishes=args.max_live_publishes)
                 print(json.dumps(summary, indent=2))
                 return exit_code
             finally:

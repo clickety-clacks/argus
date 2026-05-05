@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import unittest
@@ -150,6 +151,8 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(config.publish.state, "inactive")
         self.assertFalse(config.publish.live_approval)
         self.assertTrue(config.publish.require_embeddings)
+        self.assertEqual(config.publish.subspace_daemon_socket, "~/.openclaw/subspace-daemon/daemon.sock")
+        self.assertEqual(config.publish.subspace_daemon_api_path, "/v1/messages")
         self.assertEqual(config.embedding.backend, "subspace-embedding-cli")
         self.assertEqual(len(config.sources), 13)
         self.assertTrue(all(server_module.SOURCE_ID_RE.match(source.id) for source in config.sources))
@@ -174,6 +177,86 @@ class ServerTests(unittest.TestCase):
             )
             self.assertEqual(exit_code, 0)
             self.assertGreaterEqual(summary["counts"]["normalized_entries"], 30)
+
+    def test_checked_in_e2e_canary_config_is_single_item_inactive(self):
+        config = load_runtime_config(Path("config/argus.e2e-canary.example.yaml"))
+        self.assertEqual(config.scheduler.mode, "manual")
+        self.assertEqual(config.source_fetch_concurrency, 1)
+        self.assertEqual(config.publish.state, "inactive")
+        self.assertFalse(config.publish.live_approval)
+        self.assertEqual(config.publish.subspace_endpoint, "https://subspace.swarm.channel")
+        self.assertEqual(config.publish.subspace_daemon_socket, "~/.openclaw/subspace-daemon/daemon.sock")
+        self.assertEqual(config.publish.subspace_daemon_api_path, "/v1/messages")
+        self.assertEqual(config.fixture_dir, Path("testdata/feeds"))
+        self.assertEqual(len(config.sources), 1)
+        self.assertEqual(config.sources[0].fixture_payload_path, "testdata/feeds/argus-e2e-canary.rss.xml")
+        with TemporaryDirectory() as tmpdir:
+            exit_code, summary = run_pipeline_for_sources(
+                config.sources,
+                "config/argus.e2e-canary.example.yaml",
+                Path(tmpdir),
+                NOW,
+                fixture_dir=Path("unused-fixture-dir"),
+                state_path=None,
+                state_read=False,
+                state_write=False,
+                dedupe_in_pipeline=False,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["counts"]["normalized_entries"], 1)
+
+    def test_e2e_canary_config_can_emit_exactly_one_guarded_live_attempt(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = yaml.safe_load(Path("config/argus.e2e-canary.example.yaml").read_text())
+            config["runtime"]["database_path"] = str(root / "argus.sqlite3")
+            config["runtime"]["output_dir"] = str(root / "out")
+            config["publish"]["state"] = "active"
+            config["publish"]["live_approval"] = True
+            embedder = write_fake_embedder(root)
+            config["embedding"] = {
+                "backend": "cli",
+                "command": str(embedder),
+                "provider": "fake",
+                "model": "argus-local-v0",
+                "dimensions": 1,
+                "space_id": "argus-local-v0",
+            }
+            path = root / "canary.yaml"
+            path.write_text(yaml.safe_dump(config))
+            calls = []
+            original_post = server_module.post_json_over_unix_socket
+
+            def fake_post(socket_path, api_path, payload):
+                calls.append(payload)
+                return {
+                    "ok": True,
+                    "results": [
+                        {
+                            "server": payload["server"],
+                            "sent": True,
+                            "subspace_message_id": "canary-message",
+                            "idempotency_key": payload["idempotency_key"],
+                        }
+                    ],
+                }
+
+            server_module.post_json_over_unix_socket = fake_post
+            server = ArgusServer(path, clock=FakeClock(NOW), register_service=False)
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                exit_code, summary = server.manual_cycle(max_live_publishes=1)
+            finally:
+                os.chdir(original_cwd)
+                server_module.post_json_over_unix_socket = original_post
+                server.close()
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(summary["counts"]["normalized_entries"], 1)
+            self.assertEqual(len(calls), 1)
+            package = json.loads(calls[0]["text"])
+            self.assertEqual(package["body"]["title"], "Argus Subetha shrdlu E2E canary")
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 1)
 
     def test_embedding_text_uses_canonical_report_fields(self):
         with TemporaryDirectory() as tmpdir:
@@ -375,7 +458,7 @@ class ServerTests(unittest.TestCase):
             attempts = rows(root / "argus.sqlite3", "publish_attempts")
             self.assertEqual(sum(row["active_eligible"] for row in packages), 1)
             self.assertEqual(len(attempts), 1)
-            self.assertEqual(attempts[0]["status"], "pending")
+            self.assertEqual(attempts[0]["status"], "failed")
 
     def test_invalid_reload_fails_closed_from_active(self):
         with TemporaryDirectory() as tmpdir:
@@ -541,6 +624,78 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(run_row["status"], "failed")
             self.assertIn("cycle recovered after restart", json.loads(run_row["summary_json"])["post_pipeline_error"]["message"])
             self.assertEqual(len(rows(root / "argus.sqlite3", "source_config_snapshots")), 1)
+
+    def test_restart_marks_pending_publish_attempt_unknown(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root)
+            first = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                run_id = "run-with-pending-publish"
+                snapshot = latest = rows(root / "argus.sqlite3", "runtime_config_snapshots")[-1]
+                first.connection.execute(
+                    "INSERT OR REPLACE INTO runs VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        "manual",
+                        "2026-04-29T12:00:00Z",
+                        "running",
+                        str(root / "out" / "runs" / run_id),
+                        snapshot["snapshot_id"],
+                        json.dumps({"run_id": run_id, "run_kind": "manual", "exit_status": "running"}),
+                    ),
+                )
+                first.connection.execute(
+                    "INSERT INTO packages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "package-1",
+                        "report-1",
+                        "1",
+                        "argus-local-v0",
+                        "vector-hash",
+                        1,
+                        json.dumps({"package_id": "package-1", "supplied_embeddings": [{"space_id": "argus-local-v0", "vector": [1.0]}]}),
+                        run_id,
+                        "2026-04-29T12:00:00Z",
+                    ),
+                )
+                first.connection.execute(
+                    """
+                    INSERT INTO publish_attempts
+                    (attempt_id, package_id, publish_target_key, publish_idempotency_key, effective_publish_snapshot_id,
+                     attempt_number, mode, status, attempted_at, completed_at, subspace_message_id, response_json, error_class, error_message)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "attempt-1",
+                        "package-1",
+                        "target-1",
+                        "key-1",
+                        snapshot["snapshot_id"],
+                        1,
+                        "active",
+                        "pending",
+                        "2026-04-29T12:00:00Z",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                first.connection.execute("UPDATE scheduler_state SET running_run_id = ?", (run_id,))
+                first.connection.commit()
+            finally:
+                first.close()
+
+            second = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                attempt = rows(root / "argus.sqlite3", "publish_attempts")[0]
+            finally:
+                second.close()
+            self.assertEqual(attempt["status"], "unknown")
+            self.assertEqual(attempt["error_class"], "RuntimeError")
+            self.assertIn("before publish result was recorded", attempt["error_message"])
 
     def test_same_second_manual_runs_get_distinct_run_ids(self):
         with TemporaryDirectory() as tmpdir:
@@ -1098,13 +1253,14 @@ class ServerTests(unittest.TestCase):
                 with redirect_stdout(StringIO()):
                     self.assertEqual(command_main(["prime", "--config", str(path)]), 0)
                 with redirect_stdout(StringIO()):
-                    self.assertEqual(command_main(["run-cycle", "--config", str(path), "--reason", "manual"]), 0)
+                    self.assertEqual(command_main(["run-cycle", "--config", str(path), "--reason", "manual", "--max-live-publishes", "1"]), 0)
                 with redirect_stdout(StringIO()):
                     self.assertEqual(command_main(["set-publish-state", "--config", str(path), "--state", "active"]), 0)
             finally:
                 server_module.runtime_service_pid = original_pid
                 server_module.request_control_action = original_request
             self.assertEqual([call[0] for call in calls], ["prime", "run-cycle", "set-publish-state"])
+            self.assertEqual(calls[1][1]["max_live_publishes"], 1)
             self.assertFalse((root / "argus.sqlite3").exists())
 
     def test_server_process_executes_pending_manual_control_request(self):
@@ -1238,6 +1394,344 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(package["supplied_embeddings"][0]["space_id"], "argus-local-v0")
             self.assertNotIn("suppliedEmbeddings", package)
             self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 2)
+
+    def test_live_publisher_success_records_response_and_message_id(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+            )
+            calls = []
+            original_post = server_module.post_json_over_unix_socket
+
+            def fake_post(socket_path, api_path, payload):
+                calls.append({"socket_path": socket_path, "api_path": api_path, "payload": payload})
+                return {
+                    "ok": True,
+                    "results": [
+                        {
+                            "server": payload["server"],
+                            "sent": True,
+                            "subspace_message_id": "msg-" + payload["idempotency_key"][-8:],
+                            "idempotency_key": payload["idempotency_key"],
+                        }
+                    ],
+                }
+
+            server_module.post_json_over_unix_socket = fake_post
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server_module.post_json_over_unix_socket = original_post
+                server.close()
+            attempts = rows(root / "argus.sqlite3", "publish_attempts")
+            self.assertEqual({row["status"] for row in attempts}, {"succeeded"})
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(all(row["subspace_message_id"] for row in attempts))
+            self.assertTrue(all(json.loads(row["response_json"])["ok"] for row in attempts))
+
+    def test_live_publisher_forwards_embeddings_and_stable_idempotency_key(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+            )
+            calls = []
+            original_post = server_module.post_json_over_unix_socket
+
+            def fake_post(socket_path, api_path, payload):
+                calls.append(payload)
+                return {
+                    "ok": True,
+                    "results": [
+                        {
+                            "server": payload["server"],
+                            "sent": True,
+                            "subspace_message_id": "subspace-message",
+                            "idempotency_key": payload["idempotency_key"],
+                        }
+                    ],
+                }
+
+            server_module.post_json_over_unix_socket = fake_post
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server_module.post_json_over_unix_socket = original_post
+                server.close()
+            attempts = rows(root / "argus.sqlite3", "publish_attempts")
+            self.assertEqual({call["idempotency_key"] for call in calls}, {row["publish_idempotency_key"] for row in attempts})
+            self.assertTrue(all(call["embeddings"] for call in calls))
+            self.assertEqual({call["embeddings"][0]["space_id"] for call in calls}, {"argus-local-v0"})
+            self.assertTrue(all(isinstance(call["embeddings"][0]["vector"], list) for call in calls))
+            packages = [json.loads(call["text"]) for call in calls]
+            self.assertTrue(all(package["schema"] == "swarm.channel.news.report.v0" for package in packages))
+            self.assertTrue(all(package["supplied_embeddings"][0]["space_id"] == "argus-local-v0" for package in packages))
+            self.assertTrue(all(package["supplied_embeddings"][0]["vector"] == call["embeddings"][0]["vector"] for package, call in zip(packages, calls)))
+
+    def test_live_publisher_daemon_failure_records_failed_attempt(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+            )
+            original_post = server_module.post_json_over_unix_socket
+
+            def fake_post(socket_path, api_path, payload):
+                raise server_module.PublishTransportError(
+                    "daemon refused send",
+                    {"ok": False, "error": {"code": "subspace_unavailable", "message": "daemon refused send"}},
+                )
+
+            server_module.post_json_over_unix_socket = fake_post
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server_module.post_json_over_unix_socket = original_post
+                server.close()
+            attempts = rows(root / "argus.sqlite3", "publish_attempts")
+            self.assertEqual({row["status"] for row in attempts}, {"failed"})
+            self.assertEqual({row["error_class"] for row in attempts}, {"PublishTransportError"})
+            self.assertTrue(all(json.loads(row["response_json"])["ok"] is False for row in attempts))
+
+    def test_failed_live_publish_retries_with_next_attempt_number(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+            )
+            calls = []
+            original_post = server_module.post_json_over_unix_socket
+
+            def failing_post(socket_path, api_path, payload):
+                calls.append(("failed", payload["idempotency_key"]))
+                raise server_module.PublishTransportError("daemon down", {"ok": False, "error": {"message": "daemon down"}})
+
+            def succeeding_post(socket_path, api_path, payload):
+                calls.append(("succeeded", payload["idempotency_key"]))
+                return {
+                    "ok": True,
+                    "results": [
+                        {
+                            "server": payload["server"],
+                            "sent": True,
+                            "subspace_message_id": "msg-" + payload["idempotency_key"][-8:],
+                            "idempotency_key": payload["idempotency_key"],
+                        }
+                    ],
+                }
+
+            clock = FakeClock(NOW)
+            server_module.post_json_over_unix_socket = failing_post
+            server = ArgusServer(path, clock=clock)
+            try:
+                server.tick()
+                first_attempts = rows(root / "argus.sqlite3", "publish_attempts")
+                self.assertEqual({row["attempt_number"] for row in first_attempts}, {1})
+                self.assertEqual({row["status"] for row in first_attempts}, {"failed"})
+                server_module.post_json_over_unix_socket = succeeding_post
+                clock.advance(3600)
+                server.manual_cycle()
+            finally:
+                server_module.post_json_over_unix_socket = original_post
+                server.close()
+            attempts = rows(root / "argus.sqlite3", "publish_attempts")
+            self.assertEqual(len(attempts), 4)
+            by_key = {}
+            for attempt in attempts:
+                by_key.setdefault(attempt["publish_idempotency_key"], []).append(attempt)
+            self.assertEqual(len(by_key), 2)
+            for key, key_attempts in by_key.items():
+                self.assertEqual([row["attempt_number"] for row in sorted(key_attempts, key=lambda row: row["attempt_number"])], [1, 2])
+                self.assertEqual({row["status"] for row in key_attempts}, {"failed", "succeeded"})
+                self.assertEqual(calls.count(("failed", key)), 1)
+                self.assertEqual(calls.count(("succeeded", key)), 1)
+
+    def test_succeeded_live_publish_survives_later_artifact_failure(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+            )
+            original_post = server_module.post_json_over_unix_socket
+            original_write_text = Path.write_text
+            fail_summary_artifact = {"enabled": False}
+
+            def fake_post(socket_path, api_path, payload):
+                fail_summary_artifact["enabled"] = True
+                return {
+                    "ok": True,
+                    "results": [
+                        {
+                            "server": payload["server"],
+                            "sent": True,
+                            "subspace_message_id": "msg-" + payload["idempotency_key"][-8:],
+                            "idempotency_key": payload["idempotency_key"],
+                        }
+                    ],
+                }
+
+            def flaky_write_text(self, data, *args, **kwargs):
+                if fail_summary_artifact["enabled"] and self.name == "run-summary.json":
+                    raise OSError("simulated summary artifact failure after publish")
+                return original_write_text(self, data, *args, **kwargs)
+
+            server_module.post_json_over_unix_socket = fake_post
+            Path.write_text = flaky_write_text
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                with self.assertRaisesRegex(OSError, "simulated summary artifact failure after publish"):
+                    server.tick()
+            finally:
+                server_module.post_json_over_unix_socket = original_post
+                Path.write_text = original_write_text
+                server.close()
+            attempts = rows(root / "argus.sqlite3", "publish_attempts")
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual({row["status"] for row in attempts}, {"succeeded"})
+            self.assertTrue(all(row["subspace_message_id"] for row in attempts))
+            self.assertEqual(rows(root / "argus.sqlite3", "runs")[0]["status"], "failed")
+
+    def test_inactive_and_blocked_publish_do_not_send(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            fixture = root / "feeds" / "stateful-source.xml"
+            calls = []
+            original_post = server_module.post_json_over_unix_socket
+            server_module.post_json_over_unix_socket = lambda *args: calls.append(args) or {"ok": True, "results": []}
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+                config = yaml.safe_load(path.read_text())
+                config["publish"] = {"state": "active", "live_approval": False, "subspace_endpoint": "https://subspace.swarm.channel"}
+                path.write_text(yaml.safe_dump(config))
+                server.reload()
+                server.clock.advance(3600)
+                fixture.write_text(
+                    fixture.read_text().replace(
+                        "  </channel>\n</rss>",
+                        """    <item>\n      <guid>stateful-guid-3</guid>\n      <title>Third story</title>\n      <link>https://stateful.example/story-3</link>\n      <pubDate>Wed, 30 Apr 2026 10:00:00 +0000</pubDate>\n      <description>Brand new story.</description>\n    </item>\n  </channel>\n</rss>""",
+                    )
+                )
+                server.tick()
+            finally:
+                server_module.post_json_over_unix_socket = original_post
+                server.close()
+            self.assertEqual(calls, [])
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+
+    def test_canary_live_publish_limit_fails_before_any_send(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+            )
+            calls = []
+            original_post = server_module.post_json_over_unix_socket
+            server_module.post_json_over_unix_socket = lambda *args: calls.append(args) or {"ok": True, "results": []}
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                with self.assertRaisesRegex(Exception, "canary publish limit exceeded"):
+                    server.manual_cycle(max_live_publishes=1)
+            finally:
+                server_module.post_json_over_unix_socket = original_post
+                server.close()
+            self.assertEqual(calls, [])
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
+
+    def test_daemon_chunked_response_and_missing_message_id_failure(self):
+        ok_response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"ok\r\n14\r\n\":true,\"results\":[]}\r\n0\r\n\r\n"
+        original_socket = server_module.socket.socket
+
+        class FakeSocket:
+            def __init__(self, *args, **kwargs):
+                self._chunks = [ok_response, b""]
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def connect(self, path):
+                self.path = path
+
+            def sendall(self, request):
+                self.request = request
+
+            def recv(self, size):
+                return self._chunks.pop(0)
+
+            def close(self):
+                pass
+
+        server_module.socket.socket = FakeSocket
+        try:
+            response = server_module.post_json_over_unix_socket(Path("/tmp/daemon.sock"), "/v1/messages", {"text": "x"})
+        finally:
+            server_module.socket.socket = original_socket
+        self.assertEqual(response, {"ok": True, "results": []})
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+            )
+            original_post = server_module.post_json_over_unix_socket
+            server_module.post_json_over_unix_socket = lambda *args: {"ok": True, "results": []}
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server_module.post_json_over_unix_socket = original_post
+                server.close()
+            attempts = rows(root / "argus.sqlite3", "publish_attempts")
+            self.assertEqual({row["status"] for row in attempts}, {"failed"})
+            self.assertEqual({row["error_message"] for row in attempts}, {"daemon response missing subspace_message_id"})
 
     def test_spec_named_cli_backend_invokes_embedding_command(self):
         with TemporaryDirectory() as tmpdir:

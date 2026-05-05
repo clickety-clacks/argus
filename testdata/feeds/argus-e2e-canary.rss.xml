@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Argus E2E Canary</title>
+    <link>https://argus.invalid/e2e-canary</link>
+    <description>Single-item Argus Subetha/Subspace E2E canary fixture.</description>
+    <item>
+      <guid>argus-e2e-canary-2026-05-05</guid>
+      <title>Argus Subetha shrdlu E2E canary</title>
+      <link>https://argus.invalid/e2e-canary/2026-05-05</link>
+      <pubDate>Tue, 05 May 2026 12:00:00 +0000</pubDate>
+      <description>Operator-approved one-item canary for verifying Argus live publish delivery to shrdlu.</description>
+    </item>
+  </channel>
+</rss>
