@@ -1117,3 +1117,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
     print(json.dumps(run_summary, indent=2))
     return exit_code
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
