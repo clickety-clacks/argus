@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
@@ -882,6 +883,33 @@ class ServerTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(Exception, "not OpenAI model-backed"):
                 server_module.run_embedding_doctor(path, "fake")
+
+    def test_bin_wrapper_reports_pipeline_errors_without_traceback(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                embedding={
+                    "backend": "subspace-embedding-cli",
+                    "command": str(write_fake_embedder(root)),
+                    "provider": "fake",
+                    "model": "argus-local-v0",
+                    "dimensions": 1,
+                    "space_id": "argus-local-v0",
+                },
+                publish={"state": "inactive", "require_embeddings": True},
+            )
+            result = subprocess.run(
+                ["bin/argus", "embedding-doctor", "--config", str(path)],
+                cwd=Path(__file__).resolve().parents[1],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("not OpenAI model-backed", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
 
     def test_local_deterministic_backend_response_is_rejected(self):
         with TemporaryDirectory() as tmpdir:
