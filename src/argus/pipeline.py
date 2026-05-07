@@ -75,6 +75,7 @@ class SourceConfig:
     cadence_interval_seconds: Optional[int] = None
     authority_score: Optional[float] = None
     fixture_payload_path: Optional[str] = None
+    max_messages_per_fetch: Optional[int] = None
 
 
 @dataclasses.dataclass
@@ -181,6 +182,7 @@ def read_source_config(path: Path) -> List[SourceConfig]:
                 notes=str(row["notes"]) if row.get("notes") is not None else None,
                 authority_score=(float(row["authority_score"]) if row.get("authority_score") is not None else None),
                 fixture_payload_path=(str(row["fixture_payload_path"]) if row.get("fixture_payload_path") is not None else None),
+                max_messages_per_fetch=(int(row["max_messages_per_fetch"]) if row.get("max_messages_per_fetch") is not None else None),
             )
         )
     return sources
@@ -756,6 +758,12 @@ def run_pipeline_for_sources(
                 continue
 
             entries = parse_feed(fetch_result.body or "", source)
+            if source.max_messages_per_fetch is not None and len(entries) > source.max_messages_per_fetch:
+                raise PipelineError(
+                    "source {} returned {} messages, exceeding max_messages_per_fetch {}".format(
+                        source.id, len(entries), source.max_messages_per_fetch
+                    )
+                )
             raw_entries += len(entries)
             seen: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
             source_clusters: List[Dict[str, Any]] = []

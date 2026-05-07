@@ -605,6 +605,56 @@ class ServerTests(unittest.TestCase):
             package = json.loads(packages[0]["package_json"])
             self.assertEqual(package["body"]["title"], "Third story")
 
+
+    def test_prime_threshold_failure_stays_pending_until_successful_under_limit_baseline(self):
+        def feed_xml(items):
+            body = ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>", "<rss><channel><title>Threshold Source</title>"]
+            for idx, title in items:
+                body.append(
+                    "<item><guid>threshold-guid-{}</guid><title>{}</title><link>https://threshold.example/story-{}</link><pubDate>Wed, 30 Apr 2026 10:{:02d}:00 +0000</pubDate><description>{}</description></item>".format(
+                        idx, title, idx, idx, title
+                    )
+                )
+            body.append("</channel></rss>")
+            return "\n".join(body)
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            fixture = root / "feeds" / "stateful-source.xml"
+            fixture.write_text(feed_xml([(1, "Old one"), (2, "Old two"), (3, "Old three"), (4, "Old four"), (5, "Old five")]))
+            config = yaml.safe_load(path.read_text())
+            config["sources"][0]["max_messages_per_fetch"] = 3
+            path.write_text(yaml.safe_dump(config))
+            clock = FakeClock(NOW)
+            server = ArgusServer(path, clock=clock)
+            try:
+                exit_code, prime_summary = server.prime()
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(prime_summary["counts"]["failed_sources"], 1)
+                self.assertEqual(rows(root / "argus.sqlite3", "source_baselines")[0]["status"], "pending")
+                self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
+
+                fixture.write_text(feed_xml([(1, "Old one"), (2, "Old two")]))
+                clock.advance(3600)
+                exit_code, baseline_summary = server.manual_cycle()
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(baseline_summary["baseline_source_ids"], ["stateful-source"])
+                self.assertEqual(rows(root / "argus.sqlite3", "source_baselines")[0]["status"], "satisfied")
+                self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
+
+                fixture.write_text(feed_xml([(1, "Old one"), (2, "Old two"), (6, "New six")]))
+                clock.advance(3600)
+                exit_code, new_summary = server.manual_cycle()
+            finally:
+                server.close()
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(new_summary["baseline_source_ids"], [])
+            packages = rows(root / "argus.sqlite3", "packages")
+            self.assertEqual(len(packages), 1)
+            package = json.loads(packages[0]["package_json"])
+            self.assertEqual(package["body"]["title"], "New six")
+
     def test_active_cycle_auto_baselines_newly_added_source_without_publish_attempts(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

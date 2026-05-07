@@ -260,6 +260,9 @@ def source_from_runtime(row: Dict[str, Any]) -> SourceConfig:
     authority_score = row.get("authority_score")
     if authority_score is not None and not 0 <= float(authority_score) <= 1:
         raise PipelineError("Invalid authority_score for {}: {}".format(row.get("id"), authority_score))
+    max_messages_per_fetch = row.get("max_messages_per_fetch")
+    if max_messages_per_fetch is not None and int(max_messages_per_fetch) < 1:
+        raise PipelineError("Invalid max_messages_per_fetch for {}: {}".format(source_id, max_messages_per_fetch))
     fixture_payload_path = row.get("fixture_payload_path")
     if fixture_payload_path is not None:
         fixture_payload_path = str(fixture_payload_path)
@@ -282,6 +285,7 @@ def source_from_runtime(row: Dict[str, Any]) -> SourceConfig:
         cadence_interval_seconds=(parse_duration_seconds(row["cadence_override"]) if row.get("cadence_override") is not None else None),
         authority_score=(float(authority_score) if authority_score is not None else None),
         fixture_payload_path=fixture_payload_path,
+        max_messages_per_fetch=(int(max_messages_per_fetch) if max_messages_per_fetch is not None else None),
     )
 
 
