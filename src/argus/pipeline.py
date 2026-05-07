@@ -182,7 +182,7 @@ def read_source_config(path: Path) -> List[SourceConfig]:
                 notes=str(row["notes"]) if row.get("notes") is not None else None,
                 authority_score=(float(row["authority_score"]) if row.get("authority_score") is not None else None),
                 fixture_payload_path=(str(row["fixture_payload_path"]) if row.get("fixture_payload_path") is not None else None),
-                max_messages_per_fetch=(int(row["max_messages_per_fetch"]) if row.get("max_messages_per_fetch") is not None else None),
+                max_messages_per_fetch=None,
             )
         )
     return sources
@@ -1013,9 +1013,9 @@ def build_command_parser() -> argparse.ArgumentParser:
     run_cycle.add_argument("--reason", default="manual")
     run_cycle.add_argument("--max-live-publishes", type=int, default=None, help="Fail the cycle before publishing if more than this many live sends would be emitted.")
 
-    set_publish = subparsers.add_parser("set-publish-state", help="Record a publish-state snapshot")
+    set_publish = subparsers.add_parser("set-publish-state", help="Record a publish-mode snapshot")
     set_publish.add_argument("--config", required=True, type=Path)
-    set_publish.add_argument("--state", required=True, choices=["inactive", "active"])
+    set_publish.add_argument("--state", required=True, choices=["inactive", "dry_run", "live"])
 
     reload_parser = subparsers.add_parser("reload", help="Reload scheduler and publish config")
     reload_parser.add_argument("--config", required=True, type=Path)

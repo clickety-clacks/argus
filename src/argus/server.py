@@ -50,8 +50,7 @@ class SchedulerConfig:
 
 @dataclasses.dataclass(frozen=True)
 class PublishConfig:
-    state: str = "inactive"
-    live_approval: bool = False
+    mode: str = "inactive"
     subspace_endpoint: Optional[str] = None
     subspace_agent_id: Optional[str] = None
     subspace_session_token: Optional[str] = None
@@ -219,8 +218,7 @@ def publish_config_from_payload(payload: Dict[str, Any]) -> PublishConfig:
     if "subspace_session_token" in payload:
         raise PipelineError("publish.subspace_session_token must be supplied via ARGUS_SUBSPACE_SESSION_TOKEN")
     return PublishConfig(
-        state=str(payload.get("state", "inactive")),
-        live_approval=bool(payload.get("live_approval", False)),
+        mode=str(payload.get("mode", payload.get("state", "inactive"))),
         subspace_endpoint=(str(payload["subspace_endpoint"]) if payload.get("subspace_endpoint") else None),
         subspace_agent_id=(str(payload["subspace_agent_id"]) if payload.get("subspace_agent_id") else os.environ.get(DEFAULT_SUBSPACE_AGENT_ID_ENV)),
         subspace_session_token=os.environ.get(DEFAULT_SUBSPACE_SESSION_TOKEN_ENV),
@@ -260,9 +258,6 @@ def source_from_runtime(row: Dict[str, Any]) -> SourceConfig:
     authority_score = row.get("authority_score")
     if authority_score is not None and not 0 <= float(authority_score) <= 1:
         raise PipelineError("Invalid authority_score for {}: {}".format(row.get("id"), authority_score))
-    max_messages_per_fetch = row.get("max_messages_per_fetch")
-    if max_messages_per_fetch is not None and int(max_messages_per_fetch) < 1:
-        raise PipelineError("Invalid max_messages_per_fetch for {}: {}".format(source_id, max_messages_per_fetch))
     fixture_payload_path = row.get("fixture_payload_path")
     if fixture_payload_path is not None:
         fixture_payload_path = str(fixture_payload_path)
@@ -285,7 +280,7 @@ def source_from_runtime(row: Dict[str, Any]) -> SourceConfig:
         cadence_interval_seconds=(parse_duration_seconds(row["cadence_override"]) if row.get("cadence_override") is not None else None),
         authority_score=(float(authority_score) if authority_score is not None else None),
         fixture_payload_path=fixture_payload_path,
-        max_messages_per_fetch=(int(max_messages_per_fetch) if max_messages_per_fetch is not None else None),
+        max_messages_per_fetch=None,
     )
 
 
@@ -321,8 +316,8 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
     publish_payload = payload.get("publish") or {}
     embedding_payload = payload.get("embedding") or {}
     publish = publish_config_from_payload(publish_payload)
-    if publish.state not in {"inactive", "active"}:
-        raise PipelineError("Invalid publish.state: {}".format(publish.state))
+    if publish.mode not in {"inactive", "dry_run", "live"}:
+        raise PipelineError("Invalid publish.mode: {}".format(publish.mode))
     embedding = EmbeddingConfig(
         backend=(str(embedding_payload["backend"]) if embedding_payload.get("backend") else None),
         command=(str(embedding_payload["command"]) if embedding_payload.get("command") else None),
@@ -640,17 +635,16 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
 
 
 def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_inactive: bool = False, error: Optional[str] = None) -> Dict[str, Any]:
-    requested = "inactive" if force_inactive else config.publish.state
+    requested = "inactive" if force_inactive else config.publish.mode
     effective = "inactive"
     blocked_reason = None
     activation_observed_at = None
     if error:
         blocked_reason = error
-    elif config.publish.state == "active":
-        if not config.publish.live_approval:
-            effective = "blocked"
-            blocked_reason = "missing_live_approval"
-        elif not config.publish.subspace_endpoint:
+    elif config.publish.mode == "dry_run":
+        effective = "dry_run"
+    elif config.publish.mode == "live":
+        if not config.publish.subspace_endpoint:
             effective = "blocked"
             blocked_reason = "missing_subspace_endpoint"
         elif not config.publish.subspace_agent_id or not config.publish.subspace_session_token:
@@ -658,7 +652,7 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
             blocked_reason = "missing_subspace_credentials"
         elif config.scheduler.max_live_publishes_per_tick is None:
             effective = "blocked"
-            blocked_reason = "missing_live_publish_cap"
+            blocked_reason = "missing_publish_cap"
         elif config.publish.require_embeddings and not config.publish.allow_non_embedded_fallback and not embedding_config_valid(config.embedding):
             effective = "blocked"
             blocked_reason = "missing_embedding_config"
@@ -666,7 +660,7 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
             effective = "blocked"
             blocked_reason = "non_production_embedding_backend"
         else:
-            effective = "active"
+            effective = "live"
             activation_observed_at = iso_z(observed_at)
     snapshot = {
         "snapshot_id": "sha256:{}:{}".format(config.config_hash, iso_z(observed_at)),
@@ -675,7 +669,6 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
         "requested_mode": requested,
         "effective_mode": effective,
         "activation_observed_at": activation_observed_at,
-        "live_approval_observed": bool(config.publish.live_approval),
         "max_live_publishes_per_tick": config.scheduler.max_live_publishes_per_tick,
         "require_embeddings": bool(config.publish.require_embeddings),
         "allow_non_embedded_fallback": bool(config.publish.allow_non_embedded_fallback),
@@ -728,7 +721,7 @@ def store_runtime_snapshot(connection: sqlite3.Connection, snapshot: Dict[str, A
             snapshot["requested_mode"],
             snapshot["effective_mode"],
             snapshot["activation_observed_at"],
-            int(snapshot["live_approval_observed"]),
+            0,
             int(snapshot["require_embeddings"]),
             int(snapshot["allow_non_embedded_fallback"]),
             snapshot["blocked_reason"],
@@ -1048,20 +1041,20 @@ class ArgusServer:
         snapshot = json.loads(row["snapshot_json"])
         self._persisted_activation_observed_at = snapshot.get("activation_observed_at")
         requested_mode = snapshot.get("requested_mode")
-        if requested_mode in {"inactive", "active"}:
+        if requested_mode in {"inactive", "dry_run", "live"}:
             self.config = dataclasses.replace(
                 self.config,
-                publish=dataclasses.replace(self.config.publish, state=requested_mode),
+                publish=dataclasses.replace(self.config.publish, mode=requested_mode),
             )
 
     def _build_publish_snapshot(self, now: datetime, force_inactive: bool = False, error: Optional[str] = None) -> Dict[str, Any]:
         snapshot = build_publish_snapshot(self.config, now, force_inactive=force_inactive, error=error)
-        if not force_inactive and snapshot.get("requested_mode") == "active":
+        if not force_inactive and snapshot.get("requested_mode") == "live":
             try:
                 previous = latest_snapshot(self.connection)
             except PipelineError:
                 previous = None
-            activation_observed_at = (previous or {}).get("activation_observed_at") if (previous or {}).get("requested_mode") == "active" else None
+            activation_observed_at = (previous or {}).get("activation_observed_at") if (previous or {}).get("requested_mode") == "live" else None
             if activation_observed_at:
                 snapshot["activation_observed_at"] = activation_observed_at
         return snapshot
@@ -1199,9 +1192,9 @@ class ArgusServer:
         return publish == self.config.publish and embedding == self.config.embedding
 
     def set_publish_state(self, state: str) -> Dict[str, Any]:
-        if state not in {"inactive", "active"}:
-            raise PipelineError("Invalid publish state: {}".format(state))
-        self.config = dataclasses.replace(self.config, publish=dataclasses.replace(self.config.publish, state=state))
+        if state not in {"inactive", "dry_run", "live"}:
+            raise PipelineError("Invalid publish mode: {}".format(state))
+        self.config = dataclasses.replace(self.config, publish=dataclasses.replace(self.config.publish, mode=state))
         snapshot = self._build_publish_snapshot(self.clock.now())
         store_runtime_snapshot(self.connection, snapshot, "set_publish_state", "ok")
         return snapshot
@@ -1489,7 +1482,7 @@ class ArgusServer:
 
     def _source_ids_requiring_baseline(self, cycle_sources: List[SourceConfig], cycle_snapshot: Dict[str, Any]) -> Set[str]:
         baseline_source_ids = self._pending_source_baseline_ids(cycle_sources)
-        if cycle_snapshot.get("effective_mode") != "active":
+        if cycle_snapshot.get("effective_mode") != "live":
             return baseline_source_ids
         if self.connection.execute("SELECT 1 FROM source_run_status LIMIT 1").fetchone() is None:
             return baseline_source_ids
@@ -1906,7 +1899,7 @@ class ArgusServer:
         queued_publish_keys: set[str] = set()
         rows = [json.loads(line) for line in candidates_path.read_text().splitlines() if line.strip()]
         if (
-            publish_snapshot["effective_mode"] == "active"
+            publish_snapshot["effective_mode"] == "live"
             and max_live_publishes is not None
             and len(rows) > max_live_publishes
         ):
@@ -1969,10 +1962,10 @@ class ArgusServer:
                         iso_z(now),
                     ),
                 )
-            first_acceptance_allows_publish = first["first_effective_mode"] == "active" and (
+            first_acceptance_allows_publish = first["first_effective_mode"] == "live" and (
                 not cycle_snapshot["require_embeddings"] or cycle_snapshot["allow_non_embedded_fallback"] or embedding_matches_snapshot(cycle_snapshot, supplied_embeddings)
             )
-            publish_allowed = first_acceptance_allows_publish and publish_snapshot["effective_mode"] == "active" and (
+            publish_allowed = first_acceptance_allows_publish and publish_snapshot["effective_mode"] == "live" and (
                 not publish_snapshot["require_embeddings"] or publish_snapshot["allow_non_embedded_fallback"] or embedding_matches_snapshot(publish_snapshot, supplied_embeddings)
             )
             package_payload = package_payload_for(candidate, package_id)
@@ -1998,7 +1991,7 @@ class ArgusServer:
                     continue
                 queued_publish_keys.add(key)
                 publishable.append((package_id, target, key, package_payload, supplied_embeddings))
-        if publish_snapshot["effective_mode"] == "active":
+        if publish_snapshot["effective_mode"] == "live":
             target = "sha256:" + hashlib.sha256(("publish-target:v0\n" + str(self.config.publish.subspace_endpoint)).encode("utf-8")).hexdigest()
             for row in self.connection.execute(
                 """

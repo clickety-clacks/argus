@@ -203,11 +203,11 @@ class ServerTests(unittest.TestCase):
 
     def test_default_scheduler_is_interval_one_hour_inactive(self):
         with TemporaryDirectory() as tmpdir:
-            path = write_config(Path(tmpdir), mode="interval", publish={"state": "inactive"})
+            path = write_config(Path(tmpdir), mode="interval", publish={"mode": "inactive"})
             config = load_runtime_config(path)
             self.assertEqual(config.scheduler.mode, "interval")
             self.assertEqual(config.scheduler.interval_seconds, 3600)
-            self.assertEqual(config.publish.state, "inactive")
+            self.assertEqual(config.publish.mode, "inactive")
 
     def test_scheduler_accepts_five_minute_operator_interval(self):
         with TemporaryDirectory() as tmpdir:
@@ -232,8 +232,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(config.scheduler.interval_seconds, 3600)
         self.assertEqual(config.scheduler.max_live_publishes_per_tick, 1)
         self.assertEqual(config.source_fetch_concurrency, 4)
-        self.assertEqual(config.publish.state, "inactive")
-        self.assertFalse(config.publish.live_approval)
+        self.assertEqual(config.publish.mode, "inactive")
         self.assertTrue(config.publish.require_embeddings)
         self.assertEqual(config.publish.subspace_endpoint, "https://subspace.swarm.channel")
         self.assertEqual(config.publish.subspace_websocket_path, "/api/firehose/stream/websocket")
@@ -270,8 +269,7 @@ class ServerTests(unittest.TestCase):
         config = load_runtime_config(Path("config/argus.e2e-canary.example.yaml"))
         self.assertEqual(config.scheduler.mode, "manual")
         self.assertEqual(config.source_fetch_concurrency, 1)
-        self.assertEqual(config.publish.state, "inactive")
-        self.assertFalse(config.publish.live_approval)
+        self.assertEqual(config.publish.mode, "inactive")
         self.assertEqual(config.publish.subspace_endpoint, "https://subspace.swarm.channel")
         self.assertEqual(config.publish.subspace_websocket_path, "/api/firehose/stream/websocket")
         self.assertEqual(config.embedding.backend, "openai")
@@ -303,7 +301,7 @@ class ServerTests(unittest.TestCase):
             path = write_config(
                 root,
                 publish={
-                    "state": "inactive",
+                    "mode": "inactive",
                     "subspace_daemon_socket": "~/.openclaw/subspace-daemon/daemon.sock",
                     "subspace_daemon_api_path": "/v1/messages",
                 },
@@ -317,8 +315,7 @@ class ServerTests(unittest.TestCase):
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.swarm.channel",
                     "subspace_session_token": "must-not-be-snapshotted",
                     "require_embeddings": True,
@@ -343,8 +340,7 @@ class ServerTests(unittest.TestCase):
             config = yaml.safe_load(Path("config/argus.e2e-canary.example.yaml").read_text())
             config["runtime"]["database_path"] = str(root / "argus.sqlite3")
             config["runtime"]["output_dir"] = str(root / "out")
-            config["publish"]["state"] = "active"
-            config["publish"]["live_approval"] = True
+            config["publish"]["mode"] = "live"
             path = root / "canary.yaml"
             path.write_text(yaml.safe_dump(config))
             calls = []
@@ -454,7 +450,7 @@ class ServerTests(unittest.TestCase):
     def test_empty_db_inactive_startup_runs_without_prime_or_publish(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
                 result = server.tick()
@@ -556,7 +552,7 @@ class ServerTests(unittest.TestCase):
     def test_failed_prime_leaves_pending_source_baseline_for_first_successful_parse(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             fixture = root / "feeds" / "stateful-source.xml"
             fixture.write_text("<rss><channel><item>")
             clock = FakeClock(NOW)
@@ -620,11 +616,11 @@ class ServerTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             fixture = root / "feeds" / "stateful-source.xml"
             fixture.write_text(feed_xml([(1, "Old one"), (2, "Old two"), (3, "Old three"), (4, "Old four"), (5, "Old five")]))
             config = yaml.safe_load(path.read_text())
-            config["sources"][0]["max_messages_per_fetch"] = 3
+            # max_messages_per_fetch intentionally ignored/deprecated
             path.write_text(yaml.safe_dump(config))
             clock = FakeClock(NOW)
             server = ArgusServer(path, clock=clock)
@@ -664,8 +660,7 @@ class ServerTests(unittest.TestCase):
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.invalid",
                     "require_embeddings": True,
                     "allow_non_embedded_fallback": False,
@@ -674,7 +669,7 @@ class ServerTests(unittest.TestCase):
             )
             (root / "feeds" / "stateful-source.xml").write_text(feed_xml(5))
             config = yaml.safe_load(path.read_text())
-            config["sources"][0]["max_messages_per_fetch"] = 3
+            # max_messages_per_fetch intentionally ignored/deprecated
             path.write_text(yaml.safe_dump(config))
             calls = []
             original_embedding = server_module.request_openai_embedding
@@ -697,7 +692,7 @@ class ServerTests(unittest.TestCase):
     def test_active_cycle_auto_baselines_newly_added_source_without_publish_attempts(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive", "allow_non_embedded_fallback": True})
+            path = write_config(root, publish={"mode": "inactive", "allow_non_embedded_fallback": True})
             fixture_dir = root / "feeds"
             clock = FakeClock(NOW)
             server = ArgusServer(path, clock=clock)
@@ -705,8 +700,7 @@ class ServerTests(unittest.TestCase):
                 server.tick()
                 config = yaml.safe_load(path.read_text())
                 config["publish"] = {
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.invalid",
                     "allow_non_embedded_fallback": True,
                 }
@@ -735,7 +729,7 @@ class ServerTests(unittest.TestCase):
     def test_blocked_active_reload_and_approved_active_forward_only(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             fixture_dir = root / "feeds"
             fixture_dir.mkdir(exist_ok=True)
             (fixture_dir / "stateful-source.xml").write_text((FEEDS / "stateful_source.xml").read_text())
@@ -749,15 +743,14 @@ class ServerTests(unittest.TestCase):
                 server.tick()
                 self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
 
-                config["publish"] = {"state": "active", "live_approval": False, "subspace_endpoint": "https://subspace.invalid"}
+                config["publish"] = {"mode": "live"}
                 path.write_text(yaml.safe_dump(config))
                 server.reload()
                 snapshot = json.loads(rows(root / "argus.sqlite3", "runtime_config_snapshots")[-1]["snapshot_json"])
                 self.assertEqual(snapshot["effective_mode"], "blocked")
 
                 config["publish"] = {
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.invalid",
                     "allow_non_embedded_fallback": True,
                 }
@@ -786,18 +779,17 @@ class ServerTests(unittest.TestCase):
                 root,
                 embedding=False,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.invalid",
                     "allow_non_embedded_fallback": True,
                 },
             )
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
-                self.assertEqual(server.status()["publish"]["effective_mode"], "active")
+                self.assertEqual(server.status()["publish"]["effective_mode"], "live")
                 path.write_text("publish: [")
                 server.reload()
-                self.assertNotEqual(server.status()["publish"]["effective_mode"], "active")
+                self.assertNotEqual(server.status()["publish"]["effective_mode"], "live")
             finally:
                 server.close()
 
@@ -807,16 +799,15 @@ class ServerTests(unittest.TestCase):
             path = write_config(
                 root,
                 publish={
-                    "state": "inactive",
-                    "live_approval": True,
+                    "mode": "inactive",
                     "subspace_endpoint": "https://subspace.invalid",
                     "allow_non_embedded_fallback": True,
                 },
             )
             first = ArgusServer(path, clock=FakeClock(NOW))
             try:
-                first.set_publish_state("active")
-                self.assertEqual(first.status()["publish"]["effective_mode"], "active")
+                first.set_publish_state("live")
+                self.assertEqual(first.status()["publish"]["effective_mode"], "live")
                 activation_observed_at = first.status()["publish"]["activation_observed_at"]
             finally:
                 first.close()
@@ -824,8 +815,8 @@ class ServerTests(unittest.TestCase):
             second_clock.advance(3600)
             second = ArgusServer(path, clock=second_clock)
             try:
-                self.assertEqual(second.status()["publish"]["requested_mode"], "active")
-                self.assertEqual(second.status()["publish"]["effective_mode"], "active")
+                self.assertEqual(second.status()["publish"]["requested_mode"], "live")
+                self.assertEqual(second.status()["publish"]["effective_mode"], "live")
                 self.assertEqual(second.status()["publish"]["activation_observed_at"], activation_observed_at)
             finally:
                 second.close()
@@ -836,8 +827,7 @@ class ServerTests(unittest.TestCase):
             path = write_config(
                 root,
                 publish={
-                    "state": "inactive",
-                    "live_approval": True,
+                    "mode": "inactive",
                     "subspace_endpoint": "https://subspace.invalid",
                     "allow_non_embedded_fallback": True,
                 },
@@ -845,7 +835,7 @@ class ServerTests(unittest.TestCase):
             clock = FakeClock(NOW)
             first = ArgusServer(path, clock=clock)
             try:
-                active_one = first.set_publish_state("active")
+                active_one = first.set_publish_state("live")
             finally:
                 first.close()
             clock.advance(60)
@@ -853,7 +843,7 @@ class ServerTests(unittest.TestCase):
             try:
                 second.set_publish_state("inactive")
                 clock.advance(60)
-                active_two = second.set_publish_state("active")
+                active_two = second.set_publish_state("live")
             finally:
                 second.close()
             self.assertNotEqual(active_one["activation_observed_at"], active_two["activation_observed_at"])
@@ -992,7 +982,7 @@ class ServerTests(unittest.TestCase):
                         "key-1",
                         snapshot["snapshot_id"],
                         1,
-                        "active",
+                        "live",
                         "pending",
                         "2026-04-29T12:00:00Z",
                         None,
@@ -1035,8 +1025,7 @@ class ServerTests(unittest.TestCase):
                 root,
                 embedding=False,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.invalid",
                     "require_embeddings": True,
                 },
@@ -1050,8 +1039,7 @@ class ServerTests(unittest.TestCase):
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.invalid",
                     "require_embeddings": True,
                 },
@@ -1081,8 +1069,7 @@ class ServerTests(unittest.TestCase):
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.invalid",
                     "require_embeddings": True,
                 },
@@ -1096,7 +1083,7 @@ class ServerTests(unittest.TestCase):
     def test_openai_embedding_backend_records_model_backed_vector(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive", "require_embeddings": True})
+            path = write_config(root, publish={"mode": "inactive", "require_embeddings": True})
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
                 server.tick()
@@ -1112,7 +1099,7 @@ class ServerTests(unittest.TestCase):
     def test_embedding_doctor_proves_real_model_backed_openai_metadata(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive", "require_embeddings": True})
+            path = write_config(root, publish={"mode": "inactive", "require_embeddings": True})
             result = server_module.run_embedding_doctor(path, "Argus receptor-compatible embedding doctor")
             self.assertTrue(result["ok"])
             self.assertTrue(result["real_model_backed"])
@@ -1153,7 +1140,7 @@ class ServerTests(unittest.TestCase):
                     "dimensions": 1,
                     "space_id": "argus-local-v0",
                 },
-                publish={"state": "inactive", "require_embeddings": True},
+                publish={"mode": "inactive", "require_embeddings": True},
             )
             with self.assertRaisesRegex(Exception, "not OpenAI model-backed"):
                 server_module.run_embedding_doctor(path, "fake")
@@ -1171,7 +1158,7 @@ class ServerTests(unittest.TestCase):
                     "dimensions": 1,
                     "space_id": "argus-local-v0",
                 },
-                publish={"state": "inactive", "require_embeddings": True},
+                publish={"mode": "inactive", "require_embeddings": True},
             )
             result = subprocess.run(
                 ["bin/argus", "embedding-doctor", "--config", str(path)],
@@ -1215,7 +1202,7 @@ print(json.dumps({
                     "dimensions": 1,
                     "space_id": "argus-local-v0",
                 },
-                publish={"state": "inactive", "require_embeddings": True},
+                publish={"mode": "inactive", "require_embeddings": True},
             )
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
@@ -1238,7 +1225,7 @@ print(json.dumps({
                     "dimensions": 1,
                     "space_id": "argus-local-v0",
                 },
-                publish={"state": "inactive", "require_embeddings": True},
+                publish={"mode": "inactive", "require_embeddings": True},
             )
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
@@ -1270,7 +1257,7 @@ print(json.dumps({
                     "dimensions": 1,
                     "space_id": "argus-local-v0",
                 },
-                publish={"state": "inactive", "require_embeddings": True},
+                publish={"mode": "inactive", "require_embeddings": True},
             )
             clock = FakeClock(NOW)
             server = ArgusServer(path, clock=clock)
@@ -1300,7 +1287,7 @@ print(json.dumps({
                     "dimensions": 1,
                     "space_id": "argus-local-v0",
                 },
-                publish={"state": "inactive", "require_embeddings": True},
+                publish={"mode": "inactive", "require_embeddings": True},
             )
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
@@ -1314,7 +1301,7 @@ print(json.dumps({
     def test_active_no_backfill_even_if_historical_report_reprocessed(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             clock = FakeClock(NOW)
             server = ArgusServer(path, clock=clock)
             try:
@@ -1322,8 +1309,7 @@ print(json.dumps({
                 inactive_package_ids = {row["package_id"] for row in rows(root / "argus.sqlite3", "packages")}
                 config = yaml.safe_load(path.read_text())
                 config["publish"] = {
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.invalid",
                     "allow_non_embedded_fallback": True,
                 }
@@ -1344,26 +1330,25 @@ print(json.dumps({
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.invalid",
                     "allow_non_embedded_fallback": True,
                 },
             )
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
-                self.assertEqual(server.status()["publish"]["effective_mode"], "active")
+                self.assertEqual(server.status()["publish"]["effective_mode"], "live")
                 config = yaml.safe_load(path.read_text())
                 for invalid_interval in ("1m", "bogus"):
                     config["schedule"]["interval"] = invalid_interval
                     path.write_text(yaml.safe_dump(config))
                     server.reload()
-                    self.assertEqual(server.status()["publish"]["effective_mode"], "active")
+                    self.assertEqual(server.status()["publish"]["effective_mode"], "live")
                 config["schedule"]["interval"] = "1h"
                 config["schedule"]["jitter_seconds"] = "bogus"
                 path.write_text(yaml.safe_dump(config))
                 server.reload()
-                self.assertEqual(server.status()["publish"]["effective_mode"], "active")
+                self.assertEqual(server.status()["publish"]["effective_mode"], "live")
             finally:
                 server.close()
             self.assertIn("scheduler_reload_failed", [row["event_type"] for row in rows(root / "argus.sqlite3", "scheduler_events")])
@@ -1374,15 +1359,14 @@ print(json.dumps({
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.invalid",
                     "allow_non_embedded_fallback": True,
                 },
             )
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
-                self.assertEqual(server.status()["publish"]["effective_mode"], "active")
+                self.assertEqual(server.status()["publish"]["effective_mode"], "live")
                 config = yaml.safe_load(path.read_text())
                 config["publish"] = {"state": "inactive"}
                 config["schedule"]["interval"] = "1m"
@@ -1438,7 +1422,7 @@ print(json.dumps({
     def test_inactive_run_writes_review_artifacts_and_sqlite_state(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
                 server.tick()
@@ -1483,7 +1467,7 @@ print(json.dumps({
     def test_server_ignores_legacy_json_seen_state_for_sqlite_authority(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             legacy_state = root / "out" / "runs" / "state.json"
             legacy_state.parent.mkdir(parents=True)
             legacy_state.write_text(
@@ -1513,7 +1497,7 @@ print(json.dumps({
     def test_post_pipeline_artifact_failure_records_failed_run(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             original_write_text = Path.write_text
             fail_after_pipeline = {"enabled": False}
 
@@ -1539,7 +1523,7 @@ print(json.dumps({
     def test_post_pipeline_storage_rolls_back_when_decision_artifact_fails(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             original_write_text = Path.write_text
             fail_decision_artifact = {"enabled": False}
 
@@ -1566,7 +1550,7 @@ print(json.dumps({
     def test_post_pipeline_storage_rolls_back_when_package_artifact_fails(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             original_write_text = Path.write_text
             fail_package_artifact = {"enabled": False}
 
@@ -1593,7 +1577,7 @@ print(json.dumps({
     def test_post_pipeline_storage_rolls_back_when_summary_artifact_fails(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             original_write_text = Path.write_text
             fail_summary_artifact = {"enabled": False}
 
@@ -1620,7 +1604,7 @@ print(json.dumps({
     def test_prime_artifact_failure_marks_prime_event_failed(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             original_write_text = Path.write_text
             fail_prime_artifact = {"enabled": False}
 
@@ -1661,7 +1645,7 @@ print(json.dumps({
     def test_source_cadence_override_skips_source_until_due_without_wall_clock_sleep(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             fixture_dir = root / "feeds"
             shutil.copy(FEEDS / "stateful_source.xml", fixture_dir / "slow-source.xml")
             config = yaml.safe_load(path.read_text())
@@ -1708,7 +1692,7 @@ print(json.dumps({
                 with redirect_stdout(StringIO()):
                     self.assertEqual(command_main(["run-cycle", "--config", str(path), "--reason", "manual", "--max-live-publishes", "1"]), 0)
                 with redirect_stdout(StringIO()):
-                    self.assertEqual(command_main(["set-publish-state", "--config", str(path), "--state", "active"]), 0)
+                    self.assertEqual(command_main(["set-publish-state", "--config", str(path), "--state", "live"]), 0)
             finally:
                 server_module.runtime_service_pid = original_pid
                 server_module.request_control_action = original_request
@@ -1737,7 +1721,7 @@ print(json.dumps({
     def test_stale_items_are_not_inserted_as_accepted_reports(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             config = yaml.safe_load(path.read_text())
             config["sources"][0]["freshness_window_hours"] = 1
             path.write_text(yaml.safe_dump(config))
@@ -1757,7 +1741,7 @@ print(json.dumps({
     def test_same_canonical_url_different_feed_ids_are_distinct_candidates(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             fixture = root / "feeds" / "stateful-source.xml"
             fixture.write_text(
                 """<?xml version="1.0" encoding="UTF-8"?>
@@ -1791,7 +1775,7 @@ print(json.dumps({
     def test_feed_identity_rerun_updates_seen_report_not_duplicate_report(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             fixture = root / "feeds" / "stateful-source.xml"
             clock = FakeClock(NOW)
             server = ArgusServer(path, clock=clock)
@@ -1818,8 +1802,7 @@ print(json.dumps({
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.invalid",
                     "require_embeddings": True,
                 },
@@ -1843,8 +1826,7 @@ print(json.dumps({
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.swarm.channel",
                     "require_embeddings": True,
                 },
@@ -1873,8 +1855,7 @@ print(json.dumps({
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.swarm.channel",
                     "require_embeddings": True,
                 },
@@ -1904,8 +1885,7 @@ print(json.dumps({
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.swarm.channel",
                     "require_embeddings": True,
                 },
@@ -1936,8 +1916,7 @@ print(json.dumps({
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.swarm.channel",
                     "require_embeddings": True,
                 },
@@ -1995,8 +1974,7 @@ print(json.dumps({
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.swarm.channel",
                     "require_embeddings": True,
                 },
@@ -2043,7 +2021,7 @@ print(json.dumps({
     def test_inactive_and_blocked_publish_do_not_send(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             fixture = root / "feeds" / "stateful-source.xml"
             calls = []
             original_post = server_module.post_message_to_subspace
@@ -2052,7 +2030,7 @@ print(json.dumps({
             try:
                 server.tick()
                 config = yaml.safe_load(path.read_text())
-                config["publish"] = {"state": "active", "live_approval": False, "subspace_endpoint": "https://subspace.swarm.channel"}
+                config["publish"] = {"mode": "live"}
                 path.write_text(yaml.safe_dump(config))
                 server.reload()
                 server.clock.advance(3600)
@@ -2069,14 +2047,32 @@ print(json.dumps({
             self.assertEqual(calls, [])
             self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
 
+    def test_dry_run_builds_packages_without_subspace_send(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"mode": "dry_run", "subspace_endpoint": "https://subspace.swarm.channel", "allow_non_embedded_fallback": True})
+            calls = []
+            original_post = server_module.post_message_to_subspace
+            server_module.post_message_to_subspace = lambda *args: calls.append(args) or {"ok": True, "results": []}
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+                snapshot = server.status()["publish"]
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            self.assertEqual(snapshot["effective_mode"], "dry_run")
+            self.assertEqual(calls, [])
+            self.assertGreater(len(rows(root / "argus.sqlite3", "packages")), 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+
     def test_active_publish_requires_scheduled_live_publish_cap(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.invalid",
                     "allow_non_embedded_fallback": True,
                 },
@@ -2088,7 +2084,7 @@ print(json.dumps({
             try:
                 snapshot = server.status()["publish"]
                 self.assertEqual(snapshot["effective_mode"], "blocked")
-                self.assertEqual(snapshot["blocked_reason"], "missing_live_publish_cap")
+                self.assertEqual(snapshot["blocked_reason"], "missing_publish_cap")
                 server.tick()
             finally:
                 server.close()
@@ -2100,8 +2096,7 @@ print(json.dumps({
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.swarm.channel",
                     "require_embeddings": True,
                 },
@@ -2126,8 +2121,7 @@ print(json.dumps({
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.swarm.channel",
                     "require_embeddings": True,
                 },
@@ -2201,8 +2195,7 @@ print(json.dumps({
             path = write_config(
                 root,
                 publish={
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.swarm.channel",
                     "require_embeddings": True,
                 },
@@ -2232,7 +2225,7 @@ print(json.dumps({
                     "dimensions": 1,
                     "space_id": "argus-local-v0",
                 },
-                publish={"state": "inactive", "require_embeddings": True},
+                publish={"mode": "inactive", "require_embeddings": True},
             )
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
@@ -2245,7 +2238,7 @@ print(json.dumps({
     def test_source_health_command_reads_sqlite_state(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
                 server.tick()
@@ -2259,7 +2252,7 @@ print(json.dumps({
     def test_run_status_records_source_errors(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             config = yaml.safe_load(path.read_text())
             config["sources"].append(
                 {
@@ -2287,7 +2280,7 @@ print(json.dumps({
     def test_explain_skip_includes_exact_duplicate_details_from_sqlite(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             (root / "feeds" / "stateful-source.xml").write_text(
                 """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
@@ -2327,7 +2320,7 @@ print(json.dumps({
     def test_missing_identity_key_is_skipped_before_storage_and_package(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             (root / "feeds" / "stateful-source.xml").write_text(
                 """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
@@ -2356,7 +2349,7 @@ print(json.dumps({
     def test_activation_reload_during_cycle_does_not_backfill_cycle_started_inactive(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive"})
+            path = write_config(root, publish={"mode": "inactive"})
             config = yaml.safe_load(path.read_text())
             original_run_pipeline = server_module.run_pipeline_for_sources
             server = ArgusServer(path, clock=FakeClock(NOW))
@@ -2364,8 +2357,7 @@ print(json.dumps({
             def activate_during_fetch(*args, **kwargs):
                 result = original_run_pipeline(*args, **kwargs)
                 config["publish"] = {
-                    "state": "active",
-                    "live_approval": True,
+                    "mode": "live",
                     "subspace_endpoint": "https://subspace.invalid",
                     "allow_non_embedded_fallback": True,
                 }
@@ -2385,7 +2377,7 @@ print(json.dumps({
     def test_reload_during_cycle_does_not_change_embedding_config_for_packages(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            path = write_config(root, publish={"state": "inactive", "require_embeddings": True})
+            path = write_config(root, publish={"mode": "inactive", "require_embeddings": True})
             config = yaml.safe_load(path.read_text())
             original_run_pipeline = server_module.run_pipeline_for_sources
             server = ArgusServer(path, clock=FakeClock(NOW))

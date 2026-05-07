@@ -13,8 +13,7 @@ schedule:
   max_live_publishes_per_tick: 1
 
 publish:
-  state: inactive
-  live_approval: false
+  mode: inactive
   subspace_endpoint: https://subspace.swarm.channel
   subspace_websocket_path: /api/firehose/stream/websocket
   require_embeddings: true
