@@ -461,12 +461,16 @@ class ServerTests(unittest.TestCase):
                 server.close()
             self.assertEqual(exit_code, 0)
             self.assertTrue(summary["prime"])
+            self.assertEqual(summary["state"]["backend"], "sqlite")
+            self.assertTrue(summary["state"]["write_performed"])
+            self.assertEqual(summary["baseline_source_ids"], ["stateful-source"])
             run_dir = next((root / "out" / "runs").glob("20260429T120000Z-prime-*"))
             self.assertTrue((run_dir / "prime-baseline.json").exists())
             self.assertFalse((run_dir / "publish-candidates.jsonl").exists())
             self.assertFalse((run_dir / "package-candidates.jsonl").exists())
             self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
             self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+            self.assertEqual(rows(root / "argus.sqlite3", "source_baselines")[0]["status"], "satisfied")
 
     def test_prime_can_baseline_one_named_source(self):
         with TemporaryDirectory() as tmpdir:
@@ -495,6 +499,58 @@ class ServerTests(unittest.TestCase):
             self.assertEqual({row["source_id"] for row in rows(root / "argus.sqlite3", "normalized_reports")}, {"second-source"})
             self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
             self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+
+    def test_failed_prime_leaves_pending_source_baseline_for_first_successful_parse(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive"})
+            fixture = root / "feeds" / "stateful-source.xml"
+            fixture.write_text("<rss><channel><item>")
+            clock = FakeClock(NOW)
+            server = ArgusServer(path, clock=clock)
+            try:
+                exit_code, prime_summary = server.prime()
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(prime_summary["counts"]["failed_sources"], 1)
+                self.assertEqual(rows(root / "argus.sqlite3", "source_baselines")[0]["status"], "pending")
+                self.assertEqual(len(rows(root / "argus.sqlite3", "normalized_reports")), 0)
+                self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
+
+                (fixture.parent / "stateful-source.meta.json").write_text(json.dumps({"status_code": 304}))
+                clock.advance(3600)
+                exit_code, not_modified_summary = server.manual_cycle()
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(not_modified_summary["baseline_source_ids"], ["stateful-source"])
+                self.assertEqual(rows(root / "argus.sqlite3", "source_baselines")[0]["status"], "pending")
+                self.assertEqual(len(rows(root / "argus.sqlite3", "normalized_reports")), 0)
+                self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
+
+                (fixture.parent / "stateful-source.meta.json").unlink()
+                fixture.write_text((FEEDS / "stateful_source.xml").read_text())
+                clock.advance(3600)
+                exit_code, baseline_summary = server.manual_cycle()
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(baseline_summary["baseline_source_ids"], ["stateful-source"])
+                self.assertEqual(len(rows(root / "argus.sqlite3", "normalized_reports")), 2)
+                self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
+                self.assertEqual(rows(root / "argus.sqlite3", "source_baselines")[0]["status"], "satisfied")
+
+                fixture.write_text(
+                    fixture.read_text().replace(
+                        "  </channel>\n</rss>",
+                        """    <item>\n      <guid>stateful-guid-3</guid>\n      <title>Third story</title>\n      <link>https://stateful.example/story-3</link>\n      <pubDate>Wed, 30 Apr 2026 10:00:00 +0000</pubDate>\n      <description>Brand new story.</description>\n    </item>\n  </channel>\n</rss>""",
+                    )
+                )
+                clock.advance(3600)
+                exit_code, new_item_summary = server.manual_cycle()
+            finally:
+                server.close()
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(new_item_summary["baseline_source_ids"], [])
+            packages = rows(root / "argus.sqlite3", "packages")
+            self.assertEqual(len(packages), 1)
+            package = json.loads(packages[0]["package_json"])
+            self.assertEqual(package["body"]["title"], "Third story")
 
     def test_active_cycle_auto_baselines_newly_added_source_without_publish_attempts(self):
         with TemporaryDirectory() as tmpdir:

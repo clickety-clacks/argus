@@ -83,6 +83,14 @@ argus embedding-doctor --config /etc/argus/argus.yaml
 
 If publishing is already active and a source is added to an existing Argus database without a prior successful source run, Argus auto-baselines that source during the next cycle. The source health and normalized/dedupe state are recorded, but backlog items from that source do not create package rows or live publish attempts. The existing active-publish requirements still apply unchanged for later new items: `publish.state: active`, `publish.live_approval: true`, valid Subspace config, embedding/fallback policy, and live idempotency.
 
+Prime records per-source baseline intent in SQLite. If a primed source fails to parse during the prime run, its baseline remains pending; the first later successful parse for that source writes normalized/dedupe state and source health, but still creates no package rows or live publish attempts for that backlog. A `304 not_modified` fetch does not satisfy a pending baseline because it did not parse source contents. Later newly observed items may package/publish normally subject to the active safety gates.
+
+Verify baseline state with:
+
+```bash
+sqlite3 /var/lib/argus/argus.sqlite3 "select source_id, status, prime_run_id, first_successful_run_id, completed_at from source_baselines order by source_id;"
+```
+
 ## Source feed config checks
 
 Before the next scheduled tick after updating Argus, verify `/etc/argus/argus.yaml` matches the checked-in source adapter fixes:
@@ -96,6 +104,36 @@ sources:
 ```
 
 OpenAI and Hugging Face remain RSS sources; RFC 2822/RSS `pubDate` values with `GMT` normalize in Argus before freshness checks.
+
+If a production activation already created backlog package rows for OpenAI, The Verge, or Reddit after a failed/partial prime, turn publishing inactive first, deploy this build, then mark those source baselines satisfied and mark pre-fix backlog packages inactive-eligible before reactivation:
+
+```bash
+argus set-publish-state --config /etc/argus/argus.yaml --state inactive
+sqlite3 /var/lib/argus/argus.sqlite3 "
+update packages
+set active_eligible = 0
+where report_id in (
+  select report_id from normalized_reports
+  where source_id in ('openai', 'the-verge-ai', 'reddit-localllama')
+);
+insert into source_baselines
+  (source_id, requested_at, requested_by, prime_run_id, first_successful_run_id, completed_at, status, detail_json)
+select source_id, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'operator-migration', null, max(latest_seen_run_id), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), 'satisfied',
+       json_object('source_id', source_id, 'reason', 'post-prime parser/source fix migration')
+from normalized_reports
+where source_id in ('openai', 'the-verge-ai', 'reddit-localllama')
+group by source_id
+on conflict(source_id) do update set
+  requested_at=excluded.requested_at,
+  requested_by=excluded.requested_by,
+  first_successful_run_id=excluded.first_successful_run_id,
+  completed_at=excluded.completed_at,
+  status='satisfied',
+  detail_json=excluded.detail_json;
+"
+```
+
+Then run the status/watchdog checks below before setting publishing active again.
 
 ## First activation watchdog
 

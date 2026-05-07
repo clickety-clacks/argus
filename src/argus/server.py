@@ -590,6 +590,16 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
           error_class TEXT,
           error_message TEXT
         );
+        CREATE TABLE IF NOT EXISTS source_baselines (
+          source_id TEXT PRIMARY KEY,
+          requested_at TEXT NOT NULL,
+          requested_by TEXT,
+          prime_run_id TEXT,
+          first_successful_run_id TEXT,
+          completed_at TEXT,
+          status TEXT NOT NULL,
+          detail_json TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS service_state (
           id INTEGER PRIMARY KEY CHECK (id = 1),
           pid INTEGER NOT NULL,
@@ -1308,6 +1318,8 @@ class ArgusServer:
         self._store_source_config_snapshots(run_id)
         self._store_run_started(run_id, run_kind, now, output_dir, cycle_snapshot)
         try:
+            if prime:
+                self._record_source_baselines_requested(cycle_sources, now, requested_by="prime", prime_run_id=run_id)
             cycle_embedding = self.config.embedding
             exit_code, summary = run_pipeline_for_sources(
                 cycle_sources,
@@ -1332,11 +1344,21 @@ class ArgusServer:
                 self.reload()
             publish_snapshot = latest_snapshot(self.connection)
             summary["effective_publish_snapshot"] = cycle_snapshot
-            baseline_source_ids = set() if prime else self._source_ids_requiring_active_baseline(cycle_sources, cycle_snapshot)
+            source_health_rows = json.loads((output_dir / "source-health.json").read_text()) if (output_dir / "source-health.json").exists() else []
+            baseline_source_ids = set() if prime else self._source_ids_requiring_baseline(cycle_sources, cycle_snapshot)
             self._store_source_health(run_id, now, output_dir)
             if prime:
                 self._store_normalized_storage(run_id, now, output_dir, None)
+                self._mark_successful_source_baselines(run_id, now, source_health_rows)
                 self._write_decision_artifacts(run_id, output_dir)
+                summary["state"] = {
+                    "backend": "sqlite",
+                    "path": str(self.config.database_path),
+                    "read_enabled": True,
+                    "write_enabled": True,
+                    "write_performed": True,
+                }
+                summary["baseline_source_ids"] = sorted(source.id for source in cycle_sources if source.enabled)
                 self._store_run(run_id, run_kind, now, exit_code, output_dir, cycle_snapshot, summary, commit=False)
                 (output_dir / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
                 self._write_prime_artifacts(output_dir)
@@ -1356,6 +1378,7 @@ class ArgusServer:
                         seen_candidate_report_ids.add(row["report_id"])
                 package_candidates_path.write_text("".join(json.dumps(row) + "\n" for row in accepted_candidate_rows))
                 summary["baseline_source_ids"] = sorted(baseline_source_ids)
+                self._mark_successful_source_baselines(run_id, now, source_health_rows, source_ids=baseline_source_ids)
                 package_payloads = self._store_packages_and_publish(
                     run_id,
                     now,
@@ -1412,12 +1435,12 @@ class ArgusServer:
                 due_sources.append(source)
         return due_sources
 
-    def _source_ids_requiring_active_baseline(self, cycle_sources: List[SourceConfig], cycle_snapshot: Dict[str, Any]) -> Set[str]:
+    def _source_ids_requiring_baseline(self, cycle_sources: List[SourceConfig], cycle_snapshot: Dict[str, Any]) -> Set[str]:
+        baseline_source_ids = self._pending_source_baseline_ids(cycle_sources)
         if cycle_snapshot.get("effective_mode") != "active":
-            return set()
+            return baseline_source_ids
         if self.connection.execute("SELECT 1 FROM source_run_status LIMIT 1").fetchone() is None:
-            return set()
-        baseline_source_ids = set()
+            return baseline_source_ids
         for source in cycle_sources:
             if not source.enabled:
                 continue
@@ -1426,7 +1449,7 @@ class ArgusServer:
                 SELECT 1
                 FROM source_run_status
                 WHERE source_id = ?
-                  AND status IN ('ok', 'empty', 'not_modified')
+                  AND status IN ('ok', 'empty')
                 LIMIT 1
                 """,
                 (source.id,),
@@ -1434,6 +1457,73 @@ class ArgusServer:
             if row is None:
                 baseline_source_ids.add(source.id)
         return baseline_source_ids
+
+    def _pending_source_baseline_ids(self, cycle_sources: List[SourceConfig]) -> Set[str]:
+        source_ids = {source.id for source in cycle_sources if source.enabled}
+        if not source_ids:
+            return set()
+        rows = self.connection.execute("SELECT source_id FROM source_baselines WHERE status = 'pending'").fetchall()
+        return {row["source_id"] for row in rows if row["source_id"] in source_ids}
+
+    def _record_source_baselines_requested(self, sources: List[SourceConfig], now: datetime, requested_by: str, prime_run_id: str) -> None:
+        for source in sources:
+            if not source.enabled:
+                continue
+            self.connection.execute(
+                """
+                INSERT INTO source_baselines
+                (source_id, requested_at, requested_by, prime_run_id, first_successful_run_id, completed_at, status, detail_json)
+                VALUES (?, ?, ?, ?, NULL, NULL, 'pending', ?)
+                ON CONFLICT(source_id) DO UPDATE SET
+                  requested_at=excluded.requested_at,
+                  requested_by=excluded.requested_by,
+                  prime_run_id=excluded.prime_run_id,
+                  first_successful_run_id=NULL,
+                  completed_at=NULL,
+                  status='pending',
+                  detail_json=excluded.detail_json
+                """,
+                (
+                    source.id,
+                    iso_z(now),
+                    requested_by,
+                    prime_run_id,
+                    json.dumps({"source_id": source.id, "prime_run_id": prime_run_id}, sort_keys=True),
+                ),
+            )
+
+    def _mark_successful_source_baselines(
+        self,
+        run_id: str,
+        now: datetime,
+        source_health: List[Dict[str, Any]],
+        source_ids: Optional[Set[str]] = None,
+    ) -> None:
+        for row in source_health:
+            source_id = row.get("source_id")
+            if not source_id or (source_ids is not None and source_id not in source_ids):
+                continue
+            if row.get("status") not in {"ok", "empty"}:
+                continue
+            if self.connection.execute(
+                "SELECT 1 FROM source_baselines WHERE source_id = ? AND status = 'pending'",
+                (source_id,),
+            ).fetchone() is None:
+                continue
+            self.connection.execute(
+                """
+                UPDATE source_baselines
+                SET first_successful_run_id = ?, completed_at = ?, status = 'satisfied',
+                    detail_json = ?
+                WHERE source_id = ? AND status = 'pending'
+                """,
+                (
+                    run_id,
+                    iso_z(now),
+                    json.dumps({"source_id": source_id, "satisfied_run_id": run_id, "status": row.get("status")}, sort_keys=True),
+                    source_id,
+                ),
+            )
 
     def _store_source_config_snapshots(self, run_id: str) -> None:
         for source in self.config.sources:
