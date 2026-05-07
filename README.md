@@ -42,6 +42,7 @@ Python dependencies are declared in `pyproject.toml`:
 
 - `PyYAML`
 - `requests`
+- `websocket-client`
 
 ## Setup
 

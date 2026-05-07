@@ -206,18 +206,18 @@ argus source-health --db /var/lib/argus/argus.sqlite3
 
 `embedding-doctor` must return `real_model_backed: true` with `provider=openai`, `model=text-embedding-3-small`, `dimensions=1536`, and `space_id=openai:text-embedding-3-small:1536:v1`. A deterministic or fake CLI embedder is test-only and is not product readiness evidence.
 
-Then inspect the newest run directory under `/var/lib/argus/runs/` and confirm required inactive artifacts exist:
+Then inspect the newest run directory under `/var/lib/argus/runs/` and confirm product-valid readiness artifacts exist. Argus does not create subscriber digests; digest files are not readiness evidence.
 
 ```bash
 test -s /var/lib/argus/runs/<run-id>/run-summary.json
 test -s /var/lib/argus/runs/<run-id>/source-health.json
-test -s /var/lib/argus/runs/<run-id>/digest.md
-test -s /var/lib/argus/runs/<run-id>/digest.json
 test -s /var/lib/argus/runs/<run-id>/normalized-items.jsonl
 test -s /var/lib/argus/runs/<run-id>/dedupe-decisions.json
 test -s /var/lib/argus/runs/<run-id>/skipped-items.json
 test -s /var/lib/argus/runs/<run-id>/package-candidates.jsonl
 ```
+
+Use those artifacts plus `argus source-health`, `argus explain-skip`, and SQLite state to verify source health, normalized items, dedupe decisions or clusters where applicable, publish/package candidates, and publish attempts/state.
 
 A healthy inactive deployment has no `publish_attempts` rows unless `publish.state: active`, live approval, and Subspace endpoint config are all present.
 
