@@ -622,6 +622,9 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
         elif not config.publish.subspace_endpoint:
             effective = "blocked"
             blocked_reason = "missing_subspace_endpoint"
+        elif config.scheduler.max_live_publishes_per_tick is None:
+            effective = "blocked"
+            blocked_reason = "missing_live_publish_cap"
         elif config.publish.require_embeddings and not config.publish.allow_non_embedded_fallback and not embedding_config_valid(config.embedding):
             effective = "blocked"
             blocked_reason = "missing_embedding_config"
@@ -639,6 +642,7 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
         "effective_mode": effective,
         "activation_observed_at": activation_observed_at,
         "live_approval_observed": bool(config.publish.live_approval),
+        "max_live_publishes_per_tick": config.scheduler.max_live_publishes_per_tick,
         "require_embeddings": bool(config.publish.require_embeddings),
         "allow_non_embedded_fallback": bool(config.publish.allow_non_embedded_fallback),
         "embedding_space_id": config.embedding.space_id,

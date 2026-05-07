@@ -45,7 +45,7 @@ embedding:
   space_id: openai:text-embedding-3-small:1536:v1
 ```
 
-The host must provide `OPENAI_API_KEY` through the operator environment or host secret mechanism; do not put the token in YAML or logs. Default config keeps `publish.state: inactive` and `publish.live_approval: false`; that is the safety boundary.
+The host must provide `OPENAI_API_KEY` through the operator environment or host secret mechanism; do not put the token in YAML or logs. Default config keeps `publish.state: inactive`, `publish.live_approval: false`, and `schedule.max_live_publishes_per_tick: 1`; inactive plus no live approval is the primary safety boundary, and the scheduled publish cap is the first-activation rate boundary.
 
 ## Runtime commands
 
@@ -61,7 +61,7 @@ Deterministic one-decision smoke check without deploying a supervisor:
 argus serve --config /etc/argus/argus.yaml --once
 ```
 
-For scheduled canary/E2E configs, short operator intervals down to `5m` are allowed. Set `schedule.max_live_publishes_per_tick: 1`; a scheduled tick then fails before sending if more than one package is live-publish eligible.
+Active publishing is blocked unless `schedule.max_live_publishes_per_tick` is present. For first activation, set `schedule.max_live_publishes_per_tick: 1`; a scheduled tick then fails before sending if more than one package is live-publish eligible. For scheduled canary/E2E configs, short operator intervals down to `5m` are allowed with the same cap.
 
 Operator controls:
 
@@ -82,6 +82,64 @@ argus embedding-doctor --config /etc/argus/argus.yaml
 `prime` is optional/manual baseline tooling only. Normal scheduled/manual cycles do not require prime and do not use prime as an active/inactive gate. Use `argus prime --source <source-id>` after adding one feed when you want to baseline only that source before any later active publishing.
 
 If publishing is already active and a source is added to an existing Argus database without a prior successful source run, Argus auto-baselines that source during the next cycle. The source health and normalized/dedupe state are recorded, but backlog items from that source do not create package rows or live publish attempts. The existing active-publish requirements still apply unchanged for later new items: `publish.state: active`, `publish.live_approval: true`, valid Subspace config, embedding/fallback policy, and live idempotency.
+
+## First activation watchdog
+
+Do not run these commands from review agents. They are the operator procedure for Flynn-approved activation.
+
+Before activation, verify the config still has the hard scheduled cap and that active is not already effective:
+
+```bash
+python3 - <<'PY'
+import yaml
+config = yaml.safe_load(open('/etc/argus/argus.yaml'))
+print('max_live_publishes_per_tick=', config.get('schedule', {}).get('max_live_publishes_per_tick'))
+print('publish=', config.get('publish', {}))
+PY
+argus status --db /var/lib/argus/argus.sqlite3
+sqlite3 /var/lib/argus/argus.sqlite3 "select effective_mode, blocked_reason, json_extract(snapshot_json, '$.max_live_publishes_per_tick') as cap from runtime_config_snapshots order by observed_at desc, rowid desc limit 3;"
+```
+
+For first activation, the exact config field is:
+
+```yaml
+schedule:
+  max_live_publishes_per_tick: 1
+publish:
+  state: active
+  live_approval: true
+```
+
+After editing `/etc/argus/argus.yaml`, apply the change through the running server:
+
+```bash
+argus reload --config /etc/argus/argus.yaml
+argus status --db /var/lib/argus/argus.sqlite3
+sqlite3 /var/lib/argus/argus.sqlite3 "select effective_mode, blocked_reason, json_extract(snapshot_json, '$.max_live_publishes_per_tick') as cap from runtime_config_snapshots order by observed_at desc, rowid desc limit 1;"
+```
+
+Watch the first scheduled tick and publish attempts:
+
+```bash
+watch -n 10 'argus status --db /var/lib/argus/argus.sqlite3; sqlite3 /var/lib/argus/argus.sqlite3 "select status, count(*) from publish_attempts group by status; select attempted_at, status, subspace_message_id from publish_attempts order by attempted_at desc limit 5;"'
+```
+
+Evidence to capture after the first tick:
+
+```bash
+RUN_ID=$(sqlite3 /var/lib/argus/argus.sqlite3 "select run_id from runs order by started_at desc, rowid desc limit 1")
+cat "/var/lib/argus/runs/$RUN_ID/run-summary.json"
+sqlite3 /var/lib/argus/argus.sqlite3 "select run_id, status, json_extract(summary_json, '$.counts.publish_candidates') as publish_candidates from runs order by started_at desc, rowid desc limit 5;"
+sqlite3 /var/lib/argus/argus.sqlite3 "select attempted_at, status, subspace_message_id from publish_attempts order by attempted_at desc limit 10;"
+```
+
+If more than one live attempt appears for one run, if a tick fails with `canary publish limit exceeded`, or if rate evidence looks wrong, shut publishing back off immediately:
+
+```bash
+argus set-publish-state --config /etc/argus/argus.yaml --state inactive
+argus status --db /var/lib/argus/argus.sqlite3
+sqlite3 /var/lib/argus/argus.sqlite3 "select effective_mode, blocked_reason from runtime_config_snapshots order by observed_at desc, rowid desc limit 1;"
+```
 
 ## Racter readiness checks
 

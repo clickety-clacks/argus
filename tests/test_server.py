@@ -39,6 +39,7 @@ def write_config(root: Path, *, mode: str = "interval", interval: str = "1h", pu
             "jitter_seconds": 0,
             "run_on_startup_if_due": True,
             "missed_tick_policy": "coalesce_one",
+            "max_live_publishes_per_tick": 2,
         },
         "publish": publish or {"state": "inactive"},
         "embedding": (
@@ -190,6 +191,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(config.database_path, Path("/var/lib/argus/argus.sqlite3"))
         self.assertEqual(config.output_dir, Path("/var/lib/argus"))
         self.assertEqual(config.scheduler.interval_seconds, 3600)
+        self.assertEqual(config.scheduler.max_live_publishes_per_tick, 1)
         self.assertEqual(config.source_fetch_concurrency, 4)
         self.assertEqual(config.publish.state, "inactive")
         self.assertFalse(config.publish.live_approval)
@@ -1893,6 +1895,31 @@ print(json.dumps({
                 server_module.post_json_over_unix_socket = original_post
                 server.close()
             self.assertEqual(calls, [])
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+
+    def test_active_publish_requires_scheduled_live_publish_cap(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.invalid",
+                    "allow_non_embedded_fallback": True,
+                },
+            )
+            config = yaml.safe_load(path.read_text())
+            del config["schedule"]["max_live_publishes_per_tick"]
+            path.write_text(yaml.safe_dump(config))
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                snapshot = server.status()["publish"]
+                self.assertEqual(snapshot["effective_mode"], "blocked")
+                self.assertEqual(snapshot["blocked_reason"], "missing_live_publish_cap")
+                server.tick()
+            finally:
+                server.close()
             self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
 
     def test_canary_live_publish_limit_fails_before_any_send(self):
