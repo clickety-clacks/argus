@@ -606,7 +606,7 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(package["body"]["title"], "Third story")
 
 
-    def test_prime_threshold_failure_stays_pending_until_successful_under_limit_baseline(self):
+    def test_fetch_count_limit_is_deprecated_and_prime_baselines_large_feed(self):
         def feed_xml(items):
             body = ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>", "<rss><channel><title>Threshold Source</title>"]
             for idx, title in items:
@@ -631,19 +631,11 @@ class ServerTests(unittest.TestCase):
             try:
                 exit_code, prime_summary = server.prime()
                 self.assertEqual(exit_code, 0)
-                self.assertEqual(prime_summary["counts"]["failed_sources"], 1)
-                self.assertEqual(rows(root / "argus.sqlite3", "source_baselines")[0]["status"], "pending")
-                self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
-
-                fixture.write_text(feed_xml([(1, "Old one"), (2, "Old two")]))
-                clock.advance(3600)
-                exit_code, baseline_summary = server.manual_cycle()
-                self.assertEqual(exit_code, 0)
-                self.assertEqual(baseline_summary["baseline_source_ids"], ["stateful-source"])
+                self.assertEqual(prime_summary["counts"]["failed_sources"], 0)
                 self.assertEqual(rows(root / "argus.sqlite3", "source_baselines")[0]["status"], "satisfied")
                 self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
 
-                fixture.write_text(feed_xml([(1, "Old one"), (2, "Old two"), (6, "New six")]))
+                fixture.write_text(feed_xml([(1, "Old one"), (2, "Old two"), (3, "Old three"), (4, "Old four"), (5, "Old five"), (6, "New six")]))
                 clock.advance(3600)
                 exit_code, new_summary = server.manual_cycle()
             finally:
@@ -654,6 +646,53 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(len(packages), 1)
             package = json.loads(packages[0]["package_json"])
             self.assertEqual(package["body"]["title"], "New six")
+
+    def test_live_publish_cap_fails_before_embedding_when_feed_returns_more_candidates(self):
+        def feed_xml(count):
+            body = ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>", "<rss><channel><title>Large Source</title>"]
+            for idx in range(1, count + 1):
+                body.append(
+                    "<item><guid>large-guid-{}</guid><title>Story {}</title><link>https://large.example/story-{}</link><pubDate>Wed, 30 Apr 2026 10:{:02d}:00 +0000</pubDate><description>Story {}</description></item>".format(
+                        idx, idx, idx, idx, idx
+                    )
+                )
+            body.append("</channel></rss>")
+            return "\n".join(body)
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.invalid",
+                    "require_embeddings": True,
+                    "allow_non_embedded_fallback": False,
+                },
+                schedule={"max_live_publishes_per_tick": 2},
+            )
+            (root / "feeds" / "stateful-source.xml").write_text(feed_xml(5))
+            config = yaml.safe_load(path.read_text())
+            config["sources"][0]["max_messages_per_fetch"] = 3
+            path.write_text(yaml.safe_dump(config))
+            calls = []
+            original_embedding = server_module.request_openai_embedding
+            original_post = server_module.post_message_to_subspace
+            server_module.request_openai_embedding = lambda *args, **kwargs: calls.append(args) or [0.1] * 1536
+            server_module.post_message_to_subspace = fake_subspace_success([])
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                with self.assertRaisesRegex(Exception, "canary publish limit exceeded before embedding: 5 > 2"):
+                    server.tick()
+            finally:
+                server.close()
+                server_module.request_openai_embedding = original_embedding
+                server_module.post_message_to_subspace = original_post
+            self.assertEqual(calls, [])
+            self.assertEqual(len(rows(root / "argus.sqlite3", "embeddings")), 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+
 
     def test_active_cycle_auto_baselines_newly_added_source_without_publish_attempts(self):
         with TemporaryDirectory() as tmpdir:

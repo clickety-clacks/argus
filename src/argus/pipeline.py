@@ -758,12 +758,6 @@ def run_pipeline_for_sources(
                 continue
 
             entries = parse_feed(fetch_result.body or "", source)
-            if source.max_messages_per_fetch is not None and len(entries) > source.max_messages_per_fetch:
-                raise PipelineError(
-                    "source {} returned {} messages, exceeding max_messages_per_fetch {}".format(
-                        source.id, len(entries), source.max_messages_per_fetch
-                    )
-                )
             raw_entries += len(entries)
             seen: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
             source_clusters: List[Dict[str, Any]] = []

@@ -1905,6 +1905,12 @@ class ArgusServer:
         publishable: List[Tuple[str, str, str, Dict[str, Any], Dict[str, Any]]] = []
         queued_publish_keys: set[str] = set()
         rows = [json.loads(line) for line in candidates_path.read_text().splitlines() if line.strip()]
+        if (
+            publish_snapshot["effective_mode"] == "active"
+            and max_live_publishes is not None
+            and len(rows) > max_live_publishes
+        ):
+            raise PipelineError("canary publish limit exceeded before embedding: {} > {}".format(len(rows), max_live_publishes))
         for candidate in rows:
             if self.reload_requested:
                 self.reload_requested = False
