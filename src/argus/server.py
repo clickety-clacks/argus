@@ -13,7 +13,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import yaml
 import requests
@@ -1139,16 +1139,17 @@ class ArgusServer:
         store_runtime_snapshot(self.connection, snapshot, "set_publish_state", "ok")
         return snapshot
 
-    def prime(self, requested_by: str = "cli") -> Tuple[int, Dict[str, Any]]:
+    def prime(self, requested_by: str = "cli", source_id: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
         now = self.clock.now()
         state = self._scheduler_state()
+        source_ids = self._validated_prime_source_ids(source_id)
         if self._cycle_running or state["running_run_id"]:
-            return self._run_cycle("prime", now, prime=True)
+            return self._run_cycle("prime", now, prime=True, source_ids=source_ids)
         event = event_id("prime", now, requested_by)
         self.connection.execute("INSERT OR REPLACE INTO prime_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (event, iso_z(now), None, requested_by, None, None, "running", None, None))
         self.connection.commit()
         try:
-            exit_code, summary = self._run_cycle("prime", now, prime=True)
+            exit_code, summary = self._run_cycle("prime", now, prime=True, source_ids=source_ids)
             completed_at = iso_z(self.clock.now())
             self.connection.execute(
                 "UPDATE prime_events SET completed_at = ?, run_id = ?, prime_watermark_run_id = ?, status = ? WHERE event_id = ?",
@@ -1168,6 +1169,16 @@ class ArgusServer:
 
     def manual_cycle(self, max_live_publishes: Optional[int] = None) -> Tuple[int, Dict[str, Any]]:
         return self._run_cycle("manual", self.clock.now(), prime=False, max_live_publishes=max_live_publishes)
+
+    def _validated_prime_source_ids(self, source_id: Optional[str]) -> Optional[Set[str]]:
+        if source_id is None:
+            return None
+        matching = [source for source in self.config.sources if source.id == source_id]
+        if not matching:
+            raise PipelineError("Unknown source for prime: {}".format(source_id))
+        if not matching[0].enabled:
+            raise PipelineError("Cannot prime disabled source: {}".format(source_id))
+        return {source_id}
 
     def tick(self) -> Optional[Tuple[int, Dict[str, Any]]]:
         if self.reload_requested:
@@ -1232,7 +1243,7 @@ class ArgusServer:
         payload = json.loads(row["payload_json"])
         try:
             if row["action"] == "prime":
-                result = self.prime(requested_by=str(payload.get("requested_by", "cli")))
+                result = self.prime(requested_by=str(payload.get("requested_by", "cli")), source_id=payload.get("source_id"))
             elif row["action"] == "run-cycle":
                 max_live_publishes = payload.get("max_live_publishes")
                 result = self.manual_cycle(max_live_publishes=int(max_live_publishes) if max_live_publishes is not None else None)
@@ -1255,7 +1266,14 @@ class ArgusServer:
             self.connection.commit()
             raise
 
-    def _run_cycle(self, run_kind: str, now: datetime, prime: bool = False, max_live_publishes: Optional[int] = None) -> Tuple[int, Dict[str, Any]]:
+    def _run_cycle(
+        self,
+        run_kind: str,
+        now: datetime,
+        prime: bool = False,
+        max_live_publishes: Optional[int] = None,
+        source_ids: Optional[Set[str]] = None,
+    ) -> Tuple[int, Dict[str, Any]]:
         state = self._scheduler_state()
         if self._cycle_running or state["running_run_id"]:
             self._record_scheduler_event("cycle_skipped_already_running", state["running_run_id"], "skipped", {"requested_run_kind": run_kind}, now)
@@ -1266,6 +1284,8 @@ class ArgusServer:
                 "skip_reason": "cycle_already_running",
             }
         cycle_sources = self._sources_due_for_cycle(run_kind, now)
+        if source_ids is not None:
+            cycle_sources = [source for source in cycle_sources if source.id in source_ids]
         if not cycle_sources and run_kind == "scheduled":
             self._record_scheduler_event("cycle_skipped_no_sources_due", None, "skipped", {"run_kind": run_kind}, now)
             return 0, {"run_kind": run_kind, "exit_status": "skipped", "skip_reason": "no_sources_due"}
@@ -1301,11 +1321,14 @@ class ArgusServer:
             )
             summary["run_id"] = run_id
             summary["run_kind"] = run_kind
+            if source_ids is not None:
+                summary["source_ids"] = sorted(source_ids)
             if self.reload_requested:
                 self.reload_requested = False
                 self.reload()
             publish_snapshot = latest_snapshot(self.connection)
             summary["effective_publish_snapshot"] = cycle_snapshot
+            baseline_source_ids = set() if prime else self._source_ids_requiring_active_baseline(cycle_sources, cycle_snapshot)
             self._store_source_health(run_id, now, output_dir)
             if prime:
                 self._store_normalized_storage(run_id, now, output_dir, None)
@@ -1322,10 +1345,13 @@ class ArgusServer:
                 accepted_candidate_rows = []
                 seen_candidate_report_ids = set()
                 for row in package_candidate_rows:
+                    if row["source_id"] in baseline_source_ids:
+                        continue
                     if row["report_id"] in accepted_report_ids and row["report_id"] not in seen_candidate_report_ids:
                         accepted_candidate_rows.append(row)
                         seen_candidate_report_ids.add(row["report_id"])
                 package_candidates_path.write_text("".join(json.dumps(row) + "\n" for row in accepted_candidate_rows))
+                summary["baseline_source_ids"] = sorted(baseline_source_ids)
                 package_payloads = self._store_packages_and_publish(
                     run_id,
                     now,
@@ -1381,6 +1407,29 @@ class ArgusServer:
             if row is None or not row["fetched_at"] or now >= parse_now(row["fetched_at"]) + timedelta(seconds=source.cadence_interval_seconds):
                 due_sources.append(source)
         return due_sources
+
+    def _source_ids_requiring_active_baseline(self, cycle_sources: List[SourceConfig], cycle_snapshot: Dict[str, Any]) -> Set[str]:
+        if cycle_snapshot.get("effective_mode") != "active":
+            return set()
+        if self.connection.execute("SELECT 1 FROM source_run_status LIMIT 1").fetchone() is None:
+            return set()
+        baseline_source_ids = set()
+        for source in cycle_sources:
+            if not source.enabled:
+                continue
+            row = self.connection.execute(
+                """
+                SELECT 1
+                FROM source_run_status
+                WHERE source_id = ?
+                  AND status IN ('ok', 'empty', 'not_modified')
+                LIMIT 1
+                """,
+                (source.id,),
+            ).fetchone()
+            if row is None:
+                baseline_source_ids.add(source.id)
+        return baseline_source_ids
 
     def _store_source_config_snapshots(self, run_id: str) -> None:
         for source in self.config.sources:

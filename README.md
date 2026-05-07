@@ -106,11 +106,14 @@ If a source returns `304 Not Modified`, Argus records that as a healthy no-chang
 
 ## Prime mode
 
-Prime is optional/manual baseline tooling only. It is not required for scheduled or manual jobs and is not an active/inactive gate. Prime creates no live attempts, no ordinary package rows/candidates, and no active-eligible work.
+Prime is optional/manual baseline tooling only. It is not required for scheduled or manual jobs and is not an active/inactive gate. Prime creates no live attempts, no ordinary package rows/candidates, and no active-eligible work. Operators may prime all sources or one named source:
 
 ```bash
 argus prime --config /etc/argus/argus.yaml
+argus prime --config /etc/argus/argus.yaml --source openai
 ```
+
+When publishing is already active and a source appears with no prior successful source run in an existing Argus database, the cycle treats that source as baseline-only: it fetches, records source health, and stores normalized/dedupe state, but it does not create package rows or live publish attempts for that source's backlog. Later cycles may publish only new post-baseline reports from that source, subject to the unchanged `publish.state`, `live_approval`, embedding, and idempotency gates.
 
 `--prime` and `--dry-run` are mutually exclusive:
 

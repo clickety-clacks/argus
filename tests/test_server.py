@@ -466,6 +466,72 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
             self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
 
+    def test_prime_can_baseline_one_named_source(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root)
+            fixture_dir = root / "feeds"
+            shutil.copy(FEEDS / "stateful_source.xml", fixture_dir / "second-source.xml")
+            config = yaml.safe_load(path.read_text())
+            config["sources"].append(
+                {
+                    **config["sources"][0],
+                    "id": "second-source",
+                    "display_name": "Second Source",
+                    "feed_url": "https://fixture.invalid/second-source.xml",
+                }
+            )
+            path.write_text(yaml.safe_dump(config))
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                exit_code, summary = server.prime(source_id="second-source")
+            finally:
+                server.close()
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(summary["source_ids"], ["second-source"])
+            self.assertEqual({row["source_id"] for row in rows(root / "argus.sqlite3", "source_run_status")}, {"second-source"})
+            self.assertEqual({row["source_id"] for row in rows(root / "argus.sqlite3", "normalized_reports")}, {"second-source"})
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+
+    def test_active_cycle_auto_baselines_newly_added_source_without_publish_attempts(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"state": "inactive", "allow_non_embedded_fallback": True})
+            fixture_dir = root / "feeds"
+            clock = FakeClock(NOW)
+            server = ArgusServer(path, clock=clock)
+            try:
+                server.tick()
+                config = yaml.safe_load(path.read_text())
+                config["publish"] = {
+                    "state": "active",
+                    "live_approval": True,
+                    "subspace_endpoint": "https://subspace.invalid",
+                    "allow_non_embedded_fallback": True,
+                }
+                shutil.copy(FEEDS / "stateful_source.xml", fixture_dir / "new-source.xml")
+                config["sources"].append(
+                    {
+                        **config["sources"][0],
+                        "id": "new-source",
+                        "display_name": "New Source",
+                        "feed_url": "https://fixture.invalid/new-source.xml",
+                    }
+                )
+                path.write_text(yaml.safe_dump(config))
+                server.reload()
+                clock.advance(3600)
+                exit_code, summary = server.manual_cycle()
+            finally:
+                server.close()
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(summary["baseline_source_ids"], ["new-source"])
+            self.assertEqual({row["source_id"] for row in rows(root / "argus.sqlite3", "source_run_status")}, {"stateful-source", "new-source"})
+            self.assertEqual({row["source_id"] for row in rows(root / "argus.sqlite3", "normalized_reports")}, {"stateful-source", "new-source"})
+            self.assertEqual(len([row for row in rows(root / "argus.sqlite3", "packages") if row["created_run_id"] == summary["run_id"]]), 0)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+
     def test_blocked_active_reload_and_approved_active_forward_only(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

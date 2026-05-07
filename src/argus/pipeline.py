@@ -998,6 +998,7 @@ def build_command_parser() -> argparse.ArgumentParser:
 
     prime = subparsers.add_parser("prime", help="Run an explicit baseline prime cycle")
     prime.add_argument("--config", required=True, type=Path)
+    prime.add_argument("--source", help="Prime only the named source id.")
 
     run_cycle = subparsers.add_parser("run-cycle", help="Run one normal manual cycle")
     run_cycle.add_argument("--config", required=True, type=Path)
@@ -1044,11 +1045,14 @@ def command_main(argv: List[str]) -> int:
                 server.close()
         if args.command == "prime":
             if runtime_service_pid(args.config) is not None:
-                print(json.dumps(request_control_action(args.config, "prime", {"requested_by": "cli"}), indent=2))
+                payload = {"requested_by": "cli"}
+                if args.source:
+                    payload["source_id"] = args.source
+                print(json.dumps(request_control_action(args.config, "prime", payload), indent=2))
                 return 0
             server = ArgusServer(args.config, register_service=False)
             try:
-                exit_code, summary = server.prime()
+                exit_code, summary = server.prime(source_id=args.source)
                 print(json.dumps(summary, indent=2))
                 return exit_code
             finally:

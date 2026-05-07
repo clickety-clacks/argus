@@ -67,6 +67,7 @@ Operator controls:
 
 ```bash
 argus prime --config /etc/argus/argus.yaml
+argus prime --config /etc/argus/argus.yaml --source openai
 argus run-cycle --config /etc/argus/argus.yaml --reason manual
 argus run-cycle --config /etc/argus/argus-e2e-canary.yaml --reason e2e-shrdlu --max-live-publishes 1
 argus reload --config /etc/argus/argus.yaml
@@ -78,7 +79,9 @@ argus explain-skip --db /var/lib/argus/argus.sqlite3 --run <run_id>
 argus embedding-doctor --config /etc/argus/argus.yaml
 ```
 
-`prime` is optional/manual baseline tooling only. Normal scheduled/manual cycles do not require prime and do not use prime as an active/inactive gate.
+`prime` is optional/manual baseline tooling only. Normal scheduled/manual cycles do not require prime and do not use prime as an active/inactive gate. Use `argus prime --source <source-id>` after adding one feed when you want to baseline only that source before any later active publishing.
+
+If publishing is already active and a source is added to an existing Argus database without a prior successful source run, Argus auto-baselines that source during the next cycle. The source health and normalized/dedupe state are recorded, but backlog items from that source do not create package rows or live publish attempts. The existing active-publish requirements still apply unchanged for later new items: `publish.state: active`, `publish.live_approval: true`, valid Subspace config, embedding/fallback policy, and live idempotency.
 
 ## Racter readiness checks
 
