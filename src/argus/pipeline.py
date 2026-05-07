@@ -10,6 +10,7 @@ import sys
 import time
 import posixpath
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -109,7 +110,14 @@ def utc_now() -> datetime:
 def parse_now(value: Optional[str]) -> datetime:
     if not value:
         return utc_now()
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    text = value.strip()
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        parsed = parsedate_to_datetime(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
 
 def iso_z(value: datetime) -> str:
@@ -426,6 +434,13 @@ def normalize_timestamp(value: Optional[str]) -> Optional[str]:
             return iso_z(parsed.astimezone(timezone.utc))
         except ValueError:
             continue
+    try:
+        parsed = parsedate_to_datetime(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return iso_z(parsed.astimezone(timezone.utc))
+    except (TypeError, ValueError):
+        pass
     return text
 
 

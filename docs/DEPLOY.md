@@ -83,6 +83,20 @@ argus embedding-doctor --config /etc/argus/argus.yaml
 
 If publishing is already active and a source is added to an existing Argus database without a prior successful source run, Argus auto-baselines that source during the next cycle. The source health and normalized/dedupe state are recorded, but backlog items from that source do not create package rows or live publish attempts. The existing active-publish requirements still apply unchanged for later new items: `publish.state: active`, `publish.live_approval: true`, valid Subspace config, embedding/fallback policy, and live idempotency.
 
+## Source feed config checks
+
+Before the next scheduled tick after updating Argus, verify `/etc/argus/argus.yaml` matches the checked-in source adapter fixes:
+
+```yaml
+sources:
+  - id: the-verge-ai
+    adapter: atom
+  - id: reddit-localllama
+    adapter: atom
+```
+
+OpenAI and Hugging Face remain RSS sources; RFC 2822/RSS `pubDate` values with `GMT` normalize in Argus before freshness checks.
+
 ## First activation watchdog
 
 Do not run these commands from review agents. They are the operator procedure for Flynn-approved activation.

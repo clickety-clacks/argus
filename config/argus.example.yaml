@@ -131,11 +131,11 @@ sources:
     source_category: trusted_editorial
     feed_url: https://www.theverge.com/rss/ai-artificial-intelligence/index.xml
     site_url: https://www.theverge.com/ai-artificial-intelligence
-    adapter: rss
+    adapter: atom
     enabled: true
     freshness_window_hours: 72
     authority_score: 0.75
-    fixture_payload_path: testdata/feeds/the-verge-ai.rss.xml
+    fixture_payload_path: testdata/feeds/the-verge-ai.atom.xml
   - id: ars-technica-ai
     display_name: Ars Technica AI
     source_class: editorial
@@ -166,11 +166,11 @@ sources:
     source_category: community_reddit
     feed_url: https://www.reddit.com/r/LocalLLaMA/.rss
     site_url: https://www.reddit.com/r/LocalLLaMA/
-    adapter: rss
+    adapter: atom
     enabled: true
     freshness_window_hours: 72
     authority_score: 0.75
-    fixture_payload_path: testdata/feeds/reddit-localllama.rss.xml
+    fixture_payload_path: testdata/feeds/reddit-localllama.atom.xml
     cadence_override: 2h
     request_headers:
       User-Agent: "Argus server RSS ingestion (contact: operator)"

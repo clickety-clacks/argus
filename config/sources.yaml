@@ -133,13 +133,13 @@ sources:
     name: The Verge AI
     source_class: editorial
     source_category: trusted_editorial
-    feed_type: rss
+    feed_type: atom
     feed_url: https://www.theverge.com/rss/ai-artificial-intelligence/index.xml
     site_url: https://www.theverge.com/ai-artificial-intelligence
     enabled: true
     tier: 1
     freshness_window_hours: 72
-    adapter: generic_rss
+    adapter: generic_atom
     request_headers: {}
     notes: AI product, policy, and consumer-facing coverage.
 
@@ -176,13 +176,13 @@ sources:
     name: Reddit LocalLLaMA
     source_class: community
     source_category: community_reddit
-    feed_type: rss
+    feed_type: atom
     feed_url: https://www.reddit.com/r/LocalLLaMA/.rss
     site_url: https://www.reddit.com/r/LocalLLaMA/
     enabled: true
     tier: 1
     freshness_window_hours: 72
-    adapter: generic_rss
+    adapter: generic_atom
     request_headers:
       User-Agent: "Argus RSS ingestion worker (contact: operator)"
     notes: Community source; preserve source provenance without interpretation.
