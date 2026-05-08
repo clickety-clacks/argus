@@ -17,6 +17,12 @@ publish:
   subspace_websocket_path: /api/firehose/stream/websocket
   require_embeddings: true
 
+delivery:
+  mode: tranche
+  manual_window: 1h
+  max_retry_delay: 15m
+  live_send_concurrency: 1
+
 embedding:
   backend: openai
   provider: openai
