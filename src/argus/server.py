@@ -963,7 +963,7 @@ def post_message_to_subspace(
         create_connection = websocket.create_connection
     url = subspace_websocket_url(endpoint, websocket_path)
     try:
-        connection = create_connection(url, timeout=timeout)
+        connection = create_connection(url, timeout=timeout, suppress_origin=True)
     except Exception as exc:
         raise PublishTransportError("Subspace websocket connection failed: {}".format(exc)) from exc
     try:

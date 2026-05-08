@@ -2170,7 +2170,7 @@ print(json.dumps({
                 self.closed = True
 
         fake = FakeConnection()
-        urls = []
+        connection_kwargs = []
         response = server_module.post_message_to_subspace(
             "https://subspace.swarm.channel",
             "/api/firehose/stream/websocket",
@@ -2179,9 +2179,12 @@ print(json.dumps({
             '{"schema":"swarm.channel.news.report.v0"}',
             [{"space_id": "openai:text-embedding-3-small:1536:v1", "vector": [0.1]}],
             "stable-key",
-            create_connection=lambda url, timeout: urls.append((url, timeout)) or fake,
+            create_connection=lambda url, **kwargs: connection_kwargs.append((url, kwargs)) or fake,
         )
-        self.assertEqual(urls, [("wss://subspace.swarm.channel/api/firehose/stream/websocket?vsn=2.0.0", 10)])
+        self.assertEqual(
+            connection_kwargs,
+            [("wss://subspace.swarm.channel/api/firehose/stream/websocket?vsn=2.0.0", {"timeout": 10, "suppress_origin": True})],
+        )
         self.assertTrue(fake.closed)
         self.assertEqual(fake.sent[0][2:4], ["firehose", "phx_join"])
         self.assertEqual(fake.sent[0][4], {"agent_id": "argus-agent", "session_token": "session-token"})
