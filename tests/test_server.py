@@ -235,6 +235,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(config.delivery.manual_window_seconds, 3600)
         self.assertEqual(config.delivery.max_retry_delay_seconds, 900)
         self.assertEqual(config.delivery.live_send_concurrency, 1)
+        self.assertEqual(config.delivery.min_slot_seconds, 60)
         self.assertEqual(config.source_fetch_concurrency, 4)
         self.assertEqual(config.publish.mode, "inactive")
         self.assertTrue(config.publish.require_embeddings)
@@ -273,6 +274,7 @@ class ServerTests(unittest.TestCase):
         config = load_runtime_config(Path("config/argus.e2e-canary.example.yaml"))
         self.assertEqual(config.scheduler.mode, "manual")
         self.assertEqual(config.delivery.mode, "tranche")
+        self.assertEqual(config.delivery.min_slot_seconds, 60)
         self.assertEqual(config.source_fetch_concurrency, 1)
         self.assertEqual(config.publish.mode, "inactive")
         self.assertEqual(config.publish.subspace_endpoint, "https://subspace.swarm.channel")
@@ -2072,6 +2074,135 @@ print(json.dumps({
                 server.close()
             self.assertEqual(len(calls), 2)
             self.assertEqual({row["status"] for row in rows(root / "argus.sqlite3", "delivery_entries")}, {"succeeded"})
+
+    def test_tranche_density_guard_stops_before_plan_or_send(self):
+        def feed_xml(count):
+            body = ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>", "<rss><channel><title>Dense Source</title>"]
+            for idx in range(1, count + 1):
+                body.append(
+                    "<item><guid>dense-guid-{}</guid><title>Dense Story {}</title><link>https://dense.example/story-{}</link><pubDate>Wed, 30 Apr 2026 10:{:02d}:00 +0000</pubDate><description>Story {}</description></item>".format(
+                        idx, idx, idx, idx, idx
+                    )
+                )
+            body.append("</channel></rss>")
+            return "\n".join(body)
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                interval="5m",
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+                schedule={"max_live_publishes_per_tick": 6},
+            )
+            (root / "feeds" / "stateful-source.xml").write_text(feed_xml(6))
+            calls = []
+            original_post = server_module.post_message_to_subspace
+            server_module.post_message_to_subspace = fake_subspace_success(calls)
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                with self.assertRaisesRegex(Exception, "delivery_density_exceeded"):
+                    server.tick()
+                config = yaml.safe_load(path.read_text())
+                config["schedule"]["max_live_publishes_per_tick"] = 5
+                path.write_text(yaml.safe_dump(config))
+                server.reload()
+                server.tick()
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "accepted_reports")), 6)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 6)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "delivery_plans")), 1)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "delivery_entries")), 5)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 1)
+            self.assertEqual(len([row for row in rows(root / "argus.sqlite3", "skipped_items") if row["reason_code"] == "delivery_density_exceeded"]), 0)
+            self.assertEqual(len([row for row in rows(root / "argus.sqlite3", "skipped_items") if row["reason_code"] == "over_live_publish_budget"]), 1)
+            failed_runs = [row for row in rows(root / "argus.sqlite3", "runs") if row["status"] == "failed"]
+            self.assertEqual(len(failed_runs), 1)
+            failed_summary = json.loads(failed_runs[0]["summary_json"])
+            self.assertIn("delivery_density_exceeded", failed_summary["post_pipeline_error"]["message"])
+            self.assertIn("max_items_for_window=5", failed_summary["post_pipeline_error"]["message"])
+
+    def test_tranche_density_guard_allows_exact_threshold(self):
+        def feed_xml(count):
+            body = ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>", "<rss><channel><title>Dense Source</title>"]
+            for idx in range(1, count + 1):
+                body.append(
+                    "<item><guid>threshold-guid-{}</guid><title>Threshold Story {}</title><link>https://dense.example/threshold-{}</link><pubDate>Wed, 30 Apr 2026 10:{:02d}:00 +0000</pubDate><description>Story {}</description></item>".format(
+                        idx, idx, idx, idx, idx
+                    )
+                )
+            body.append("</channel></rss>")
+            return "\n".join(body)
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                interval="5m",
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+                schedule={"max_live_publishes_per_tick": 5},
+            )
+            (root / "feeds" / "stateful-source.xml").write_text(feed_xml(5))
+            calls = []
+            original_post = server_module.post_message_to_subspace
+            server_module.post_message_to_subspace = fake_subspace_success(calls)
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "delivery_plans")), 1)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "delivery_entries")), 5)
+            self.assertEqual(len([row for row in rows(root / "argus.sqlite3", "skipped_items") if row["reason_code"] == "delivery_density_exceeded"]), 0)
+
+    def test_tranche_density_guard_allows_single_item_in_short_window(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+                schedule={"max_live_publishes_per_tick": 1},
+            )
+            fixture = root / "feeds" / "stateful-source.xml"
+            calls = []
+            original_post = server_module.post_message_to_subspace
+            server_module.post_message_to_subspace = fake_subspace_success(calls)
+            clock = FakeClock(NOW)
+            server = ArgusServer(path, clock=clock)
+            try:
+                server.tick()
+                fixture.write_text(
+                    fixture.read_text().replace(
+                        "  </channel>\n</rss>",
+                        """    <item>\n      <guid>stateful-guid-short-window</guid>\n      <title>Short window story</title>\n      <link>https://stateful.example/short-window</link>\n      <pubDate>Wed, 30 Apr 2026 10:30:00 +0000</pubDate>\n      <description>Brand new short-window story.</description>\n    </item>\n  </channel>\n</rss>""",
+                    )
+                )
+                clock.advance(3570)
+                server.manual_cycle()
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "delivery_plans")), 2)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "delivery_entries")), 2)
+            self.assertEqual(len([row for row in rows(root / "argus.sqlite3", "skipped_items") if row["reason_code"] == "delivery_density_exceeded"]), 0)
 
     def test_delivery_immediate_mode_drains_selected_work_in_one_cycle(self):
         with TemporaryDirectory() as tmpdir:
