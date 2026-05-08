@@ -2252,6 +2252,91 @@ print(json.dumps({
             self.assertEqual(health[0]["last_run_id"], rows(root / "argus.sqlite3", "runs")[0]["run_id"])
             self.assertEqual(len(rows(root / "argus.sqlite3", "source_run_status")), 1)
 
+    def test_deferred_source_health_does_not_increment_success_or_failure_totals(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"mode": "inactive"})
+            output_dir = root / "out" / "runs" / "deferred-run"
+            output_dir.mkdir(parents=True)
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.connection.execute(
+                    "INSERT INTO source_health VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "arxiv-cs-ai",
+                        "ok",
+                        "previous-run",
+                        "2026-04-29T11:00:00Z",
+                        1,
+                        "ok",
+                        "2026-04-29T11:00:00Z",
+                        "2026-04-29T10:00:00Z",
+                        0,
+                        1,
+                        0,
+                        None,
+                        None,
+                        None,
+                        "{}",
+                    ),
+                )
+                (output_dir / "source-health.json").write_text(
+                    json.dumps(
+                        [
+                            {
+                                "source_id": "arxiv-cs-ai",
+                                "status": "deferred",
+                                "enabled": True,
+                                "parse_status": "deferred",
+                                "fetched_at": "2026-04-29T12:00:00Z",
+                                "http_status": 429,
+                                "failure_reason": None,
+                                "last_error": {"class": "HTTPError", "message": "429", "retry_eligible": True},
+                            }
+                        ]
+                    )
+                )
+                server._store_source_health("deferred-run", NOW, output_dir)
+                row = rows(root / "argus.sqlite3", "source_health")[0]
+                source_health = server_module.run_source_health(root / "argus.sqlite3")
+            finally:
+                server.close()
+            self.assertEqual(row["last_status"], "deferred")
+            self.assertEqual(row["last_successful_fetch_at"], "2026-04-29T11:00:00Z")
+            self.assertEqual(row["latest_item_published_at"], "2026-04-29T10:00:00Z")
+            self.assertEqual(source_health[0]["last_successful_fetch_at"], "2026-04-29T11:00:00Z")
+            self.assertEqual(source_health[0]["latest_item_published_at"], "2026-04-29T10:00:00Z")
+            self.assertEqual(row["consecutive_failures"], 0)
+            self.assertEqual(row["total_successes"], 1)
+            self.assertEqual(row["total_failures"], 0)
+
+    def test_run_status_records_all_deferred_sources(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"mode": "inactive"})
+            output_dir = root / "out" / "runs" / "deferred-run"
+            output_dir.mkdir(parents=True)
+            (output_dir / "source-health.json").write_text("[]\n")
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server._store_run(
+                    "deferred-run",
+                    "manual",
+                    NOW,
+                    0,
+                    output_dir,
+                    {"snapshot_id": "snapshot"},
+                    {
+                        "run_id": "deferred-run",
+                        "run_kind": "manual",
+                        "exit_status": "deferred",
+                        "counts": {"failed_sources": 0, "deferred_sources": 1},
+                    },
+                )
+            finally:
+                server.close()
+            self.assertEqual(rows(root / "argus.sqlite3", "runs")[0]["status"], "deferred")
+
     def test_run_status_records_source_errors(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

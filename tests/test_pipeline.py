@@ -6,7 +6,10 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from argus.pipeline import SourceConfig, canonicalize_url, default_state_path, normalize_title, parse_feed, read_source_config, run_pipeline
+import requests
+
+import argus.pipeline as pipeline_module
+from argus.pipeline import FetchResult, SourceConfig, canonicalize_url, default_state_path, normalize_title, parse_feed, read_source_config, run_pipeline, run_pipeline_for_sources
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "argus"
 FEEDS = FIXTURE_ROOT / "feeds"
@@ -22,6 +25,171 @@ def read_jsonl(path: Path):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_arxiv_export_requests_are_spaced_by_three_seconds(self):
+        source = SourceConfig(
+            id="arxiv_cs_ai",
+            name="arXiv cs.AI",
+            source_class="research",
+            source_category="research_arxiv",
+            feed_type="arxiv_atom",
+            feed_url="https://export.arxiv.org/api/query?search_query=cat:cs.AI",
+            site_url="https://arxiv.org/list/cs.AI/recent",
+            enabled=True,
+            tier=1,
+            freshness_window_hours=120,
+            adapter="arxiv_atom",
+            request_headers={},
+        )
+        original = dict(pipeline_module._LAST_POLITE_FETCH_STARTED_AT_BY_NETLOC)
+        sleeps = []
+        try:
+            pipeline_module._LAST_POLITE_FETCH_STARTED_AT_BY_NETLOC.clear()
+            self.assertEqual(
+                pipeline_module.wait_for_polite_fetch_slot(source, monotonic=lambda: 100.0, sleep=sleeps.append),
+                0.0,
+            )
+            post_sleep_times = iter([101.0, 104.0])
+            self.assertEqual(
+                pipeline_module.wait_for_polite_fetch_slot(source, monotonic=lambda: next(post_sleep_times), sleep=sleeps.append),
+                2.0,
+            )
+            self.assertEqual(sleeps, [2.0])
+            self.assertEqual(pipeline_module._LAST_POLITE_FETCH_STARTED_AT_BY_NETLOC["export.arxiv.org"], 104.0)
+        finally:
+            pipeline_module._LAST_POLITE_FETCH_STARTED_AT_BY_NETLOC.clear()
+            pipeline_module._LAST_POLITE_FETCH_STARTED_AT_BY_NETLOC.update(original)
+
+    def test_arxiv_429_and_timeout_defer_without_source_error(self):
+        rss_source = SourceConfig(
+            id="ok_source",
+            name="OK Source",
+            source_class="editorial",
+            source_category="trusted_editorial",
+            feed_type="rss",
+            feed_url="https://fixture.invalid/ok.xml",
+            site_url="https://fixture.invalid/",
+            enabled=True,
+            tier=1,
+            freshness_window_hours=72,
+            adapter="rss",
+            request_headers={},
+        )
+        arxiv_source = SourceConfig(
+            id="arxiv_cs_ai",
+            name="arXiv cs.AI",
+            source_class="research",
+            source_category="research_arxiv",
+            feed_type="arxiv_atom",
+            feed_url="https://export.arxiv.org/api/query?search_query=cat:cs.AI",
+            site_url="https://arxiv.org/list/cs.AI/recent",
+            enabled=True,
+            tier=1,
+            freshness_window_hours=120,
+            adapter="arxiv_atom",
+            request_headers={},
+        )
+        rss_body = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <item>
+      <guid>ok-guid</guid>
+      <title>OK story</title>
+      <link>https://fixture.invalid/ok-story</link>
+      <pubDate>Wed, 29 Apr 2026 12:00:00 GMT</pubDate>
+      <description>OK summary.</description>
+    </item>
+  </channel>
+</rss>
+"""
+
+        response = requests.Response()
+        response.status_code = 429
+        response.headers["retry-after"] = "60"
+        http_error = requests.HTTPError("429 Client Error: Too Many Requests")
+        http_error.response = response
+        cases = [
+            ("http_429", http_error, 429, 60),
+            ("read_timeout", requests.exceptions.ReadTimeout("export.arxiv.org timed out"), None, None),
+        ]
+
+        for _name, exc, http_status, retry_after in cases:
+            from tempfile import TemporaryDirectory
+
+            with self.subTest(_name), TemporaryDirectory() as tmpdir:
+                original_fetch = pipeline_module.fetch_feed
+
+                def fake_fetch(source, validators=None):
+                    if source.id == "arxiv_cs_ai":
+                        raise exc
+                    return FetchResult(rss_body, 200, "application/rss+xml", 1, None, None)
+
+                pipeline_module.fetch_feed = fake_fetch
+                try:
+                    exit_code, summary = run_pipeline_for_sources(
+                        [rss_source, arxiv_source],
+                        "test-sources.yaml",
+                        Path(tmpdir),
+                        now=NOW,
+                    )
+                finally:
+                    pipeline_module.fetch_feed = original_fetch
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(summary["exit_status"], "success")
+                self.assertEqual(summary["counts"]["failed_sources"], 0)
+                self.assertEqual(summary["counts"]["deferred_sources"], 1)
+                self.assertEqual(summary["counts"]["publish_candidates"], 1)
+                health = {row["source_id"]: row for row in read_json(Path(tmpdir) / "source-health.json")}
+                self.assertEqual(health["arxiv_cs_ai"]["status"], "deferred")
+                self.assertEqual(health["arxiv_cs_ai"]["parse_status"], "deferred")
+                self.assertEqual(health["arxiv_cs_ai"]["http_status"], http_status)
+                self.assertEqual(health["arxiv_cs_ai"]["retry_after_seconds"], retry_after)
+                self.assertEqual(read_jsonl(Path(tmpdir) / "publish-candidates.jsonl")[0]["source_id"], "ok_source")
+
+    def test_all_deferred_arxiv_sources_do_not_report_success(self):
+        from tempfile import TemporaryDirectory
+
+        arxiv_source = SourceConfig(
+            id="arxiv_cs_ai",
+            name="arXiv cs.AI",
+            source_class="research",
+            source_category="research_arxiv",
+            feed_type="arxiv_atom",
+            feed_url="https://export.arxiv.org/api/query?search_query=cat:cs.AI",
+            site_url="https://arxiv.org/list/cs.AI/recent",
+            enabled=True,
+            tier=1,
+            freshness_window_hours=120,
+            adapter="arxiv_atom",
+            request_headers={},
+        )
+        response = requests.Response()
+        response.status_code = 429
+        http_error = requests.HTTPError("429 Client Error: Too Many Requests")
+        http_error.response = response
+        original_fetch = pipeline_module.fetch_feed
+
+        def fake_fetch(source, validators=None):
+            raise http_error
+
+        pipeline_module.fetch_feed = fake_fetch
+        try:
+            with TemporaryDirectory() as tmpdir:
+                exit_code, summary = run_pipeline_for_sources(
+                    [arxiv_source],
+                    "test-sources.yaml",
+                    Path(tmpdir),
+                    now=NOW,
+                )
+        finally:
+            pipeline_module.fetch_feed = original_fetch
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["exit_status"], "deferred")
+        self.assertEqual(summary["counts"]["failed_sources"], 0)
+        self.assertEqual(summary["counts"]["deferred_sources"], 1)
+        self.assertEqual(summary["counts"]["fetched_sources"], 0)
+
     def test_rss_gmt_pubdate_normalizes_before_freshness_filter(self):
         from tempfile import TemporaryDirectory
 

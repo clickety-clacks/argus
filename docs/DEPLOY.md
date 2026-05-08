@@ -221,6 +221,12 @@ Use those artifacts plus `argus source-health`, `argus explain-skip`, and SQLite
 
 A healthy inactive deployment has no `publish_attempts` rows unless `publish.state: active`, live approval, and Subspace endpoint config are all present.
 
+## arXiv source reliability
+
+Argus treats `export.arxiv.org` as a polite-fetch source. arXiv Atom requests are spaced at least three seconds apart within a run, matching arXiv API terms for one request every three seconds and one connection at a time. Transient arXiv `429 Too Many Requests` and read-timeout responses are recorded in `source-health.json` as `status: deferred` with retry detail, but they do not create publish candidates and do not make the run `succeeded_with_source_errors` when other sources are healthy.
+
+Deferred arXiv fetches preserve existing source state and are retried on a later eligible cycle. Operators should still inspect `argus source-health --db /var/lib/argus/argus.sqlite3` for repeated `deferred` arXiv rows before changing source cadence.
+
 ## Controlled Subetha/Subspace E2E canary
 
 Do not run a live E2E send without explicit Flynn approval. Active publish is externally visible.
