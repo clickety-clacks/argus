@@ -1778,7 +1778,15 @@ class ArgusServer:
         summary: Dict[str, Any],
         commit: bool = True,
     ) -> None:
-        status = "failed" if exit_code != 0 else "succeeded_with_source_errors" if summary.get("counts", {}).get("failed_sources", 0) else "succeeded"
+        status = (
+            "failed"
+            if exit_code != 0
+            else "deferred"
+            if summary.get("exit_status") == "deferred"
+            else "succeeded_with_source_errors"
+            if summary.get("counts", {}).get("failed_sources", 0)
+            else "succeeded"
+        )
         self.connection.execute(
             "INSERT OR REPLACE INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (run_id, run_kind, iso_z(now), iso_z(self.clock.now()), status, str(output_dir), snapshot["snapshot_id"], json.dumps(summary, sort_keys=True)),
@@ -1808,16 +1816,27 @@ class ArgusServer:
         for item in health_rows:
             previous = self.connection.execute("SELECT * FROM source_health WHERE source_id = ?", (item["source_id"],)).fetchone()
             failed = item.get("status") == "failed"
+            succeeded = item.get("status") in {"ok", "empty", "not_modified"}
             previous_consecutive_failures = int(previous["consecutive_failures"]) if previous else 0
-            consecutive_failures = previous_consecutive_failures + 1 if failed and update_totals else 0 if not failed and update_totals else previous_consecutive_failures
+            consecutive_failures = previous_consecutive_failures + 1 if failed and update_totals else 0 if succeeded and update_totals else previous_consecutive_failures
             total_successes = int(previous["total_successes"]) if previous else 0
             total_failures = int(previous["total_failures"]) if previous else 0
             if update_totals:
                 if failed:
                     total_failures += 1
-                else:
+                elif succeeded:
                     total_successes += 1
             last_error = item.get("last_error") or {}
+            last_successful_fetch_at = item.get("last_successful_fetch_at")
+            latest_item_published_at = item.get("latest_item_published_at")
+            if item.get("status") == "deferred" and previous:
+                last_successful_fetch_at = previous["last_successful_fetch_at"]
+                latest_item_published_at = previous["latest_item_published_at"]
+                item = {
+                    **item,
+                    "last_successful_fetch_at": last_successful_fetch_at,
+                    "latest_item_published_at": latest_item_published_at,
+                }
             self.connection.execute(
                 """
                 INSERT INTO source_health VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1844,8 +1863,8 @@ class ArgusServer:
                     item.get("fetched_at") or iso_z(now),
                     int(bool(item.get("enabled", True))),
                     item.get("parse_status"),
-                    item.get("last_successful_fetch_at"),
-                    item.get("latest_item_published_at"),
+                    last_successful_fetch_at,
+                    latest_item_published_at,
                     consecutive_failures,
                     total_successes,
                     total_failures,

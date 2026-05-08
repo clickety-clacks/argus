@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 from xml.etree import ElementTree as ET
 
@@ -23,6 +23,8 @@ import yaml
 SCHEMA_VERSION = 1
 STATE_SCHEMA_VERSION = 1
 REQUEST_TIMEOUT_SECONDS = 20
+ARXIV_EXPORT_NETLOC = "export.arxiv.org"
+ARXIV_REQUEST_INTERVAL_SECONDS = 3.0
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DROP_QUERY_PARAMS = {
     "utm_source",
@@ -42,6 +44,7 @@ DROP_QUERY_PARAMS = {
 ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
 UNRESERVED_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+_LAST_POLITE_FETCH_STARTED_AT_BY_NETLOC: Dict[str, float] = {}
 
 
 class HTMLStripper(HTMLParser):
@@ -228,7 +231,55 @@ def source_state_view(state: Dict[str, Any], source_id: str) -> Dict[str, Any]:
     return view
 
 
+def polite_fetch_netloc(source: SourceConfig) -> Optional[str]:
+    parsed = urlparse(source.feed_url)
+    netloc = parsed.netloc.lower()
+    if source.feed_type == "arxiv_atom" and netloc == ARXIV_EXPORT_NETLOC:
+        return netloc
+    return None
+
+
+def wait_for_polite_fetch_slot(
+    source: SourceConfig,
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> float:
+    netloc = polite_fetch_netloc(source)
+    if netloc is None:
+        return 0.0
+    now = monotonic()
+    previous = _LAST_POLITE_FETCH_STARTED_AT_BY_NETLOC.get(netloc)
+    delay = max(0.0, ARXIV_REQUEST_INTERVAL_SECONDS - (now - previous)) if previous is not None else 0.0
+    if delay > 0:
+        sleep(delay)
+        now = monotonic()
+    _LAST_POLITE_FETCH_STARTED_AT_BY_NETLOC[netloc] = now
+    return delay
+
+
+def retry_after_seconds(exc: Exception) -> Optional[int]:
+    response = getattr(exc, "response", None)
+    header = response.headers.get("retry-after") if response is not None else None
+    if not header:
+        return None
+    try:
+        return max(0, int(header))
+    except ValueError:
+        return None
+
+
+def is_deferred_source_fetch(source: SourceConfig, exc: Exception) -> bool:
+    if polite_fetch_netloc(source) is None:
+        return False
+    response = getattr(exc, "response", None)
+    if response is not None and response.status_code == 429:
+        return True
+    return isinstance(exc, requests.exceptions.ReadTimeout)
+
+
 def fetch_feed(source: SourceConfig, validators: Optional[Dict[str, str]] = None) -> FetchResult:
+    wait_for_polite_fetch_slot(source)
     started = time.perf_counter()
     headers = {"User-Agent": "argus/0.1 (+local-only worker)"}
     headers.update(source.request_headers)
@@ -683,6 +734,7 @@ def run_pipeline_for_sources(
     failed_sources = 0
     raw_entries = 0
     succeeded_sources = 0
+    deferred_sources = 0
 
     for source in sources:
         state_before = source_state_view(state, source.id)
@@ -875,6 +927,35 @@ def run_pipeline_for_sources(
                 }
             )
         except Exception as exc:
+            if is_deferred_source_fetch(source, exc):
+                deferred_sources += 1
+                source_health.append(
+                    {
+                        "source_id": source.id,
+                        "source_name": source.name,
+                        "status": "deferred",
+                        "enabled": True,
+                        "parse_status": "deferred",
+                        "last_successful_fetch_at": None,
+                        "latest_item_published_at": None,
+                        "feed_url": source.feed_url,
+                        "fetched_at": fetched_at,
+                        "http_status": getattr(getattr(exc, "response", None), "status_code", None),
+                        "content_type": getattr(getattr(exc, "response", None), "headers", {}).get("content-type") if getattr(exc, "response", None) is not None else None,
+                        "raw_entry_count": 0,
+                        "normalized_entry_count": 0,
+                        "emitted_candidate_count": 0,
+                        "skipped_previously_seen_count": 0,
+                        "failure_reason": None,
+                        "deferred_reason": "transient_fetch_error",
+                        "retry_after_seconds": retry_after_seconds(exc),
+                        "last_error": {"class": exc.__class__.__name__, "message": str(exc), "retry_eligible": True},
+                        "elapsed_ms": 0,
+                        "etag": validator_view.get("etag"),
+                        "last_modified": validator_view.get("last_modified"),
+                    }
+                )
+                continue
             failed_sources += 1
             source_health.append(
                 {
@@ -905,6 +986,9 @@ def run_pipeline_for_sources(
     if failed_sources > 0:
         exit_status = "partial_failure"
         exit_code = 0
+    elif enabled_sources and succeeded_sources == 0 and deferred_sources > 0:
+        exit_status = "deferred"
+        exit_code = 0
     else:
         exit_status = "success"
         exit_code = 0
@@ -926,6 +1010,7 @@ def run_pipeline_for_sources(
             "enabled_sources": len(enabled_sources),
             "fetched_sources": fetched_sources,
             "failed_sources": failed_sources,
+            "deferred_sources": deferred_sources,
             "raw_entries": raw_entries,
             "normalized_entries": len(normalized_rows),
             "source_local_duplicates": duplicate_count,
