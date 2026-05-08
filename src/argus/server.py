@@ -60,6 +60,16 @@ class PublishConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class DeliveryConfig:
+    mode: str = "tranche"
+    manual_window_seconds: int = DEFAULT_INTERVAL_SECONDS
+    max_retry_delay_seconds: int = 15 * 60
+    live_send_concurrency: int = 1
+    min_slot_seconds: int = 60
+    max_messages_per_plan: int = 20
+
+
+@dataclasses.dataclass(frozen=True)
 class EmbeddingConfig:
     backend: Optional[str] = None
     command: Optional[str] = None
@@ -76,6 +86,7 @@ class RuntimeConfig:
     sources: List[SourceConfig]
     scheduler: SchedulerConfig
     publish: PublishConfig
+    delivery: DeliveryConfig
     embedding: EmbeddingConfig
     source_fetch_concurrency: int = 4
     fixture_dir: Optional[Path] = None
@@ -207,6 +218,41 @@ def validate_scheduler(payload: Dict[str, Any]) -> SchedulerConfig:
     )
 
 
+def validate_delivery(payload: Dict[str, Any]) -> DeliveryConfig:
+    mode = str(payload.get("mode", "tranche"))
+    if mode not in {"tranche", "immediate"}:
+        raise PipelineError("Invalid delivery.mode: {}".format(mode))
+    manual_window_seconds = parse_duration_seconds(payload.get("manual_window", "1h"))
+    max_retry_delay_seconds = parse_duration_seconds(payload.get("max_retry_delay", "15m"))
+    min_slot_seconds = parse_duration_seconds(payload.get("min_slot", "1m"))
+    try:
+        max_messages_per_plan = int(payload.get("max_messages_per_plan", 20))
+    except (TypeError, ValueError):
+        raise PipelineError("Invalid delivery.max_messages_per_plan: {}".format(payload.get("max_messages_per_plan")))
+    try:
+        live_send_concurrency = int(payload.get("live_send_concurrency", 1))
+    except (TypeError, ValueError):
+        raise PipelineError("Invalid delivery.live_send_concurrency: {}".format(payload.get("live_send_concurrency")))
+    if manual_window_seconds <= 0:
+        raise PipelineError("Invalid delivery.manual_window: {}".format(payload.get("manual_window")))
+    if max_retry_delay_seconds <= 0:
+        raise PipelineError("Invalid delivery.max_retry_delay: {}".format(payload.get("max_retry_delay")))
+    if min_slot_seconds <= 0:
+        raise PipelineError("Invalid delivery.min_slot: {}".format(payload.get("min_slot")))
+    if max_messages_per_plan <= 0:
+        raise PipelineError("Invalid delivery.max_messages_per_plan: {}".format(payload.get("max_messages_per_plan")))
+    if live_send_concurrency != 1:
+        raise PipelineError("Invalid delivery.live_send_concurrency: {}".format(live_send_concurrency))
+    return DeliveryConfig(
+        mode=mode,
+        manual_window_seconds=manual_window_seconds,
+        max_retry_delay_seconds=max_retry_delay_seconds,
+        live_send_concurrency=live_send_concurrency,
+        min_slot_seconds=min_slot_seconds,
+        max_messages_per_plan=max_messages_per_plan,
+    )
+
+
 def publish_config_from_payload(payload: Dict[str, Any]) -> PublishConfig:
     legacy_keys = sorted(key for key in LEGACY_DAEMON_PUBLISH_KEYS if key in payload)
     if legacy_keys:
@@ -334,6 +380,7 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
         sources=sources,
         scheduler=validate_scheduler(payload.get("schedule") or {}),
         publish=publish,
+        delivery=validate_delivery(payload.get("delivery") or {}),
         embedding=embedding,
         source_fetch_concurrency=source_fetch_concurrency,
         fixture_dir=(Path(runtime["fixture_dir"]) if runtime.get("fixture_dir") else None),
@@ -533,6 +580,43 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
           UNIQUE (publish_idempotency_key, attempt_number)
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_publish_success_once ON publish_attempts(publish_idempotency_key) WHERE status = 'succeeded';
+        CREATE TABLE IF NOT EXISTS delivery_plans (
+          plan_id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL,
+          publish_target_key TEXT NOT NULL,
+          mode TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          window_start TEXT NOT NULL,
+          window_end TEXT NOT NULL,
+          selected_count INTEGER NOT NULL,
+          skipped_over_budget_count INTEGER NOT NULL,
+          first_due_at TEXT,
+          last_due_at TEXT,
+          detail_json TEXT NOT NULL,
+          UNIQUE (run_id, publish_target_key)
+        );
+        CREATE TABLE IF NOT EXISTS delivery_entries (
+          entry_id TEXT PRIMARY KEY,
+          plan_id TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          publish_target_key TEXT NOT NULL,
+          package_id TEXT NOT NULL,
+          publish_idempotency_key TEXT NOT NULL,
+          selected_order_index INTEGER NOT NULL,
+          due_at TEXT NOT NULL,
+          status TEXT NOT NULL,
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          last_attempt_at TEXT,
+          next_retry_at TEXT,
+          last_error_class TEXT,
+          last_error_message TEXT,
+          subspace_message_id TEXT,
+          updated_at TEXT NOT NULL,
+          UNIQUE (package_id, publish_target_key),
+          UNIQUE (run_id, publish_target_key, selected_order_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_delivery_due
+          ON delivery_entries(status, due_at, next_retry_at, selected_order_index);
         CREATE TABLE IF NOT EXISTS runtime_config_snapshots (
           snapshot_id TEXT PRIMARY KEY,
           config_hash TEXT NOT NULL,
@@ -674,6 +758,12 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
         "allow_non_embedded_fallback": bool(config.publish.allow_non_embedded_fallback),
         "embedding_space_id": config.embedding.space_id,
         "embedding_backend": config.embedding.backend,
+        "delivery_mode": config.delivery.mode,
+        "publish_target_key": (
+            "sha256:" + hashlib.sha256(("publish-target:v0\n" + str(config.publish.subspace_endpoint)).encode("utf-8")).hexdigest()
+            if config.publish.subspace_endpoint
+            else None
+        ),
         "blocked_reason": blocked_reason,
     }
     return snapshot
@@ -905,9 +995,33 @@ def canonical_embedding_for_subspace(supplied_embedding: Dict[str, Any]) -> Dict
 
 def subspace_message_id_from_response(response: Dict[str, Any]) -> Optional[str]:
     for result in response.get("results") or []:
-        if result.get("sent"):
+        if result.get("sent") or result.get("duplicate") or result.get("idempotent_duplicate"):
             return result.get("subspace_message_id")
     return None
+
+
+def subspace_response_is_success(response: Dict[str, Any]) -> bool:
+    if not response.get("ok"):
+        return False
+    results = response.get("results") or []
+    return any(result.get("duplicate") or result.get("idempotent_duplicate") for result in results)
+
+
+def publish_exception_is_permanent(exc: Exception) -> bool:
+    if not isinstance(exc, PublishTransportError):
+        return False
+    response = exc.response if isinstance(exc.response, dict) else {}
+    error = response.get("error") if isinstance(response.get("error"), dict) else {}
+    reply = response.get("reply") if isinstance(response.get("reply"), dict) else {}
+    response_body = reply.get("response") if isinstance(reply.get("response"), dict) else {}
+    code = str(error.get("code") or response_body.get("code") or response_body.get("reason") or "")
+    return code in {
+        "invalid_package_contract",
+        "invalid_request",
+        "invalid_subspace_message",
+        "message_contract_violation",
+        "missing_required_embedding",
+    }
 
 
 def subspace_websocket_url(endpoint: str, websocket_path: str) -> str:
@@ -1088,6 +1202,7 @@ class ArgusServer:
                 )
                 self.connection.commit()
                 self._record_scheduler_event("cycle_recovered_after_restart", stale["running_run_id"], "failed", {}, now)
+            self._recover_stale_delivery_attempts(now)
         self._record_scheduler_config(self.config.scheduler, now, recompute_next=True)
         self._record_scheduler_event("scheduler_ready", None, "ok", {"mode": self.config.scheduler.mode}, now)
 
@@ -1118,6 +1233,41 @@ class ArgusServer:
             """,
             ("unknown", iso_z(now), "RuntimeError", "cycle recovered after restart before publish result was recorded"),
         )
+        self.connection.execute(
+            """
+            UPDATE delivery_entries
+            SET status = 'retry_pending',
+                next_retry_at = ?,
+                last_error_class = ?,
+                last_error_message = ?,
+                updated_at = ?
+            WHERE status = 'attempting'
+            """,
+            (iso_z(now), "RuntimeError", "cycle recovered after restart before delivery result was recorded", iso_z(now)),
+        )
+
+    def _recover_stale_delivery_attempts(self, now: datetime) -> None:
+        self.connection.execute(
+            """
+            UPDATE publish_attempts
+            SET status = ?, completed_at = ?, error_class = ?, error_message = ?
+            WHERE status = 'pending'
+            """,
+            ("unknown", iso_z(now), "RuntimeError", "service restarted before publish result was recorded"),
+        )
+        self.connection.execute(
+            """
+            UPDATE delivery_entries
+            SET status = 'retry_pending',
+                next_retry_at = ?,
+                last_error_class = ?,
+                last_error_message = ?,
+                updated_at = ?
+            WHERE status = 'attempting'
+            """,
+            (iso_z(now), "RuntimeError", "service restarted before delivery result was recorded", iso_z(now)),
+        )
+        self.connection.commit()
 
     def _write_service_registration(self) -> None:
         registration = {
@@ -1228,7 +1378,8 @@ class ArgusServer:
             raise
 
     def manual_cycle(self, max_live_publishes: Optional[int] = None) -> Tuple[int, Dict[str, Any]]:
-        return self._run_cycle("manual", self.clock.now(), prime=False, max_live_publishes=max_live_publishes)
+        effective_max_live_publishes = self.config.scheduler.max_live_publishes_per_tick if max_live_publishes is None else max_live_publishes
+        return self._run_cycle("manual", self.clock.now(), prime=False, max_live_publishes=effective_max_live_publishes)
 
     def _validated_prime_source_ids(self, source_id: Optional[str]) -> Optional[Set[str]]:
         if source_id is None:
@@ -1248,6 +1399,9 @@ class ArgusServer:
         if control_result is not None:
             return control_result
         now = self.clock.now()
+        delivery_result = self._drain_due_delivery(now)
+        if delivery_result:
+            return 0, {"run_kind": "delivery", "exit_status": "ok", "delivery": delivery_result}
         state = self._scheduler_state()
         if state["mode"] == "manual":
             self._record_scheduler_event("decision_manual_idle", None, "skipped", {}, now)
@@ -1274,6 +1428,9 @@ class ArgusServer:
             if result is None:
                 state = self._scheduler_state()
                 next_due_at = parse_now(state["next_due_at"]) if state["next_due_at"] else self.clock.now() + timedelta(seconds=60)
+                delivery_due_at = self._next_delivery_due_at()
+                if delivery_due_at is not None and delivery_due_at < next_due_at:
+                    next_due_at = delivery_due_at
                 delay = max(1.0, min(60.0, (next_due_at - self.clock.now()).total_seconds()))
                 self.clock.sleep(delay)
         return 0
@@ -1285,6 +1442,7 @@ class ArgusServer:
             "output_dir": str(self.config.output_dir),
             "publish": latest_snapshot(self.connection),
             "scheduler": dict(state),
+            "delivery": self._delivery_status(self.clock.now()),
             "last_run": self._last_run(),
         }
 
@@ -1448,7 +1606,7 @@ class ArgusServer:
                 (output_dir / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
                 self.connection.commit()
             completed_at = self.clock.now()
-            self._record_scheduler_completion(run_id, completed_at)
+            self._record_scheduler_completion(run_id, run_kind, completed_at)
             self._record_scheduler_event("cycle_completed", run_id, "ok" if exit_code == 0 else "failed", {"run_kind": run_kind}, completed_at)
             return exit_code, summary
         except Exception as exc:
@@ -1914,15 +2072,9 @@ class ArgusServer:
     ) -> List[Dict[str, Any]]:
         package_payloads: List[Dict[str, Any]] = []
         embedding_failures: List[Dict[str, Any]] = []
-        publishable: List[Tuple[str, str, str, Dict[str, Any], Dict[str, Any]]] = []
+        publishable: List[Tuple[str, str, str, Dict[str, Any], Dict[str, Any], Dict[str, Any]]] = []
         queued_publish_keys: set[str] = set()
         rows = [json.loads(line) for line in candidates_path.read_text().splitlines() if line.strip()]
-        if (
-            publish_snapshot["effective_mode"] == "live"
-            and max_live_publishes is not None
-            and len(rows) > max_live_publishes
-        ):
-            raise PipelineError("canary publish limit exceeded before embedding: {} > {}".format(len(rows), max_live_publishes))
         for candidate in rows:
             if self.reload_requested:
                 self.reload_requested = False
@@ -1984,9 +2136,7 @@ class ArgusServer:
             first_acceptance_allows_publish = first["first_effective_mode"] == "live" and (
                 not cycle_snapshot["require_embeddings"] or cycle_snapshot["allow_non_embedded_fallback"] or embedding_matches_snapshot(cycle_snapshot, supplied_embeddings)
             )
-            publish_allowed = first_acceptance_allows_publish and publish_snapshot["effective_mode"] == "live" and (
-                not publish_snapshot["require_embeddings"] or publish_snapshot["allow_non_embedded_fallback"] or embedding_matches_snapshot(publish_snapshot, supplied_embeddings)
-            )
+            publish_allowed = first_acceptance_allows_publish and bool(cycle_snapshot.get("publish_target_key"))
             package_payload = package_payload_for(candidate, package_id)
             package_payloads.append(package_payload)
             self.connection.execute(
@@ -2004,89 +2154,21 @@ class ArgusServer:
                 ),
             )
             if publish_allowed:
-                target = "sha256:" + hashlib.sha256(("publish-target:v0\n" + str(self.config.publish.subspace_endpoint)).encode("utf-8")).hexdigest()
+                target = str(cycle_snapshot["publish_target_key"])
                 key = "sha256:" + hashlib.sha256(("publish:v0\n{}\n{}".format(package_id, target)).encode("utf-8")).hexdigest()
                 if self.connection.execute("SELECT 1 FROM publish_attempts WHERE publish_idempotency_key = ? AND status = 'succeeded'", (key,)).fetchone():
                     continue
                 queued_publish_keys.add(key)
-                publishable.append((package_id, target, key, package_payload, supplied_embeddings))
-        if publish_snapshot["effective_mode"] == "live":
-            target = "sha256:" + hashlib.sha256(("publish-target:v0\n" + str(self.config.publish.subspace_endpoint)).encode("utf-8")).hexdigest()
-            for row in self.connection.execute(
-                """
-                SELECT package_id, package_json
-                FROM packages
-                WHERE active_eligible = 1
-                ORDER BY created_at, package_id
-                """
-            ):
-                package_id = row["package_id"]
-                key = "sha256:" + hashlib.sha256(("publish:v0\n{}\n{}".format(package_id, target)).encode("utf-8")).hexdigest()
-                if key in queued_publish_keys:
-                    continue
-                latest_attempt = self.connection.execute(
-                    """
-                    SELECT status
-                    FROM publish_attempts
-                    WHERE publish_idempotency_key = ?
-                    ORDER BY attempt_number DESC
-                    LIMIT 1
-                    """,
-                    (key,),
-                ).fetchone()
-                if latest_attempt is None or latest_attempt["status"] != "failed":
-                    continue
-                package_payload = json.loads(row["package_json"])
-                supplied_embeddings = supplied_embedding_for(package_payload)
-                queued_publish_keys.add(key)
-                publishable.append((package_id, target, key, package_payload, supplied_embeddings))
-        if max_live_publishes is not None and len(publishable) > max_live_publishes:
-            raise PipelineError("canary publish limit exceeded: {} > {}".format(len(publishable), max_live_publishes))
+                publishable.append((package_id, target, key, package_payload, supplied_embeddings, candidate))
         if publishable:
+            delivery_started_at = self.clock.now()
+            self._create_delivery_plan(run_id, delivery_started_at, publishable, publish_snapshot, max_live_publishes)
             self.connection.commit()
-        for package_id, target, key, package_payload, supplied_embeddings in publishable:
-            previous_attempt = self.connection.execute(
-                "SELECT MAX(attempt_number) AS attempt_number FROM publish_attempts WHERE publish_idempotency_key = ?",
-                (key,),
-            ).fetchone()
-            attempt_number = int(previous_attempt["attempt_number"] or 0) + 1
-            attempt = "sha256:" + hashlib.sha256(("publish-attempt:v0\n{}\n{}".format(key, attempt_number)).encode("utf-8")).hexdigest()
-            attempted_at = iso_z(now)
-            self.connection.execute(
-                """
-                INSERT INTO publish_attempts
-                (attempt_id, package_id, publish_target_key, publish_idempotency_key, effective_publish_snapshot_id,
-                 attempt_number, mode, status, attempted_at, completed_at, subspace_message_id, response_json, error_class, error_message)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (attempt, package_id, target, key, publish_snapshot["snapshot_id"], attempt_number, publish_snapshot["effective_mode"], "pending", attempted_at, None, None, None, None, None),
-            )
-            self.connection.commit()
-            try:
-                response = self._publish_package_to_subspace(package_payload, key, supplied_embeddings)
-                message_id = subspace_message_id_from_response(response)
-                if not message_id:
-                    raise PublishTransportError("Subspace response missing subspace_message_id", response)
-                self.connection.execute(
-                    """
-                    UPDATE publish_attempts
-                    SET status = ?, completed_at = ?, subspace_message_id = ?, response_json = ?, error_class = NULL, error_message = NULL
-                    WHERE attempt_id = ?
-                    """,
-                    ("succeeded", iso_z(self.clock.now()), message_id, json.dumps(response, sort_keys=True), attempt),
-                )
-                self.connection.commit()
-            except Exception as exc:
-                response = getattr(exc, "response", None)
-                self.connection.execute(
-                    """
-                    UPDATE publish_attempts
-                    SET status = ?, completed_at = ?, response_json = ?, error_class = ?, error_message = ?
-                    WHERE attempt_id = ?
-                    """,
-                    ("failed", iso_z(self.clock.now()), json.dumps(response, sort_keys=True) if response is not None else None, exc.__class__.__name__, str(exc), attempt),
-                )
-                self.connection.commit()
+            if self.config.delivery.mode == "immediate":
+                while self._drain_due_delivery(delivery_started_at, max_entries=100000).get("attempted"):
+                    pass
+            else:
+                self._drain_due_delivery(delivery_started_at)
         (output_dir / "embedding-failures.json").write_text(json.dumps(embedding_failures, indent=2, sort_keys=True) + "\n")
         return package_payloads
 
@@ -2100,6 +2182,400 @@ class ArgusServer:
             [canonical_embedding_for_subspace(supplied_embedding)] if supplied_embedding else [],
             idempotency_key,
         )
+
+    def _delivery_window_end(self, now: datetime, run_id: str) -> datetime:
+        state = self._scheduler_state()
+        if self.config.scheduler.mode == "manual" or not state["next_due_at"]:
+            return now + timedelta(seconds=self.config.delivery.manual_window_seconds)
+        next_due_at = parse_now(state["next_due_at"])
+        if next_due_at <= now:
+            return now + timedelta(seconds=self.config.scheduler.interval_seconds + self._jitter_offset(run_id))
+        return next_due_at
+
+    def _create_delivery_plan(
+        self,
+        run_id: str,
+        now: datetime,
+        publishable: List[Tuple[str, str, str, Dict[str, Any], Dict[str, Any], Dict[str, Any]]],
+        publish_snapshot: Dict[str, Any],
+        max_live_publishes: Optional[int],
+    ) -> None:
+        if not publishable:
+            return
+        target = publishable[0][1]
+        existing = self.connection.execute(
+            "SELECT plan_id FROM delivery_plans WHERE run_id = ? AND publish_target_key = ?",
+            (run_id, target),
+        ).fetchone()
+        if existing is not None:
+            return
+        publishable.sort(
+            key=lambda item: (
+                item[5].get("published_at") is None,
+                item[5].get("published_at") or "",
+                item[5].get("fetched_at") or "",
+                item[5].get("source_id") or "",
+                item[5].get("report_id") or "",
+            )
+        )
+        budget = len(publishable) if max_live_publishes is None else max(0, max_live_publishes)
+        selected = publishable[:budget]
+        over_budget = publishable[budget:]
+        for package_id, _target, key, _payload, _embedding, candidate in over_budget:
+            self.connection.execute(
+                "INSERT INTO skipped_items VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    candidate["source_id"],
+                    candidate["report_id"],
+                    "over_live_publish_budget",
+                    json.dumps({"package_id": package_id, "publish_idempotency_key": key}, sort_keys=True),
+                    iso_z(now),
+                ),
+            )
+        if not selected:
+            return
+        window_start = now
+        configured_window_end = self._delivery_window_end(now, run_id)
+        window_end = configured_window_end if configured_window_end > window_start else window_start
+        plan_id = "sha256:" + hashlib.sha256(("delivery-plan:v0\n{}\n{}".format(run_id, target)).encode("utf-8")).hexdigest()
+        duration = max(0.0, (window_end - window_start).total_seconds())
+        if self.config.delivery.mode == "tranche" and len(selected) > self.config.delivery.max_messages_per_plan:
+            raise PipelineError(
+                "delivery_max_messages_exceeded: selected_count={} exceeds max_messages_per_plan={} for window_seconds={}".format(
+                    len(selected),
+                    self.config.delivery.max_messages_per_plan,
+                    int(duration),
+                )
+            )
+        slot_width = duration / len(selected) if selected and duration > 0 else 0
+        if self.config.delivery.mode == "tranche" and len(selected) > 1 and duration > 0 and slot_width < self.config.delivery.min_slot_seconds:
+            max_items_for_window = int(duration // self.config.delivery.min_slot_seconds)
+            raise PipelineError(
+                "delivery_density_exceeded: selected_count={} exceeds max_items_for_window={} for window_seconds={} min_slot_seconds={} computed_slot_seconds={:.3f}".format(
+                    len(selected),
+                    max_items_for_window,
+                    int(duration),
+                    self.config.delivery.min_slot_seconds,
+                    slot_width,
+                )
+            )
+        first_due_at = None
+        last_due_at = None
+        due_times: List[datetime] = []
+        for index, _item in enumerate(selected):
+            if self.config.delivery.mode == "immediate" or duration <= 0:
+                due_at = window_start
+            else:
+                due_at = window_start + timedelta(seconds=int(index * (duration / len(selected))))
+                if due_at > window_end:
+                    due_at = window_end
+            due_times.append(due_at)
+            first_due_at = due_at if first_due_at is None else min(first_due_at, due_at)
+            last_due_at = due_at if last_due_at is None else max(last_due_at, due_at)
+        self.connection.execute(
+            """
+            INSERT INTO delivery_plans
+            (plan_id, run_id, publish_target_key, mode, created_at, window_start, window_end,
+             selected_count, skipped_over_budget_count, first_due_at, last_due_at, detail_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                plan_id,
+                run_id,
+                target,
+                self.config.delivery.mode,
+                iso_z(now),
+                iso_z(window_start),
+                iso_z(window_end),
+                len(selected),
+                len(over_budget),
+                iso_z(first_due_at or window_start),
+                iso_z(last_due_at or window_start),
+                json.dumps(
+                    {
+                        "publish_snapshot_id": publish_snapshot["snapshot_id"],
+                        "configured_window_end": iso_z(configured_window_end),
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        )
+        for index, item in enumerate(selected):
+            package_id, _target, key, _payload, _embedding, _candidate = item
+            entry_id = "sha256:" + hashlib.sha256(("delivery-entry:v0\n{}\n{}".format(plan_id, package_id)).encode("utf-8")).hexdigest()
+            self.connection.execute(
+                """
+                INSERT INTO delivery_entries
+                (entry_id, plan_id, run_id, publish_target_key, package_id, publish_idempotency_key,
+                 selected_order_index, due_at, status, attempt_count, last_attempt_at, next_retry_at,
+                 last_error_class, last_error_message, subspace_message_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, NULL, NULL, NULL, NULL, ?)
+                """,
+                (entry_id, plan_id, run_id, target, package_id, key, index, iso_z(due_times[index]), iso_z(now)),
+            )
+
+    def _current_publish_target_key(self) -> Optional[str]:
+        if not self.config.publish.subspace_endpoint:
+            return None
+        return "sha256:" + hashlib.sha256(("publish-target:v0\n" + str(self.config.publish.subspace_endpoint)).encode("utf-8")).hexdigest()
+
+    def _mark_delivery_permanent_failure(self, entry_id: str, now: datetime, error_class: str, message: str) -> None:
+        self.connection.execute(
+            """
+            UPDATE delivery_entries
+            SET status = 'permanent_failure',
+                last_error_class = ?,
+                last_error_message = ?,
+                updated_at = ?
+            WHERE entry_id = ?
+            """,
+            (error_class, message, iso_z(now), entry_id),
+        )
+        self.connection.commit()
+
+    def _drain_due_delivery(self, now: datetime, max_entries: Optional[int] = None) -> Dict[str, Any]:
+        publish_snapshot = latest_snapshot(self.connection)
+        if publish_snapshot["effective_mode"] != "live":
+            return {}
+        target = self._current_publish_target_key()
+        if target is None:
+            return {}
+        due_filter = """
+            (
+                status = 'pending' AND due_at <= ?
+            ) OR (
+                status = 'retry_pending' AND COALESCE(next_retry_at, due_at) <= ?
+            ) OR status = 'attempting'
+        """
+        mismatched_rows = self.connection.execute(
+            """
+            SELECT entry_id
+            FROM delivery_entries
+            WHERE ({})
+              AND publish_target_key != ?
+            ORDER BY COALESCE(next_retry_at, due_at), due_at, selected_order_index
+            """.format(due_filter),
+            (iso_z(now), iso_z(now), target),
+        ).fetchall()
+        for row in mismatched_rows:
+            self._mark_delivery_permanent_failure(
+                row["entry_id"],
+                now,
+                "publish_target_mismatch",
+                "delivery entry publish target does not match current approved target",
+            )
+        due_rows = self.connection.execute(
+            """
+            SELECT *
+            FROM delivery_entries
+            WHERE ({})
+              AND publish_target_key = ?
+            ORDER BY COALESCE(next_retry_at, due_at), due_at, selected_order_index
+            LIMIT ?
+            """.format(due_filter),
+            (iso_z(now), iso_z(now), target, max_entries or self.config.delivery.live_send_concurrency),
+        ).fetchall()
+        attempted = 0
+        succeeded = 0
+        failed = 0
+        for entry in due_rows:
+            package_row = self.connection.execute("SELECT active_eligible, package_json FROM packages WHERE package_id = ?", (entry["package_id"],)).fetchone()
+            if package_row is None:
+                self._mark_delivery_permanent_failure(
+                    entry["entry_id"],
+                    now,
+                    "missing_package",
+                    "delivery package payload is missing",
+                )
+                failed += 1
+                continue
+            if not int(package_row["active_eligible"]):
+                self._mark_delivery_permanent_failure(
+                    entry["entry_id"],
+                    now,
+                    "inactive_package",
+                    "delivery package is not active-eligible",
+                )
+                failed += 1
+                continue
+            package_payload = json.loads(package_row["package_json"])
+            supplied_embeddings = supplied_embedding_for(package_payload)
+            if package_payload.get("schema") != "swarm.channel.news.report.v0" or package_payload.get("package_id") != entry["package_id"]:
+                self._mark_delivery_permanent_failure(
+                    entry["entry_id"],
+                    now,
+                    "invalid_package_contract",
+                    "delivery package violates canonical Subspace message contract",
+                )
+                failed += 1
+                continue
+            if (
+                publish_snapshot["require_embeddings"]
+                and not publish_snapshot["allow_non_embedded_fallback"]
+                and not embedding_matches_snapshot(publish_snapshot, supplied_embeddings)
+            ):
+                self._mark_delivery_permanent_failure(
+                    entry["entry_id"],
+                    now,
+                    "missing_required_embedding",
+                    "delivery package is missing required embedding for current publish snapshot",
+                )
+                failed += 1
+                continue
+            key = entry["publish_idempotency_key"]
+            if self.connection.execute("SELECT 1 FROM publish_attempts WHERE publish_idempotency_key = ? AND status = 'succeeded'", (key,)).fetchone():
+                message_row = self.connection.execute(
+                    "SELECT subspace_message_id FROM publish_attempts WHERE publish_idempotency_key = ? AND status = 'succeeded' ORDER BY completed_at DESC LIMIT 1",
+                    (key,),
+                ).fetchone()
+                self.connection.execute(
+                    """
+                    UPDATE delivery_entries
+                    SET status = 'succeeded', subspace_message_id = ?, updated_at = ?
+                    WHERE entry_id = ?
+                    """,
+                    (message_row["subspace_message_id"] if message_row else None, iso_z(now), entry["entry_id"]),
+                )
+                self.connection.commit()
+                succeeded += 1
+                continue
+            previous_attempt = self.connection.execute(
+                "SELECT MAX(attempt_number) AS attempt_number FROM publish_attempts WHERE publish_idempotency_key = ?",
+                (key,),
+            ).fetchone()
+            attempt_number = int(previous_attempt["attempt_number"] or 0) + 1
+            attempt = "sha256:" + hashlib.sha256(("publish-attempt:v0\n{}\n{}".format(key, attempt_number)).encode("utf-8")).hexdigest()
+            self.connection.execute(
+                """
+                UPDATE delivery_entries
+                SET status = 'attempting', attempt_count = attempt_count + 1, last_attempt_at = ?, updated_at = ?
+                WHERE entry_id = ?
+                """,
+                (iso_z(now), iso_z(now), entry["entry_id"]),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO publish_attempts
+                (attempt_id, package_id, publish_target_key, publish_idempotency_key, effective_publish_snapshot_id,
+                 attempt_number, mode, status, attempted_at, completed_at, subspace_message_id, response_json, error_class, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, NULL, NULL, NULL)
+                """,
+                (attempt, entry["package_id"], entry["publish_target_key"], key, publish_snapshot["snapshot_id"], attempt_number, publish_snapshot["effective_mode"], iso_z(now)),
+            )
+            self.connection.commit()
+            attempted += 1
+            try:
+                response = self._publish_package_to_subspace(package_payload, key, supplied_embeddings)
+                message_id = subspace_message_id_from_response(response)
+                if not message_id and not subspace_response_is_success(response):
+                    raise PublishTransportError("Subspace response missing subspace_message_id", response)
+                completed_at = iso_z(self.clock.now())
+                self.connection.execute(
+                    """
+                    UPDATE publish_attempts
+                    SET status = 'succeeded', completed_at = ?, subspace_message_id = ?, response_json = ?, error_class = NULL, error_message = NULL
+                    WHERE attempt_id = ?
+                    """,
+                    (completed_at, message_id, json.dumps(response, sort_keys=True), attempt),
+                )
+                self.connection.execute(
+                    """
+                    UPDATE delivery_entries
+                    SET status = 'succeeded', subspace_message_id = ?, last_error_class = NULL, last_error_message = NULL, updated_at = ?
+                    WHERE entry_id = ?
+                    """,
+                    (message_id, completed_at, entry["entry_id"]),
+                )
+                self.connection.commit()
+                succeeded += 1
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                completed_at = iso_z(self.clock.now())
+                delay = min(self.config.delivery.max_retry_delay_seconds, 60 * (2 ** max(0, attempt_number - 1)))
+                delivery_status = "permanent_failure" if publish_exception_is_permanent(exc) else "retry_pending"
+                next_retry_at = None if delivery_status == "permanent_failure" else iso_z(self.clock.now() + timedelta(seconds=delay))
+                self.connection.execute(
+                    """
+                    UPDATE publish_attempts
+                    SET status = 'failed', completed_at = ?, response_json = ?, error_class = ?, error_message = ?
+                    WHERE attempt_id = ?
+                    """,
+                    (completed_at, json.dumps(response, sort_keys=True) if response is not None else None, exc.__class__.__name__, str(exc), attempt),
+                )
+                self.connection.execute(
+                    """
+                    UPDATE delivery_entries
+                    SET status = ?, next_retry_at = ?, last_error_class = ?, last_error_message = ?, updated_at = ?
+                    WHERE entry_id = ?
+                    """,
+                    (delivery_status, next_retry_at, exc.__class__.__name__, str(exc), completed_at, entry["entry_id"]),
+                )
+                self.connection.commit()
+                failed += 1
+        return {"attempted": attempted, "succeeded": succeeded, "failed": failed} if due_rows else {}
+
+    def _next_delivery_due_at(self) -> Optional[datetime]:
+        try:
+            if latest_snapshot(self.connection)["effective_mode"] != "live":
+                return None
+        except PipelineError:
+            return None
+        row = self.connection.execute(
+            """
+            SELECT due_at, next_retry_at, status
+            FROM delivery_entries
+            WHERE status IN ('pending', 'retry_pending')
+            ORDER BY COALESCE(next_retry_at, due_at), due_at, selected_order_index
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        return parse_now(row["next_retry_at"] or row["due_at"])
+
+    def _delivery_status(self, now: datetime) -> Dict[str, Any]:
+        plan = self.connection.execute("SELECT * FROM delivery_plans ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone()
+        if plan:
+            counts = {
+                row["status"]: row["count"]
+                for row in self.connection.execute(
+                    "SELECT status, COUNT(*) AS count FROM delivery_entries WHERE plan_id = ? GROUP BY status",
+                    (plan["plan_id"],),
+                )
+            }
+            overdue = self.connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM delivery_entries
+                WHERE plan_id = ?
+                  AND ((status = 'pending' AND due_at <= ?)
+                    OR (status = 'retry_pending' AND COALESCE(next_retry_at, due_at) <= ?))
+                """,
+                (plan["plan_id"], iso_z(now), iso_z(now)),
+            ).fetchone()[0]
+        else:
+            counts = {}
+            overdue = 0
+        last_success = self.connection.execute(
+            "SELECT subspace_message_id FROM delivery_entries WHERE status = 'succeeded' AND (? IS NULL OR plan_id = ?) ORDER BY updated_at DESC LIMIT 1",
+            (plan["plan_id"] if plan else None, plan["plan_id"] if plan else None),
+        ).fetchone()
+        last_error = self.connection.execute(
+            "SELECT last_error_class, last_error_message FROM delivery_entries WHERE last_error_class IS NOT NULL AND (? IS NULL OR plan_id = ?) ORDER BY updated_at DESC LIMIT 1",
+            (plan["plan_id"] if plan else None, plan["plan_id"] if plan else None),
+        ).fetchone()
+        return {
+            "mode": self.config.delivery.mode,
+            "active_plan_id": plan["plan_id"] if plan else None,
+            "counts_by_status": counts,
+            "pending_count": counts.get("pending", 0),
+            "overdue_count": overdue,
+            "retry_pending_count": counts.get("retry_pending", 0),
+            "succeeded_count": counts.get("succeeded", 0),
+            "last_successful_subspace_message_id": last_success["subspace_message_id"] if last_success else None,
+            "last_delivery_error": dict(last_error) if last_error else None,
+        }
 
     def _store_normalized_storage(self, run_id: str, now: datetime, output_dir: Path, accepted_report_ids: Optional[set[str]]) -> set[str]:
         sqlite_accepted_report_ids: set[str] = set()
@@ -2309,10 +2785,19 @@ class ArgusServer:
         )
         self.connection.commit()
 
-    def _record_scheduler_completion(self, run_id: str, now: datetime) -> None:
+    def _record_scheduler_completion(self, run_id: str, run_kind: str, now: datetime) -> None:
         next_due_at = None
         if self.config.scheduler.mode == "interval":
-            next_due_at = iso_z(now + timedelta(seconds=self.config.scheduler.interval_seconds + self._jitter_offset(run_id)))
+            existing = self._scheduler_state()
+            if run_kind != "scheduled" and existing["next_due_at"] and parse_now(existing["next_due_at"]) > now:
+                next_due_at = existing["next_due_at"]
+            else:
+                plan_row = self.connection.execute(
+                    "SELECT window_start FROM delivery_plans WHERE run_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+                base = parse_now(plan_row["window_start"]) if plan_row else now
+                next_due_at = iso_z(base + timedelta(seconds=self.config.scheduler.interval_seconds + self._jitter_offset(run_id)))
         self.connection.execute(
             """
             UPDATE scheduler_state
@@ -2362,6 +2847,7 @@ def run_status(db_path: Path) -> Dict[str, Any]:
     connection = connect_database_readonly(db_path)
     try:
         snapshot_row = connection.execute("SELECT snapshot_json FROM runtime_config_snapshots ORDER BY observed_at DESC, rowid DESC LIMIT 1").fetchone()
+        snapshot = json.loads(snapshot_row["snapshot_json"]) if snapshot_row else None
         scheduler_row = connection.execute("SELECT * FROM scheduler_state WHERE id = 1").fetchone()
         run_row = connection.execute("SELECT * FROM runs ORDER BY started_at DESC, rowid DESC LIMIT 1").fetchone()
         prime_row = connection.execute("SELECT * FROM prime_events ORDER BY requested_at DESC, rowid DESC LIMIT 1").fetchone()
@@ -2373,6 +2859,43 @@ def run_status(db_path: Path) -> Dict[str, Any]:
             "SELECT * FROM scheduler_events WHERE event_type LIKE '%reload%' AND status = 'failed' ORDER BY observed_at DESC, rowid DESC LIMIT 1"
         ).fetchone()
         package_count = connection.execute("SELECT COUNT(*) FROM packages").fetchone()[0]
+        delivery_plan_row = connection.execute("SELECT * FROM delivery_plans ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone()
+        now = utc_now()
+        if delivery_plan_row:
+            delivery_counts = {
+                row["status"]: row["count"]
+                for row in connection.execute(
+                    "SELECT status, COUNT(*) AS count FROM delivery_entries WHERE plan_id = ? GROUP BY status",
+                    (delivery_plan_row["plan_id"],),
+                )
+            }
+            overdue_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM delivery_entries
+                WHERE plan_id = ?
+                  AND ((status = 'pending' AND due_at <= ?)
+                    OR (status = 'retry_pending' AND COALESCE(next_retry_at, due_at) <= ?))
+                """,
+                (delivery_plan_row["plan_id"], iso_z(now), iso_z(now)),
+            ).fetchone()[0]
+            last_delivery_error_row = connection.execute(
+                "SELECT last_error_class, last_error_message FROM delivery_entries WHERE plan_id = ? AND last_error_class IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
+                (delivery_plan_row["plan_id"],),
+            ).fetchone()
+            last_delivery_success_row = connection.execute(
+                "SELECT subspace_message_id FROM delivery_entries WHERE plan_id = ? AND status = 'succeeded' ORDER BY updated_at DESC LIMIT 1",
+                (delivery_plan_row["plan_id"],),
+            ).fetchone()
+        else:
+            delivery_counts = {}
+            overdue_count = 0
+            last_delivery_error_row = None
+            last_delivery_success_row = None
+        all_delivery_counts = {
+            row["status"]: row["count"]
+            for row in connection.execute("SELECT status, COUNT(*) AS count FROM delivery_entries GROUP BY status")
+        }
         publish_counts = {
             row["status"]: row["count"]
             for row in connection.execute("SELECT status, COUNT(*) AS count FROM publish_attempts GROUP BY status")
@@ -2384,11 +2907,23 @@ def run_status(db_path: Path) -> Dict[str, Any]:
         embedding_failure_count = connection.execute("SELECT COUNT(*) FROM embeddings WHERE status = 'failed'").fetchone()[0]
         last_summary = json.loads(run_row["summary_json"]) if run_row and run_row["summary_json"] else None
         return {
-            "publish": json.loads(snapshot_row["snapshot_json"]) if snapshot_row else None,
+            "publish": snapshot,
             "scheduler": dict(scheduler_row) if scheduler_row else None,
+            "delivery": {
+                "mode": snapshot.get("delivery_mode") if snapshot else (delivery_plan_row["mode"] if delivery_plan_row else None),
+                "active_plan_id": delivery_plan_row["plan_id"] if delivery_plan_row else None,
+                "counts_by_status": delivery_counts,
+                "pending_count": delivery_counts.get("pending", 0),
+                "overdue_count": overdue_count,
+                "retry_pending_count": delivery_counts.get("retry_pending", 0),
+                "succeeded_count": delivery_counts.get("succeeded", 0),
+                "last_successful_subspace_message_id": last_delivery_success_row["subspace_message_id"] if last_delivery_success_row else None,
+                "last_delivery_error": dict(last_delivery_error_row) if last_delivery_error_row else None,
+            },
             "last_run": ({**dict(run_row), "summary": last_summary} if run_row else None),
             "counts": {
                 "packages": package_count,
+                "delivery_entries_by_status": all_delivery_counts,
                 "publish_attempts_by_status": publish_counts,
                 "skipped_items_by_reason": skipped_counts,
                 "embedding_failures": embedding_failure_count,
