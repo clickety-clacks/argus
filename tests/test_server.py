@@ -7,7 +7,7 @@ import sqlite3
 import subprocess
 import unittest
 from contextlib import redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -1196,7 +1196,8 @@ class ServerTests(unittest.TestCase):
             finally:
                 second.close()
             self.assertEqual(attempt["status"], "unknown")
-            self.assertEqual(entry["status"], "retry_pending")
+            self.assertEqual(entry["status"], "unknown")
+            self.assertIsNone(entry["next_retry_at"])
             self.assertIn("service restarted", entry["last_error_message"])
 
     def test_same_second_manual_runs_get_distinct_run_ids(self):
@@ -2492,7 +2493,7 @@ print(json.dumps({
                 self.assertEqual({row["attempt_number"] for row in first_attempts}, {1})
                 self.assertEqual({row["status"] for row in first_attempts}, {"failed"})
                 server_module.post_message_to_subspace = succeeding_post
-                clock.advance(60)
+                clock.advance(10 * 60)
                 server.tick()
             finally:
                 server_module.post_message_to_subspace = original_post
@@ -2716,6 +2717,10 @@ print(json.dumps({
                 self.closed = False
                 self.replies = [
                     json.dumps(["1", "1", "firehose", "phx_reply", {"status": "ok", "response": {}}]),
+                    *[
+                        json.dumps(["1", "replay-{}".format(index), "firehose", "new_msg", {"body": "replay"}])
+                        for index in range(150)
+                    ],
                     json.dumps(["1", "2", "firehose", "phx_reply", {"status": "ok", "response": {"id": "subspace-message"}}]),
                 ]
 
@@ -2773,6 +2778,189 @@ print(json.dumps({
             attempts = rows(root / "argus.sqlite3", "publish_attempts")
             self.assertEqual({row["status"] for row in attempts}, {"failed"})
             self.assertEqual({row["error_message"] for row in attempts}, {"Subspace response missing subspace_message_id"})
+
+    def test_missing_post_ack_records_unknown_without_retrying_hot_loop(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+            )
+            calls = []
+            original_post = server_module.post_message_to_subspace
+
+            def unknown_ack(*args):
+                calls.append(args)
+                raise server_module.PublishAckUnknownError("Subspace post_message reply not received after replay")
+
+            server_module.post_message_to_subspace = unknown_ack
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+                server._drain_due_delivery(NOW + timedelta(hours=1), max_entries=100)
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            attempts = rows(root / "argus.sqlite3", "publish_attempts")
+            entries = rows(root / "argus.sqlite3", "delivery_entries")
+            self.assertEqual(len(calls), 2)
+            self.assertEqual([row["status"] for row in attempts], ["unknown", "unknown"])
+            self.assertEqual({row["status"] for row in entries}, {"unknown"})
+            self.assertTrue(all(row["next_retry_at"] is None for row in entries))
+
+    def test_publish_failures_use_jittered_backoff_and_trip_run_circuit_breaker(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+                schedule={"max_live_publishes_per_tick": 10},
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            original_post = server_module.post_message_to_subspace
+            calls = []
+
+            def failing_post(*args):
+                calls.append(args)
+                raise server_module.PublishTransportError("temporary Subspace failure")
+
+            server_module.post_message_to_subspace = failing_post
+            try:
+                snapshot = rows(root / "argus.sqlite3", "runtime_config_snapshots")[-1]
+                target = server._current_publish_target_key()
+                self.assertIsNotNone(target)
+                plan_id = "plan-circuit"
+                run_id = "run-circuit"
+                package_json = lambda package_id: json.dumps(
+                    {
+                        "schema": "swarm.channel.news.report.v0",
+                        "package_id": package_id,
+                        "supplied_embeddings": [{"space_id": "openai:text-embedding-3-small:1536:v1", "vector": [1.0]}],
+                    },
+                    sort_keys=True,
+                )
+                server.connection.execute(
+                    "INSERT OR REPLACE INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (run_id, "manual", "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", "succeeded", str(root / "out" / run_id), snapshot["snapshot_id"], "{}"),
+                )
+                server.connection.execute(
+                    "INSERT INTO delivery_plans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (plan_id, run_id, target, "immediate", "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", 6, 0, "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", "{}"),
+                )
+                for index in range(6):
+                    package_id = "package-circuit-{}".format(index)
+                    key = "key-circuit-{}".format(index)
+                    server.connection.execute(
+                        "INSERT INTO packages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (package_id, "report-circuit-{}".format(index), "1", "openai:text-embedding-3-small:1536:v1", "vector-hash", 1, package_json(package_id), run_id, "2026-04-29T12:00:00Z"),
+                    )
+                    server.connection.execute(
+                        """
+                        INSERT INTO delivery_entries
+                        (entry_id, plan_id, run_id, publish_target_key, package_id, publish_idempotency_key,
+                         selected_order_index, due_at, status, attempt_count, last_attempt_at, next_retry_at,
+                         last_error_class, last_error_message, subspace_message_id, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, NULL, NULL, NULL, NULL, ?)
+                        """,
+                        ("entry-circuit-{}".format(index), plan_id, run_id, target, package_id, key, index, "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z"),
+                    )
+                server.connection.commit()
+
+                result = server._drain_due_delivery(NOW, max_entries=10)
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            self.assertEqual(result["attempted"], server_module.DELIVERY_CIRCUIT_BREAKER_FAILURES_PER_RUN)
+            self.assertEqual(result["circuit_opened"], 1)
+            self.assertEqual(len(calls), server_module.DELIVERY_CIRCUIT_BREAKER_FAILURES_PER_RUN)
+            attempts = rows(root / "argus.sqlite3", "publish_attempts")
+            entries = rows(root / "argus.sqlite3", "delivery_entries")
+            self.assertEqual(len(attempts), server_module.DELIVERY_CIRCUIT_BREAKER_FAILURES_PER_RUN)
+            self.assertEqual({row["status"] for row in attempts}, {"failed"})
+            retry_entries = [row for row in entries if row["status"] == "retry_pending"]
+            self.assertEqual(len(retry_entries), 6)
+            self.assertTrue(any(row["last_error_class"] == "publish_circuit_breaker" for row in retry_entries))
+            first_retry = min(parse for parse in (row["next_retry_at"] for row in retry_entries) if parse)
+            self.assertGreaterEqual(first_retry, "2026-04-29T12:05:00Z")
+
+    def test_per_report_publish_attempt_cap_stops_fourth_send(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+            )
+            calls = []
+            original_post = server_module.post_message_to_subspace
+            server_module.post_message_to_subspace = lambda *args: calls.append(args) or {"ok": True, "results": []}
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                snapshot = rows(root / "argus.sqlite3", "runtime_config_snapshots")[-1]
+                target = server._current_publish_target_key()
+                run_id = "run-cap"
+                package_id = "package-cap"
+                key = "key-cap"
+                payload = {
+                    "schema": "swarm.channel.news.report.v0",
+                    "package_id": package_id,
+                    "supplied_embeddings": [{"space_id": "openai:text-embedding-3-small:1536:v1", "vector": [1.0]}],
+                }
+                server.connection.execute(
+                    "INSERT OR REPLACE INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (run_id, "manual", "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", "succeeded", str(root / "out" / run_id), snapshot["snapshot_id"], "{}"),
+                )
+                server.connection.execute(
+                    "INSERT INTO packages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (package_id, "report-cap", "1", "openai:text-embedding-3-small:1536:v1", "vector-hash", 1, json.dumps(payload), run_id, "2026-04-29T12:00:00Z"),
+                )
+                server.connection.execute(
+                    "INSERT INTO delivery_plans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("plan-cap", run_id, target, "immediate", "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", 1, 0, "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", "{}"),
+                )
+                server.connection.execute(
+                    """
+                    INSERT INTO delivery_entries
+                    (entry_id, plan_id, run_id, publish_target_key, package_id, publish_idempotency_key,
+                     selected_order_index, due_at, status, attempt_count, last_attempt_at, next_retry_at,
+                     last_error_class, last_error_message, subspace_message_id, updated_at)
+                    VALUES ('entry-cap', 'plan-cap', ?, ?, ?, ?, 0, '2026-04-29T12:00:00Z', 'retry_pending', 3,
+                            '2026-04-29T12:00:00Z', '2026-04-29T12:00:00Z', NULL, NULL, NULL, '2026-04-29T12:00:00Z')
+                    """,
+                    (run_id, target, package_id, key),
+                )
+                for attempt_number in range(1, server_module.DELIVERY_MAX_ATTEMPTS_PER_REPORT_KEY + 1):
+                    server.connection.execute(
+                        """
+                        INSERT INTO publish_attempts
+                        (attempt_id, package_id, publish_target_key, publish_idempotency_key, effective_publish_snapshot_id,
+                         attempt_number, mode, status, attempted_at, completed_at, subspace_message_id, response_json, error_class, error_message)
+                        VALUES (?, ?, ?, ?, ?, ?, 'live', 'failed', '2026-04-29T12:00:00Z', '2026-04-29T12:00:00Z', NULL, NULL, 'PublishTransportError', 'temporary')
+                        """,
+                        ("attempt-cap-{}".format(attempt_number), package_id, target, key, snapshot["snapshot_id"], attempt_number),
+                    )
+                server.connection.commit()
+
+                result = server._drain_due_delivery(NOW, max_entries=1)
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            self.assertEqual(result["attempted"], 0)
+            self.assertEqual(calls, [])
+            entry = rows(root / "argus.sqlite3", "delivery_entries")[0]
+            self.assertEqual(entry["status"], "permanent_failure")
+            self.assertEqual(entry["last_error_class"], "publish_report_attempt_cap")
 
     def test_spec_named_cli_backend_invokes_embedding_command(self):
         with TemporaryDirectory() as tmpdir:

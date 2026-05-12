@@ -176,6 +176,8 @@ Watch the first scheduled tick and publish attempts:
 watch -n 10 'argus status --db /var/lib/argus/argus.sqlite3; sqlite3 /var/lib/argus/argus.sqlite3 "select status, count(*) from publish_attempts group by status; select attempted_at, status, subspace_message_id from publish_attempts order by attempted_at desc limit 5;"'
 ```
 
+Publish retry discipline is intentionally conservative. A sent `post_message` with no observed Subspace ACK is recorded as `unknown` on both `publish_attempts` and `delivery_entries`; Argus does not automatically retry that package because Subspace may have accepted it and the operator must reconcile by idempotency key/message evidence. Retryable transport failures use capped exponential backoff with deterministic jitter, one pending in-flight attempt per publish idempotency key, per-report and per-run attempt caps, and a run-level circuit breaker so a small set of reports cannot amplify into hundreds of live attempts.
+
 Evidence to capture after the first tick:
 
 ```bash
