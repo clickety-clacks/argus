@@ -36,6 +36,12 @@ OPENAI_EMBEDDING_PROVIDER = "openai"
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
 OPENAI_EMBEDDING_DIMENSIONS = 1536
 OPENAI_EMBEDDING_SPACE_ID = "openai:text-embedding-3-small:1536:v1"
+SUBSPACE_REPLY_MAX_FRAMES = 5000
+DELIVERY_RETRY_BASE_DELAY_SECONDS = 5 * 60
+DELIVERY_RETRY_JITTER_RATIO = 0.25
+DELIVERY_MAX_ATTEMPTS_PER_REPORT_KEY = 3
+DELIVERY_MAX_ATTEMPTS_PER_RUN = 50
+DELIVERY_CIRCUIT_BREAKER_FAILURES_PER_RUN = 5
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,6 +71,8 @@ class DeliveryConfig:
     manual_window_seconds: int = DEFAULT_INTERVAL_SECONDS
     max_retry_delay_seconds: int = 15 * 60
     live_send_concurrency: int = 1
+    min_slot_seconds: int = 60
+    max_messages_per_plan: int = 20
 
 
 @dataclasses.dataclass(frozen=True)
@@ -222,6 +230,11 @@ def validate_delivery(payload: Dict[str, Any]) -> DeliveryConfig:
         raise PipelineError("Invalid delivery.mode: {}".format(mode))
     manual_window_seconds = parse_duration_seconds(payload.get("manual_window", "1h"))
     max_retry_delay_seconds = parse_duration_seconds(payload.get("max_retry_delay", "15m"))
+    min_slot_seconds = parse_duration_seconds(payload.get("min_slot", "1m"))
+    try:
+        max_messages_per_plan = int(payload.get("max_messages_per_plan", 20))
+    except (TypeError, ValueError):
+        raise PipelineError("Invalid delivery.max_messages_per_plan: {}".format(payload.get("max_messages_per_plan")))
     try:
         live_send_concurrency = int(payload.get("live_send_concurrency", 1))
     except (TypeError, ValueError):
@@ -230,6 +243,10 @@ def validate_delivery(payload: Dict[str, Any]) -> DeliveryConfig:
         raise PipelineError("Invalid delivery.manual_window: {}".format(payload.get("manual_window")))
     if max_retry_delay_seconds <= 0:
         raise PipelineError("Invalid delivery.max_retry_delay: {}".format(payload.get("max_retry_delay")))
+    if min_slot_seconds <= 0:
+        raise PipelineError("Invalid delivery.min_slot: {}".format(payload.get("min_slot")))
+    if max_messages_per_plan <= 0:
+        raise PipelineError("Invalid delivery.max_messages_per_plan: {}".format(payload.get("max_messages_per_plan")))
     if live_send_concurrency != 1:
         raise PipelineError("Invalid delivery.live_send_concurrency: {}".format(live_send_concurrency))
     return DeliveryConfig(
@@ -237,6 +254,8 @@ def validate_delivery(payload: Dict[str, Any]) -> DeliveryConfig:
         manual_window_seconds=manual_window_seconds,
         max_retry_delay_seconds=max_retry_delay_seconds,
         live_send_concurrency=live_send_concurrency,
+        min_slot_seconds=min_slot_seconds,
+        max_messages_per_plan=max_messages_per_plan,
     )
 
 
@@ -1043,6 +1062,10 @@ class PublishTransportError(PipelineError):
         self.response = response
 
 
+class PublishAckUnknownError(PublishTransportError):
+    pass
+
+
 def canonical_embedding_for_subspace(supplied_embedding: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "space_id": supplied_embedding.get("space_id"),
@@ -1081,6 +1104,16 @@ def publish_exception_is_permanent(exc: Exception) -> bool:
     }
 
 
+def delivery_retry_delay_seconds(max_delay_seconds: int, attempt_number: int, key: str) -> int:
+    base_delay = min(max_delay_seconds, DELIVERY_RETRY_BASE_DELAY_SECONDS * (2 ** max(0, attempt_number - 1)))
+    jitter_window = int(base_delay * DELIVERY_RETRY_JITTER_RATIO)
+    if jitter_window <= 0:
+        return base_delay
+    digest = hashlib.sha256(("delivery-retry-jitter:v0\n{}\n{}".format(key, attempt_number)).encode("utf-8")).hexdigest()
+    jitter = int(digest[:8], 16) % (jitter_window + 1)
+    return min(max_delay_seconds, base_delay + jitter)
+
+
 def subspace_websocket_url(endpoint: str, websocket_path: str) -> str:
     parsed = urlparse(endpoint)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -1092,9 +1125,21 @@ def subspace_websocket_url(endpoint: str, websocket_path: str) -> str:
     return urlunparse((scheme, parsed.netloc, path, "", "vsn=2.0.0", ""))
 
 
-def _read_phoenix_reply(connection: Any, expected_ref: str, operation: str, max_frames: int = 100) -> Dict[str, Any]:
+def _read_phoenix_reply(
+    connection: Any,
+    expected_ref: str,
+    operation: str,
+    max_frames: int = SUBSPACE_REPLY_MAX_FRAMES,
+    *,
+    missing_ack_is_unknown: bool = False,
+) -> Dict[str, Any]:
     for _ in range(max_frames):
-        raw = connection.recv()
+        try:
+            raw = connection.recv()
+        except Exception as exc:
+            if missing_ack_is_unknown:
+                raise PublishAckUnknownError("Subspace {} reply not received: {}".format(operation, exc)) from exc
+            raise PublishTransportError("Subspace {} reply not received: {}".format(operation, exc)) from exc
         try:
             frame = json.loads(raw)
         except ValueError as exc:
@@ -1111,7 +1156,9 @@ def _read_phoenix_reply(connection: Any, expected_ref: str, operation: str, max_
             message = payload.get("response", {}).get("reason") if isinstance(payload.get("response"), dict) else None
             raise PublishTransportError(message or "Subspace {} failed".format(operation), response)
         return payload
-    raise PublishTransportError("Subspace {} reply not received".format(operation))
+    if missing_ack_is_unknown:
+        raise PublishAckUnknownError("Subspace {} reply not received after {} frames".format(operation, max_frames))
+    raise PublishTransportError("Subspace {} reply not received after {} frames".format(operation, max_frames))
 
 
 def post_message_to_subspace(
@@ -1159,7 +1206,7 @@ def post_message_to_subspace(
                 separators=(",", ":"),
             )
         )
-        reply = _read_phoenix_reply(connection, post_ref, "post_message")
+        reply = _read_phoenix_reply(connection, post_ref, "post_message", missing_ack_is_unknown=True)
     except PublishTransportError:
         raise
     except Exception as exc:
@@ -1293,14 +1340,14 @@ class ArgusServer:
         self.connection.execute(
             """
             UPDATE delivery_entries
-            SET status = 'retry_pending',
-                next_retry_at = ?,
+            SET status = 'unknown',
+                next_retry_at = NULL,
                 last_error_class = ?,
                 last_error_message = ?,
                 updated_at = ?
             WHERE status = 'attempting'
             """,
-            (iso_z(now), "RuntimeError", "cycle recovered after restart before delivery result was recorded", iso_z(now)),
+            ("RuntimeError", "cycle recovered after restart before delivery result was recorded", iso_z(now)),
         )
 
     def _recover_stale_delivery_attempts(self, now: datetime) -> None:
@@ -1315,14 +1362,14 @@ class ArgusServer:
         self.connection.execute(
             """
             UPDATE delivery_entries
-            SET status = 'retry_pending',
-                next_retry_at = ?,
+            SET status = 'unknown',
+                next_retry_at = NULL,
                 last_error_class = ?,
                 last_error_message = ?,
                 updated_at = ?
             WHERE status = 'attempting'
             """,
-            (iso_z(now), "RuntimeError", "service restarted before delivery result was recorded", iso_z(now)),
+            ("RuntimeError", "service restarted before delivery result was recorded", iso_z(now)),
         )
         self.connection.commit()
 
@@ -2442,6 +2489,26 @@ class ArgusServer:
         window_end = configured_window_end if configured_window_end > window_start else window_start
         plan_id = "sha256:" + hashlib.sha256(("delivery-plan:v0\n{}\n{}".format(run_id, target)).encode("utf-8")).hexdigest()
         duration = max(0.0, (window_end - window_start).total_seconds())
+        if self.config.delivery.mode == "tranche" and len(selected) > self.config.delivery.max_messages_per_plan:
+            raise PipelineError(
+                "delivery_max_messages_exceeded: selected_count={} exceeds max_messages_per_plan={} for window_seconds={}".format(
+                    len(selected),
+                    self.config.delivery.max_messages_per_plan,
+                    int(duration),
+                )
+            )
+        slot_width = duration / len(selected) if selected and duration > 0 else 0
+        if self.config.delivery.mode == "tranche" and len(selected) > 1 and duration > 0 and slot_width < self.config.delivery.min_slot_seconds:
+            max_items_for_window = int(duration // self.config.delivery.min_slot_seconds)
+            raise PipelineError(
+                "delivery_density_exceeded: selected_count={} exceeds max_items_for_window={} for window_seconds={} min_slot_seconds={} computed_slot_seconds={:.3f}".format(
+                    len(selected),
+                    max_items_for_window,
+                    int(duration),
+                    self.config.delivery.min_slot_seconds,
+                    slot_width,
+                )
+            )
         first_due_at = None
         last_due_at = None
         due_times: List[datetime] = []
@@ -2516,6 +2583,75 @@ class ArgusServer:
         )
         self.connection.commit()
 
+    def _mark_delivery_retry_pending(self, entry_id: str, now: datetime, delay_seconds: int, error_class: str, message: str) -> None:
+        retry_at = now + timedelta(seconds=delay_seconds)
+        self.connection.execute(
+            """
+            UPDATE delivery_entries
+            SET status = 'retry_pending',
+                next_retry_at = ?,
+                last_error_class = ?,
+                last_error_message = ?,
+                updated_at = ?
+            WHERE entry_id = ?
+            """,
+            (iso_z(retry_at), error_class, message, iso_z(now), entry_id),
+        )
+        self.connection.commit()
+
+    def _mark_delivery_unknown(self, entry_id: str, now: datetime, error_class: str, message: str) -> None:
+        self.connection.execute(
+            """
+            UPDATE delivery_entries
+            SET status = 'unknown',
+                next_retry_at = NULL,
+                last_error_class = ?,
+                last_error_message = ?,
+                updated_at = ?
+            WHERE entry_id = ?
+            """,
+            (error_class, message, iso_z(now), entry_id),
+        )
+        self.connection.commit()
+
+    def _run_publish_attempt_counts(self, run_id: str) -> Dict[str, int]:
+        rows = self.connection.execute(
+            """
+            SELECT pa.status, COUNT(*) AS count
+            FROM publish_attempts pa
+            JOIN delivery_entries de ON de.publish_idempotency_key = pa.publish_idempotency_key
+            WHERE de.run_id = ?
+            GROUP BY pa.status
+            """,
+            (run_id,),
+        ).fetchall()
+        counts = {row["status"]: int(row["count"]) for row in rows}
+        counts["total"] = sum(counts.values())
+        counts["failure_or_unknown"] = counts.get("failed", 0) + counts.get("unknown", 0)
+        return counts
+
+    def _trip_delivery_circuit_breaker_if_needed(self, entry: sqlite3.Row, now: datetime) -> bool:
+        counts = self._run_publish_attempt_counts(entry["run_id"])
+        if counts["total"] >= DELIVERY_MAX_ATTEMPTS_PER_RUN:
+            self._mark_delivery_retry_pending(
+                entry["entry_id"],
+                now,
+                self.config.delivery.max_retry_delay_seconds,
+                "publish_run_attempt_cap",
+                "run publish attempt cap reached before delivery send",
+            )
+            return True
+        if counts["failure_or_unknown"] >= DELIVERY_CIRCUIT_BREAKER_FAILURES_PER_RUN:
+            self._mark_delivery_retry_pending(
+                entry["entry_id"],
+                now,
+                self.config.delivery.max_retry_delay_seconds,
+                "publish_circuit_breaker",
+                "run publish failure/unknown circuit breaker opened before delivery send",
+            )
+            return True
+        return False
+
     def _drain_due_delivery(self, now: datetime, max_entries: Optional[int] = None) -> Dict[str, Any]:
         publish_snapshot = latest_snapshot(self.connection)
         if publish_snapshot["effective_mode"] != "live":
@@ -2561,7 +2697,12 @@ class ArgusServer:
         attempted = 0
         succeeded = 0
         failed = 0
+        unknown = 0
+        circuit_opened = 0
         for entry in due_rows:
+            if self._trip_delivery_circuit_breaker_if_needed(entry, now):
+                circuit_opened += 1
+                continue
             package_row = self.connection.execute("SELECT active_eligible, package_json FROM packages WHERE package_id = ?", (entry["package_id"],)).fetchone()
             if package_row is None:
                 self._mark_delivery_permanent_failure(
@@ -2622,11 +2763,48 @@ class ArgusServer:
                 self.connection.commit()
                 succeeded += 1
                 continue
+            unknown_attempt = self.connection.execute(
+                "SELECT attempt_id FROM publish_attempts WHERE publish_idempotency_key = ? AND status = 'unknown' ORDER BY attempted_at DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+            if unknown_attempt is not None:
+                self._mark_delivery_unknown(
+                    entry["entry_id"],
+                    now,
+                    "PublishAckUnknownError",
+                    "previous Subspace publish attempt has unknown acknowledgement state",
+                )
+                unknown += 1
+                continue
+            inflight_attempt = self.connection.execute(
+                "SELECT attempt_id FROM publish_attempts WHERE publish_idempotency_key = ? AND status = 'pending' ORDER BY attempted_at DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+            if inflight_attempt is not None:
+                self.connection.execute(
+                    """
+                    UPDATE delivery_entries
+                    SET status = 'attempting', updated_at = ?
+                    WHERE entry_id = ?
+                    """,
+                    (iso_z(now), entry["entry_id"]),
+                )
+                self.connection.commit()
+                continue
             previous_attempt = self.connection.execute(
                 "SELECT MAX(attempt_number) AS attempt_number FROM publish_attempts WHERE publish_idempotency_key = ?",
                 (key,),
             ).fetchone()
             attempt_number = int(previous_attempt["attempt_number"] or 0) + 1
+            if attempt_number > DELIVERY_MAX_ATTEMPTS_PER_REPORT_KEY:
+                self._mark_delivery_permanent_failure(
+                    entry["entry_id"],
+                    now,
+                    "publish_report_attempt_cap",
+                    "per-report publish attempt cap reached before delivery send",
+                )
+                failed += 1
+                continue
             attempt = "sha256:" + hashlib.sha256(("publish-attempt:v0\n{}\n{}".format(key, attempt_number)).encode("utf-8")).hexdigest()
             self.connection.execute(
                 """
@@ -2671,10 +2849,35 @@ class ArgusServer:
                 )
                 self.connection.commit()
                 succeeded += 1
+            except PublishAckUnknownError as exc:
+                response = getattr(exc, "response", None)
+                completed_at = iso_z(self.clock.now())
+                self.connection.execute(
+                    """
+                    UPDATE publish_attempts
+                    SET status = 'unknown', completed_at = ?, response_json = ?, error_class = ?, error_message = ?
+                    WHERE attempt_id = ?
+                    """,
+                    (completed_at, json.dumps(response, sort_keys=True) if response is not None else None, exc.__class__.__name__, str(exc), attempt),
+                )
+                self.connection.execute(
+                    """
+                    UPDATE delivery_entries
+                    SET status = 'unknown',
+                        next_retry_at = NULL,
+                        last_error_class = ?,
+                        last_error_message = ?,
+                        updated_at = ?
+                    WHERE entry_id = ?
+                    """,
+                    (exc.__class__.__name__, str(exc), completed_at, entry["entry_id"]),
+                )
+                self.connection.commit()
+                unknown += 1
             except Exception as exc:
                 response = getattr(exc, "response", None)
                 completed_at = iso_z(self.clock.now())
-                delay = min(self.config.delivery.max_retry_delay_seconds, 60 * (2 ** max(0, attempt_number - 1)))
+                delay = delivery_retry_delay_seconds(self.config.delivery.max_retry_delay_seconds, attempt_number, key)
                 delivery_status = "permanent_failure" if publish_exception_is_permanent(exc) else "retry_pending"
                 next_retry_at = None if delivery_status == "permanent_failure" else iso_z(self.clock.now() + timedelta(seconds=delay))
                 self.connection.execute(
@@ -2695,7 +2898,13 @@ class ArgusServer:
                 )
                 self.connection.commit()
                 failed += 1
-        return {"attempted": attempted, "succeeded": succeeded, "failed": failed} if due_rows else {}
+        return {
+            "attempted": attempted,
+            "succeeded": succeeded,
+            "failed": failed,
+            "unknown": unknown,
+            "circuit_opened": circuit_opened,
+        } if due_rows else {}
 
     def _next_delivery_due_at(self) -> Optional[datetime]:
         try:

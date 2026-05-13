@@ -8,7 +8,7 @@ import sqlite3
 import subprocess
 import unittest
 from contextlib import redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -236,6 +236,8 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(config.delivery.manual_window_seconds, 3600)
         self.assertEqual(config.delivery.max_retry_delay_seconds, 900)
         self.assertEqual(config.delivery.live_send_concurrency, 1)
+        self.assertEqual(config.delivery.min_slot_seconds, 60)
+        self.assertEqual(config.delivery.max_messages_per_plan, 20)
         self.assertEqual(config.source_fetch_concurrency, 4)
         self.assertEqual(config.publish.mode, "inactive")
         self.assertTrue(config.publish.require_embeddings)
@@ -274,6 +276,8 @@ class ServerTests(unittest.TestCase):
         config = load_runtime_config(Path("config/argus.e2e-canary.example.yaml"))
         self.assertEqual(config.scheduler.mode, "manual")
         self.assertEqual(config.delivery.mode, "tranche")
+        self.assertEqual(config.delivery.min_slot_seconds, 60)
+        self.assertEqual(config.delivery.max_messages_per_plan, 20)
         self.assertEqual(config.source_fetch_concurrency, 1)
         self.assertEqual(config.publish.mode, "inactive")
         self.assertEqual(config.publish.subspace_endpoint, "https://subspace.swarm.channel")
@@ -1260,7 +1264,8 @@ class ServerTests(unittest.TestCase):
             finally:
                 second.close()
             self.assertEqual(attempt["status"], "unknown")
-            self.assertEqual(entry["status"], "retry_pending")
+            self.assertEqual(entry["status"], "unknown")
+            self.assertIsNone(entry["next_retry_at"])
             self.assertIn("service restarted", entry["last_error_message"])
 
     def test_same_second_manual_runs_get_distinct_run_ids(self):
@@ -2475,6 +2480,188 @@ print(json.dumps({
             self.assertEqual(len(calls), 2)
             self.assertEqual({row["status"] for row in rows(root / "argus.sqlite3", "delivery_entries")}, {"succeeded"})
 
+    def test_tranche_density_guard_stops_before_plan_or_send(self):
+        def feed_xml(count):
+            body = ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>", "<rss><channel><title>Dense Source</title>"]
+            for idx in range(1, count + 1):
+                body.append(
+                    "<item><guid>dense-guid-{}</guid><title>Dense Story {}</title><link>https://dense.example/story-{}</link><pubDate>Wed, 30 Apr 2026 10:{:02d}:00 +0000</pubDate><description>Story {}</description></item>".format(
+                        idx, idx, idx, idx, idx
+                    )
+                )
+            body.append("</channel></rss>")
+            return "\n".join(body)
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                interval="5m",
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+                schedule={"max_live_publishes_per_tick": 6},
+            )
+            (root / "feeds" / "stateful-source.xml").write_text(feed_xml(6))
+            calls = []
+            original_post = server_module.post_message_to_subspace
+            server_module.post_message_to_subspace = fake_subspace_success(calls)
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                with self.assertRaisesRegex(Exception, "delivery_density_exceeded"):
+                    server.tick()
+                config = yaml.safe_load(path.read_text())
+                config["schedule"]["max_live_publishes_per_tick"] = 5
+                path.write_text(yaml.safe_dump(config))
+                server.reload()
+                server.tick()
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "accepted_reports")), 6)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 6)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "delivery_plans")), 1)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "delivery_entries")), 5)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 1)
+            self.assertEqual(len([row for row in rows(root / "argus.sqlite3", "skipped_items") if row["reason_code"] == "delivery_density_exceeded"]), 0)
+            self.assertEqual(len([row for row in rows(root / "argus.sqlite3", "skipped_items") if row["reason_code"] == "over_live_publish_budget"]), 1)
+            failed_runs = [row for row in rows(root / "argus.sqlite3", "runs") if row["status"] == "failed"]
+            self.assertEqual(len(failed_runs), 1)
+            failed_summary = json.loads(failed_runs[0]["summary_json"])
+            self.assertIn("delivery_density_exceeded", failed_summary["post_pipeline_error"]["message"])
+            self.assertIn("max_items_for_window=5", failed_summary["post_pipeline_error"]["message"])
+
+    def test_tranche_density_guard_allows_exact_threshold(self):
+        def feed_xml(count):
+            body = ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>", "<rss><channel><title>Dense Source</title>"]
+            for idx in range(1, count + 1):
+                body.append(
+                    "<item><guid>threshold-guid-{}</guid><title>Threshold Story {}</title><link>https://dense.example/threshold-{}</link><pubDate>Wed, 30 Apr 2026 10:{:02d}:00 +0000</pubDate><description>Story {}</description></item>".format(
+                        idx, idx, idx, idx, idx
+                    )
+                )
+            body.append("</channel></rss>")
+            return "\n".join(body)
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                interval="5m",
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+                schedule={"max_live_publishes_per_tick": 5},
+            )
+            (root / "feeds" / "stateful-source.xml").write_text(feed_xml(5))
+            calls = []
+            original_post = server_module.post_message_to_subspace
+            server_module.post_message_to_subspace = fake_subspace_success(calls)
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "delivery_plans")), 1)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "delivery_entries")), 5)
+            self.assertEqual(len([row for row in rows(root / "argus.sqlite3", "skipped_items") if row["reason_code"] == "delivery_density_exceeded"]), 0)
+
+    def test_tranche_density_guard_allows_single_item_in_short_window(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+                schedule={"max_live_publishes_per_tick": 1},
+            )
+            fixture = root / "feeds" / "stateful-source.xml"
+            calls = []
+            original_post = server_module.post_message_to_subspace
+            server_module.post_message_to_subspace = fake_subspace_success(calls)
+            clock = FakeClock(NOW)
+            server = ArgusServer(path, clock=clock)
+            try:
+                server.tick()
+                fixture.write_text(
+                    fixture.read_text().replace(
+                        "  </channel>\n</rss>",
+                        """    <item>\n      <guid>stateful-guid-short-window</guid>\n      <title>Short window story</title>\n      <link>https://stateful.example/short-window</link>\n      <pubDate>Wed, 30 Apr 2026 10:30:00 +0000</pubDate>\n      <description>Brand new short-window story.</description>\n    </item>\n  </channel>\n</rss>""",
+                    )
+                )
+                clock.advance(3570)
+                server.manual_cycle()
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "delivery_plans")), 2)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "delivery_entries")), 2)
+            self.assertEqual(len([row for row in rows(root / "argus.sqlite3", "skipped_items") if row["reason_code"] == "delivery_density_exceeded"]), 0)
+
+    def test_tranche_max_messages_guard_stops_before_plan_or_send(self):
+        def feed_xml(count):
+            body = ["<?xml version=\"1.0\" encoding=\"UTF-8\"?>", "<rss><channel><title>Large Source</title>"]
+            for idx in range(1, count + 1):
+                body.append(
+                    "<item><guid>large-guid-{}</guid><title>Large Story {}</title><link>https://large.example/story-{}</link><pubDate>Wed, 30 Apr 2026 10:{:02d}:00 +0000</pubDate><description>Story {}</description></item>".format(
+                        idx, idx, idx, idx, idx
+                    )
+                )
+            body.append("</channel></rss>")
+            return "\n".join(body)
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                interval="2h",
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+                schedule={"max_live_publishes_per_tick": 21},
+            )
+            (root / "feeds" / "stateful-source.xml").write_text(feed_xml(21))
+            calls = []
+            original_post = server_module.post_message_to_subspace
+            server_module.post_message_to_subspace = fake_subspace_success(calls)
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                with self.assertRaisesRegex(Exception, "delivery_max_messages_exceeded"):
+                    server.tick()
+                config = yaml.safe_load(path.read_text())
+                config["schedule"]["max_live_publishes_per_tick"] = 20
+                path.write_text(yaml.safe_dump(config))
+                server.reload()
+                server.tick()
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "accepted_reports")), 21)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 21)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "delivery_plans")), 1)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "delivery_entries")), 20)
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 1)
+            self.assertEqual(len([row for row in rows(root / "argus.sqlite3", "skipped_items") if row["reason_code"] == "over_live_publish_budget"]), 1)
+            failed_runs = [row for row in rows(root / "argus.sqlite3", "runs") if row["status"] == "failed"]
+            self.assertEqual(len(failed_runs), 1)
+            failed_summary = json.loads(failed_runs[0]["summary_json"])
+            self.assertIn("delivery_max_messages_exceeded", failed_summary["post_pipeline_error"]["message"])
+            self.assertIn("max_messages_per_plan=20", failed_summary["post_pipeline_error"]["message"])
+
     def test_delivery_immediate_mode_drains_selected_work_in_one_cycle(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -2708,7 +2895,7 @@ print(json.dumps({
                 self.assertEqual({row["attempt_number"] for row in first_attempts}, {1})
                 self.assertEqual({row["status"] for row in first_attempts}, {"failed"})
                 server_module.post_message_to_subspace = succeeding_post
-                clock.advance(60)
+                clock.advance(10 * 60)
                 server.tick()
             finally:
                 server_module.post_message_to_subspace = original_post
@@ -2905,6 +3092,26 @@ print(json.dumps({
             with self.assertRaisesRegex(Exception, "Invalid schedule.max_live_publishes_per_tick"):
                 load_runtime_config(path)
 
+    def test_delivery_max_messages_per_plan_config_parses_and_rejects_invalid_values(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root)
+            config = yaml.safe_load(path.read_text())
+            config["delivery"] = {
+                "mode": "tranche",
+                "manual_window": "1h",
+                "max_retry_delay": "15m",
+                "live_send_concurrency": 1,
+                "min_slot": "1m",
+                "max_messages_per_plan": 7,
+            }
+            path.write_text(yaml.safe_dump(config))
+            self.assertEqual(load_runtime_config(path).delivery.max_messages_per_plan, 7)
+            config["delivery"]["max_messages_per_plan"] = 0
+            path.write_text(yaml.safe_dump(config))
+            with self.assertRaisesRegex(Exception, "Invalid delivery.max_messages_per_plan"):
+                load_runtime_config(path)
+
     def test_direct_subspace_websocket_publish_and_missing_message_id_failure(self):
         class FakeConnection:
             def __init__(self):
@@ -2912,6 +3119,10 @@ print(json.dumps({
                 self.closed = False
                 self.replies = [
                     json.dumps(["1", "1", "firehose", "phx_reply", {"status": "ok", "response": {}}]),
+                    *[
+                        json.dumps(["1", "replay-{}".format(index), "firehose", "new_msg", {"body": "replay"}])
+                        for index in range(150)
+                    ],
                     json.dumps(["1", "2", "firehose", "phx_reply", {"status": "ok", "response": {"id": "subspace-message"}}]),
                 ]
 
@@ -2969,6 +3180,189 @@ print(json.dumps({
             attempts = rows(root / "argus.sqlite3", "publish_attempts")
             self.assertEqual({row["status"] for row in attempts}, {"failed"})
             self.assertEqual({row["error_message"] for row in attempts}, {"Subspace response missing subspace_message_id"})
+
+    def test_missing_post_ack_records_unknown_without_retrying_hot_loop(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+            )
+            calls = []
+            original_post = server_module.post_message_to_subspace
+
+            def unknown_ack(*args):
+                calls.append(args)
+                raise server_module.PublishAckUnknownError("Subspace post_message reply not received after replay")
+
+            server_module.post_message_to_subspace = unknown_ack
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+                server._drain_due_delivery(NOW + timedelta(hours=1), max_entries=100)
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            attempts = rows(root / "argus.sqlite3", "publish_attempts")
+            entries = rows(root / "argus.sqlite3", "delivery_entries")
+            self.assertEqual(len(calls), 2)
+            self.assertEqual([row["status"] for row in attempts], ["unknown", "unknown"])
+            self.assertEqual({row["status"] for row in entries}, {"unknown"})
+            self.assertTrue(all(row["next_retry_at"] is None for row in entries))
+
+    def test_publish_failures_use_jittered_backoff_and_trip_run_circuit_breaker(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+                schedule={"max_live_publishes_per_tick": 10},
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            original_post = server_module.post_message_to_subspace
+            calls = []
+
+            def failing_post(*args):
+                calls.append(args)
+                raise server_module.PublishTransportError("temporary Subspace failure")
+
+            server_module.post_message_to_subspace = failing_post
+            try:
+                snapshot = rows(root / "argus.sqlite3", "runtime_config_snapshots")[-1]
+                target = server._current_publish_target_key()
+                self.assertIsNotNone(target)
+                plan_id = "plan-circuit"
+                run_id = "run-circuit"
+                package_json = lambda package_id: json.dumps(
+                    {
+                        "schema": "swarm.channel.news.report.v0",
+                        "package_id": package_id,
+                        "supplied_embeddings": [{"space_id": "openai:text-embedding-3-small:1536:v1", "vector": [1.0]}],
+                    },
+                    sort_keys=True,
+                )
+                server.connection.execute(
+                    "INSERT OR REPLACE INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (run_id, "manual", "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", "succeeded", str(root / "out" / run_id), snapshot["snapshot_id"], "{}"),
+                )
+                server.connection.execute(
+                    "INSERT INTO delivery_plans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (plan_id, run_id, target, "immediate", "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", 6, 0, "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", "{}"),
+                )
+                for index in range(6):
+                    package_id = "package-circuit-{}".format(index)
+                    key = "key-circuit-{}".format(index)
+                    server.connection.execute(
+                        "INSERT INTO packages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (package_id, "report-circuit-{}".format(index), "1", "openai:text-embedding-3-small:1536:v1", "vector-hash", 1, package_json(package_id), run_id, "2026-04-29T12:00:00Z"),
+                    )
+                    server.connection.execute(
+                        """
+                        INSERT INTO delivery_entries
+                        (entry_id, plan_id, run_id, publish_target_key, package_id, publish_idempotency_key,
+                         selected_order_index, due_at, status, attempt_count, last_attempt_at, next_retry_at,
+                         last_error_class, last_error_message, subspace_message_id, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, NULL, NULL, NULL, NULL, ?)
+                        """,
+                        ("entry-circuit-{}".format(index), plan_id, run_id, target, package_id, key, index, "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z"),
+                    )
+                server.connection.commit()
+
+                result = server._drain_due_delivery(NOW, max_entries=10)
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            self.assertEqual(result["attempted"], server_module.DELIVERY_CIRCUIT_BREAKER_FAILURES_PER_RUN)
+            self.assertEqual(result["circuit_opened"], 1)
+            self.assertEqual(len(calls), server_module.DELIVERY_CIRCUIT_BREAKER_FAILURES_PER_RUN)
+            attempts = rows(root / "argus.sqlite3", "publish_attempts")
+            entries = rows(root / "argus.sqlite3", "delivery_entries")
+            self.assertEqual(len(attempts), server_module.DELIVERY_CIRCUIT_BREAKER_FAILURES_PER_RUN)
+            self.assertEqual({row["status"] for row in attempts}, {"failed"})
+            retry_entries = [row for row in entries if row["status"] == "retry_pending"]
+            self.assertEqual(len(retry_entries), 6)
+            self.assertTrue(any(row["last_error_class"] == "publish_circuit_breaker" for row in retry_entries))
+            first_retry = min(parse for parse in (row["next_retry_at"] for row in retry_entries) if parse)
+            self.assertGreaterEqual(first_retry, "2026-04-29T12:05:00Z")
+
+    def test_per_report_publish_attempt_cap_stops_fourth_send(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+            )
+            calls = []
+            original_post = server_module.post_message_to_subspace
+            server_module.post_message_to_subspace = lambda *args: calls.append(args) or {"ok": True, "results": []}
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                snapshot = rows(root / "argus.sqlite3", "runtime_config_snapshots")[-1]
+                target = server._current_publish_target_key()
+                run_id = "run-cap"
+                package_id = "package-cap"
+                key = "key-cap"
+                payload = {
+                    "schema": "swarm.channel.news.report.v0",
+                    "package_id": package_id,
+                    "supplied_embeddings": [{"space_id": "openai:text-embedding-3-small:1536:v1", "vector": [1.0]}],
+                }
+                server.connection.execute(
+                    "INSERT OR REPLACE INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (run_id, "manual", "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", "succeeded", str(root / "out" / run_id), snapshot["snapshot_id"], "{}"),
+                )
+                server.connection.execute(
+                    "INSERT INTO packages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (package_id, "report-cap", "1", "openai:text-embedding-3-small:1536:v1", "vector-hash", 1, json.dumps(payload), run_id, "2026-04-29T12:00:00Z"),
+                )
+                server.connection.execute(
+                    "INSERT INTO delivery_plans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("plan-cap", run_id, target, "immediate", "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", 1, 0, "2026-04-29T12:00:00Z", "2026-04-29T12:00:00Z", "{}"),
+                )
+                server.connection.execute(
+                    """
+                    INSERT INTO delivery_entries
+                    (entry_id, plan_id, run_id, publish_target_key, package_id, publish_idempotency_key,
+                     selected_order_index, due_at, status, attempt_count, last_attempt_at, next_retry_at,
+                     last_error_class, last_error_message, subspace_message_id, updated_at)
+                    VALUES ('entry-cap', 'plan-cap', ?, ?, ?, ?, 0, '2026-04-29T12:00:00Z', 'retry_pending', 3,
+                            '2026-04-29T12:00:00Z', '2026-04-29T12:00:00Z', NULL, NULL, NULL, '2026-04-29T12:00:00Z')
+                    """,
+                    (run_id, target, package_id, key),
+                )
+                for attempt_number in range(1, server_module.DELIVERY_MAX_ATTEMPTS_PER_REPORT_KEY + 1):
+                    server.connection.execute(
+                        """
+                        INSERT INTO publish_attempts
+                        (attempt_id, package_id, publish_target_key, publish_idempotency_key, effective_publish_snapshot_id,
+                         attempt_number, mode, status, attempted_at, completed_at, subspace_message_id, response_json, error_class, error_message)
+                        VALUES (?, ?, ?, ?, ?, ?, 'live', 'failed', '2026-04-29T12:00:00Z', '2026-04-29T12:00:00Z', NULL, NULL, 'PublishTransportError', 'temporary')
+                        """,
+                        ("attempt-cap-{}".format(attempt_number), package_id, target, key, snapshot["snapshot_id"], attempt_number),
+                    )
+                server.connection.commit()
+
+                result = server._drain_due_delivery(NOW, max_entries=1)
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            self.assertEqual(result["attempted"], 0)
+            self.assertEqual(calls, [])
+            entry = rows(root / "argus.sqlite3", "delivery_entries")[0]
+            self.assertEqual(entry["status"], "permanent_failure")
+            self.assertEqual(entry["last_error_class"], "publish_report_attempt_cap")
 
     def test_spec_named_cli_backend_invokes_embedding_command(self):
         with TemporaryDirectory() as tmpdir:
