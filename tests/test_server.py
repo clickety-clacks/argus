@@ -2314,32 +2314,32 @@ print(json.dumps({
             root = Path(tmpdir)
             path = write_config(root, publish={"mode": "inactive"})
             feed_dir = root / "feeds"
-            (feed_dir / "nasa-a.xml").write_text(
+            (feed_dir / "source-a.xml").write_text(
                 """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
   <channel>
-    <title>NASA A</title>
+    <title>Source A</title>
     <item>
-      <guid>nasa-a-guid</guid>
-      <title>Shared NASA story from A</title>
-      <link>https://science.nasa.gov/shared-story?utm_source=a</link>
+      <guid>source-a-guid</guid>
+      <title>Shared story from A</title>
+      <link>https://publisher.example/shared-story?utm_source=a</link>
       <pubDate>Wed, 29 Apr 2026 10:00:00 +0000</pubDate>
-      <description>NASA A copy.</description>
+      <description>Source A copy.</description>
     </item>
   </channel>
 </rss>"""
             )
-            (feed_dir / "nasa-b.xml").write_text(
+            (feed_dir / "source-b.xml").write_text(
                 """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
   <channel>
-    <title>NASA B</title>
+    <title>Source B</title>
     <item>
-      <guid>nasa-b-guid</guid>
-      <title>Shared NASA story from B</title>
-      <link>https://science.nasa.gov/shared-story?utm_source=b</link>
+      <guid>source-b-guid</guid>
+      <title>Shared story from B</title>
+      <link>https://publisher.example/shared-story?utm_source=b</link>
       <pubDate>Wed, 29 Apr 2026 10:05:00 +0000</pubDate>
-      <description>NASA B copy.</description>
+      <description>Source B copy.</description>
     </item>
   </channel>
 </rss>"""
@@ -2347,22 +2347,22 @@ print(json.dumps({
             config = yaml.safe_load(path.read_text())
             config["sources"] = [
                 {
-                    "id": "nasa-a",
-                    "display_name": "NASA A",
+                    "id": "source-a",
+                    "display_name": "Source A",
                     "source_class": "official",
-                    "feed_url": "https://fixture.invalid/nasa-a.xml",
-                    "site_url": "https://science.nasa.gov/",
+                    "feed_url": "https://fixture.invalid/source-a.xml",
+                    "site_url": "https://publisher.example/",
                     "adapter": "rss",
                     "enabled": True,
                     "freshness_window_hours": 72,
                     "authority_score": 0.75,
                 },
                 {
-                    "id": "nasa-b",
-                    "display_name": "NASA B",
+                    "id": "source-b",
+                    "display_name": "Source B",
                     "source_class": "official",
-                    "feed_url": "https://fixture.invalid/nasa-b.xml",
-                    "site_url": "https://science.nasa.gov/",
+                    "feed_url": "https://fixture.invalid/source-b.xml",
+                    "site_url": "https://publisher.example/",
                     "adapter": "rss",
                     "enabled": True,
                     "freshness_window_hours": 72,
@@ -2378,12 +2378,12 @@ print(json.dumps({
             packages = rows(root / "argus.sqlite3", "packages")
             self.assertEqual(len(packages), 1)
             package = json.loads(packages[0]["package_json"])
-            self.assertEqual(package["body"]["url"], "https://science.nasa.gov/shared-story")
+            self.assertEqual(package["body"]["url"], "https://publisher.example/shared-story")
             self.assertEqual(package["dedupe"]["selected_key_type"], "canonical_url")
             self.assertEqual(package["dedupe"]["selected_key_scope"], "global:canonical_url")
             carried_by = package["provenance"]["carried_by"]
-            self.assertEqual({row["source_id"] for row in carried_by}, {"nasa-a", "nasa-b"})
-            self.assertEqual({row["feed_guid"] for row in carried_by}, {"nasa-a-guid", "nasa-b-guid"})
+            self.assertEqual({row["source_id"] for row in carried_by}, {"source-a", "source-b"})
+            self.assertEqual({row["feed_guid"] for row in carried_by}, {"source-a-guid", "source-b-guid"})
             decisions = rows(root / "argus.sqlite3", "dedupe_decisions")
             duplicate = next(row for row in decisions if row["decision"] == "exact_duplicate")
             self.assertEqual(duplicate["duplicate_key_type"], "canonical_url")
