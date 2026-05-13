@@ -505,6 +505,9 @@ def report_identity_input(feed_entry_id: Optional[str], canonical_url: Optional[
     if canonical_url:
         return "canonical_url", canonical_url
     if feed_entry_id:
+        title_value = normalize_title(title)
+        if title_value:
+            return "feed_entry_id", "{}\n{}\n{}".format(normalize_feed_entry_id(feed_entry_id), title_value, date_bucket(published_at))
         return "feed_entry_id", normalize_feed_entry_id(feed_entry_id)
     if not normalize_title(title):
         return "missing_identity_key", ""
@@ -528,6 +531,9 @@ def dedupe_key(report: Dict[str, Any]) -> Tuple[str, str, str]:
     if report.get("canonical_url"):
         return source_id, "canonical_url", report["canonical_url"]
     if report.get("feed_entry_id"):
+        report_input_value = report.get("report_id_input_value")
+        if report.get("report_id_input_type") == "feed_entry_id" and report_input_value:
+            return source_id, "feed_entry_id", report_input_value
         return source_id, "feed_entry_id", normalize_feed_entry_id(report["feed_entry_id"])
     return source_id, "normalized_title_date", "{}\n{}".format(normalize_title(report["title"]), date_bucket(report.get("published_at") or report.get("fetched_at")))
 
@@ -535,7 +541,11 @@ def dedupe_key(report: Dict[str, Any]) -> Tuple[str, str, str]:
 def persistent_identities_for(report: Dict[str, Any]) -> List[Tuple[str, str]]:
     identities: List[Tuple[str, str]] = []
     if report.get("feed_entry_id"):
-        identities.append(("feed_entry_id", normalize_feed_entry_id(report["feed_entry_id"])))
+        report_input_value = report.get("report_id_input_value")
+        if report.get("report_id_input_type") == "feed_entry_id" and report_input_value:
+            identities.append(("feed_entry_id", report_input_value))
+        else:
+            identities.append(("feed_entry_id", normalize_feed_entry_id(report["feed_entry_id"])))
     if report.get("canonical_url"):
         identities.append(("canonical_url", report["canonical_url"]))
     if normalize_title(report["title"]) and report.get("report_id_input_type") != "missing_identity_key":

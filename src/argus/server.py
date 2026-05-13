@@ -726,6 +726,11 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
         SELECT report_id, source_id, canonical_url
         FROM normalized_reports
         WHERE canonical_url IS NOT NULL AND canonical_url != ''
+          AND EXISTS (
+            SELECT 1
+            FROM packages
+            WHERE packages.report_id = normalized_reports.report_id
+          )
         """
     ).fetchall():
         source_scope = "source:{}".format(row["source_id"])
@@ -917,7 +922,11 @@ def selected_dedupe_key_for_report(report: Dict[str, Any]) -> Tuple[str, str, st
         normalized_key_value = report["canonical_url"]
     elif report.get("feed_entry_id"):
         key_type = "feed_entry_id"
-        normalized_key_value = normalize_feed_entry_id(report["feed_entry_id"])
+        report_input_value = report.get("report_id_input_value")
+        if report.get("report_id_input_type") == "feed_entry_id" and report_input_value:
+            normalized_key_value = report_input_value
+        else:
+            normalized_key_value = normalize_feed_entry_id(report["feed_entry_id"])
     elif not normalize_title(report["title"]):
         key_type = "missing_identity_key"
         normalized_key_value = ""
@@ -2401,6 +2410,28 @@ class ArgusServer:
                 ),
             )
             if candidate.get("canonical_url"):
+                global_key_hash = dedupe_key_hash("global:canonical_url", "canonical_url", candidate["canonical_url"])
+                self.connection.execute(
+                    """
+                    INSERT OR IGNORE INTO dedupe_keys VALUES (?, ?, ?, ?, ?)
+                    """,
+                    ("global:canonical_url", "canonical_url", global_key_hash, candidate["report_id"], candidate["canonical_url"]),
+                )
+                self.connection.execute(
+                    """
+                    UPDATE dedupe_keys
+                    SET report_id = ?
+                    WHERE key_scope = 'global:canonical_url'
+                      AND key_type = 'canonical_url'
+                      AND key_hash = ?
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM packages
+                        WHERE packages.report_id = dedupe_keys.report_id
+                      )
+                    """,
+                    (candidate["report_id"], global_key_hash),
+                )
                 packaged_canonical_report_ids[candidate["canonical_url"]] = candidate["report_id"]
             if publish_allowed:
                 target = str(cycle_snapshot["publish_target_key"])
@@ -3037,11 +3068,11 @@ class ArgusServer:
             )
             if key_type == "missing_identity_key":
                 decision = "missing_identity_key"
+            elif is_cross_source_url_duplicate:
+                decision = "exact_duplicate"
             elif retry_failed_embedding:
                 decision = "seen_existing_report"
                 sqlite_accepted_report_ids.add(report["report_id"])
-            elif is_cross_source_url_duplicate:
-                decision = "exact_duplicate"
             elif existing_key and existing_seen_in_run:
                 decision = "exact_duplicate"
             elif existing_report:
