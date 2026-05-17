@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>T261 shrdlu Source B</title>
+    <link>https://argus.invalid/t261-shrdlu-source-b</link>
+    <description>T261 URL-first cross-source dedupe E2E fixture source B.</description>
+    <item>
+      <guid>t261-source-b-shared-url-guid</guid>
+      <title>T261 shared URL story from source B</title>
+      <link>https://t261.example/news/shared-story?utm_source=source-b</link>
+      <pubDate>Wed, 29 Apr 2026 10:05:00 +0000</pubDate>
+      <description>Source B carries the same canonical URL with a different source-local GUID.</description>
+    </item>
+    <item>
+      <guid>t261-same-guid-different-url</guid>
+      <title>T261 source B same GUID unique URL</title>
+      <link>https://t261-source-b.example/news/source-local-guid-story</link>
+      <pubDate>Wed, 29 Apr 2026 10:15:00 +0000</pubDate>
+      <description>Source B reuses source A's GUID string, but this is a distinct canonical URL.</description>
+    </item>
+  </channel>
+</rss>

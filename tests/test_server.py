@@ -305,6 +305,48 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(summary["counts"]["normalized_entries"], 1)
 
+    def test_checked_in_t261_shrdlu_e2e_config_is_two_source_inactive(self):
+        config = load_runtime_config(Path("config/argus.t261-shrdlu-e2e.example.yaml"))
+        self.assertEqual(config.scheduler.mode, "manual")
+        self.assertEqual(config.scheduler.max_live_publishes_per_tick, 3)
+        self.assertEqual(config.delivery.mode, "tranche")
+        self.assertEqual(config.delivery.min_slot_seconds, 60)
+        self.assertEqual(config.delivery.max_messages_per_plan, 20)
+        self.assertEqual(config.delivery.live_send_concurrency, 1)
+        self.assertEqual(config.source_fetch_concurrency, 1)
+        self.assertEqual(config.publish.mode, "inactive")
+        self.assertEqual(config.publish.subspace_endpoint, "https://subspace.swarm.channel")
+        self.assertEqual(config.publish.subspace_websocket_path, "/api/firehose/stream/websocket")
+        self.assertEqual(config.embedding.backend, "openai")
+        self.assertEqual(config.embedding.provider, "openai")
+        self.assertEqual(config.embedding.model, "text-embedding-3-small")
+        self.assertEqual(config.embedding.dimensions, 1536)
+        self.assertEqual(config.embedding.space_id, "openai:text-embedding-3-small:1536:v1")
+        self.assertEqual(config.fixture_dir, Path("testdata/feeds"))
+        self.assertEqual(len(config.sources), 2)
+        self.assertEqual(
+            {source.fixture_payload_path for source in config.sources},
+            {
+                "testdata/feeds/t261-shrdlu-source-a.rss.xml",
+                "testdata/feeds/t261-shrdlu-source-b.rss.xml",
+            },
+        )
+        self.assertTrue(all(Path(source.fixture_payload_path).exists() for source in config.sources if source.fixture_payload_path))
+        with TemporaryDirectory() as tmpdir:
+            exit_code, summary = run_pipeline_for_sources(
+                config.sources,
+                "config/argus.t261-shrdlu-e2e.example.yaml",
+                Path(tmpdir),
+                NOW,
+                fixture_dir=Path("unused-fixture-dir"),
+                state_path=None,
+                state_read=False,
+                state_write=False,
+                dedupe_in_pipeline=False,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["counts"]["normalized_entries"], 4)
+
     def test_publish_config_rejects_legacy_publish_topology_fields(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -371,6 +413,68 @@ class ServerTests(unittest.TestCase):
             package = json.loads(calls[0]["text"])
             self.assertEqual(package["body"]["title"], "Argus Subetha shrdlu E2E canary")
             self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 1)
+
+    def test_t261_shrdlu_e2e_fixture_proves_url_first_and_guid_source_local(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = yaml.safe_load(Path("config/argus.t261-shrdlu-e2e.example.yaml").read_text())
+            config["runtime"]["database_path"] = str(root / "argus.sqlite3")
+            config["runtime"]["output_dir"] = str(root / "out")
+            config["publish"]["mode"] = "live"
+            path = root / "t261-e2e.yaml"
+            path.write_text(yaml.safe_dump(config))
+            calls = []
+            original_post = server_module.post_message_to_subspace
+            server_module.post_message_to_subspace = fake_subspace_success(calls, "t261-message")
+            server = ArgusServer(path, clock=FakeClock(NOW), register_service=False)
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                exit_code, summary = server.manual_cycle(max_live_publishes=3)
+            finally:
+                os.chdir(original_cwd)
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(summary["counts"]["normalized_entries"], 4)
+            self.assertEqual(summary["counts"]["package_candidates"], 3)
+            self.assertEqual(summary["counts"]["publish_candidates"], 3)
+            package_rows = rows(root / "argus.sqlite3", "packages")
+            self.assertEqual(len(package_rows), 3)
+            packages = [json.loads(row["package_json"]) for row in package_rows]
+            package_by_url = {package["body"]["url"]: package for package in packages}
+            self.assertEqual(
+                set(package_by_url),
+                {
+                    "https://t261.example/news/shared-story",
+                    "https://t261-source-a.example/news/source-local-guid-story",
+                    "https://t261-source-b.example/news/source-local-guid-story",
+                },
+            )
+            shared_package = package_by_url["https://t261.example/news/shared-story"]
+            self.assertEqual(shared_package["dedupe"]["selected_key_type"], "canonical_url")
+            self.assertEqual(shared_package["dedupe"]["selected_key_scope"], "global:canonical_url")
+            self.assertEqual(
+                {(row["source_id"], row["feed_guid"]) for row in shared_package["provenance"]["carried_by"]},
+                {
+                    ("t261-shrdlu-source-a", "t261-source-a-shared-url-guid"),
+                    ("t261-shrdlu-source-b", "t261-source-b-shared-url-guid"),
+                },
+            )
+            for url in [
+                "https://t261-source-a.example/news/source-local-guid-story",
+                "https://t261-source-b.example/news/source-local-guid-story",
+            ]:
+                self.assertEqual(package_by_url[url]["provenance"]["carried_by"][0]["feed_guid"], "t261-same-guid-different-url")
+            duplicate_decisions = [row for row in rows(root / "argus.sqlite3", "dedupe_decisions") if row["decision"] == "exact_duplicate"]
+            self.assertEqual(len(duplicate_decisions), 1)
+            self.assertEqual(duplicate_decisions[0]["duplicate_key_type"], "canonical_url")
+            self.assertEqual(duplicate_decisions[0]["duplicate_key_scope"], "global:canonical_url")
+            self.assertEqual(json.loads(duplicate_decisions[0]["detail_json"])["canonical_url"], "https://t261.example/news/shared-story")
+            self.assertEqual(len(rows(root / "argus.sqlite3", "delivery_entries")), 3)
+            self.assertEqual(len(calls), 1)
+            first_posted = json.loads(calls[0]["text"])
+            self.assertIn(first_posted["body"]["url"], set(package_by_url))
 
     def test_embedding_text_uses_canonical_report_fields(self):
         with TemporaryDirectory() as tmpdir:

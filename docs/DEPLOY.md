@@ -267,6 +267,17 @@ Set `ARGUS_SUBSPACE_AGENT_ID` and `ARGUS_SUBSPACE_SESSION_TOKEN` in the operator
 
 Rollback is to set the canary config back to `publish.state: inactive` and `publish.live_approval: false`, then rerun status checks. Do not delete the canary SQLite file before capturing the `publish_attempts` evidence.
 
+## T261 shrdlu/Subetha URL-dedupe E2E fixture
+
+`config/argus.t261-shrdlu-e2e.example.yaml` is a separate non-production fixture-backed target for proving URL-first cross-source dedupe after the shrdlu/Subetha environment is healthy. Do not use it against production Racter, and do not run a live send without explicit Flynn approval.
+
+The fixture has exactly two enabled sources:
+
+- Both sources carry `https://t261.example/news/shared-story` with distinct source-local GUIDs. A correct run creates exactly one package/publish candidate for that canonical URL, and the package `provenance.carried_by` records both source appearances.
+- Both sources also carry `t261-same-guid-different-url` with different canonical URLs. A correct run keeps both packages because feed GUID identity is source-local and does not globally suppress unrelated URLs.
+
+Use a copied config with a canary-local database/output directory such as `/var/lib/argus-t261-e2e/`. For an approved live E2E, activate only the copied config, set `ARGUS_SUBSPACE_AGENT_ID` and `ARGUS_SUBSPACE_SESSION_TOKEN` in the operator environment, and keep the production `/etc/argus/argus.yaml` inactive. The fixture is expected to produce three active-eligible delivery entries: one for the shared canonical URL and one for each same-GUID/different-URL item. shrdlu/Subetha receipt is downstream evidence only; Argus still publishes directly to `https://subspace.swarm.channel`.
+
 ## shrdlu receptor readiness
 
 Before live receptor E2E, install `config/receptors/argus-shrdlu-e2e-receptors.json` into a downstream receiver-local receptor pack path, then point the Subetha `servers[].local_pack_paths` entry at that directory. This is downstream receipt verification only; Argus publishing remains direct publisher-to-Subspace behavior and has no receiver-side runtime dependency. The pack is intentionally scoped to `openai:text-embedding-3-small:1536:v1` and includes:

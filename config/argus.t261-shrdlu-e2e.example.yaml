@@ -1,0 +1,59 @@
+runtime:
+  database_path: /var/lib/argus-t261-e2e/argus.sqlite3
+  output_dir: /var/lib/argus-t261-e2e
+  fixture_dir: testdata/feeds
+  source_fetch_concurrency: 1
+
+schedule:
+  mode: manual
+  interval: 1h
+  jitter_seconds: 0
+  run_on_startup_if_due: false
+  missed_tick_policy: coalesce_one
+  max_live_publishes_per_tick: 3
+
+publish:
+  mode: inactive
+  subspace_endpoint: https://subspace.swarm.channel
+  subspace_websocket_path: /api/firehose/stream/websocket
+  require_embeddings: true
+  allow_non_embedded_fallback: false
+
+delivery:
+  mode: tranche
+  manual_window: 1h
+  max_retry_delay: 15m
+  live_send_concurrency: 1
+  min_slot: 1m
+  max_messages_per_plan: 20
+
+embedding:
+  backend: openai
+  provider: openai
+  model: text-embedding-3-small
+  dimensions: 1536
+  space_id: openai:text-embedding-3-small:1536:v1
+
+sources:
+  - id: t261-shrdlu-source-a
+    display_name: T261 shrdlu Source A
+    source_class: adapter
+    source_category: adapter
+    feed_url: https://argus.invalid/t261-shrdlu-source-a.xml
+    site_url: https://argus.invalid/t261-shrdlu-source-a
+    adapter: rss
+    enabled: true
+    freshness_window_hours: 87600
+    authority_score: 0.01
+    fixture_payload_path: testdata/feeds/t261-shrdlu-source-a.rss.xml
+  - id: t261-shrdlu-source-b
+    display_name: T261 shrdlu Source B
+    source_class: adapter
+    source_category: adapter
+    feed_url: https://argus.invalid/t261-shrdlu-source-b.xml
+    site_url: https://argus.invalid/t261-shrdlu-source-b
+    adapter: rss
+    enabled: true
+    freshness_window_hours: 87600
+    authority_score: 0.01
+    fixture_payload_path: testdata/feeds/t261-shrdlu-source-b.rss.xml
