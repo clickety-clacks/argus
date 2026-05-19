@@ -25,6 +25,17 @@ delivery:
   min_slot: 1m
   max_messages_per_plan: 20
 
+operator_alerts:
+  enabled: false
+  target: openclaw_alert
+  endpoint:
+  session_key:
+  command: []
+  source: argus
+  dedupe_window: 1h
+  product_degraded_classes:
+    - required_embedding_outage
+
 embedding:
   backend: openai
   provider: openai

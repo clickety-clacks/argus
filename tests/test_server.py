@@ -238,6 +238,14 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(config.delivery.live_send_concurrency, 1)
         self.assertEqual(config.delivery.min_slot_seconds, 60)
         self.assertEqual(config.delivery.max_messages_per_plan, 20)
+        self.assertFalse(config.operator_alerts.enabled)
+        self.assertEqual(config.operator_alerts.target, "openclaw_alert")
+        self.assertIsNone(config.operator_alerts.endpoint)
+        self.assertIsNone(config.operator_alerts.session_key)
+        self.assertEqual(config.operator_alerts.command, ())
+        self.assertEqual(config.operator_alerts.source, "argus")
+        self.assertEqual(config.operator_alerts.dedupe_window_seconds, 3600)
+        self.assertEqual(config.operator_alerts.product_degraded_classes, ("required_embedding_outage",))
         self.assertEqual(config.source_fetch_concurrency, 4)
         self.assertEqual(config.publish.mode, "inactive")
         self.assertTrue(config.publish.require_embeddings)
@@ -1607,8 +1615,213 @@ print(json.dumps({
             self.assertEqual(len(rows(root / "argus.sqlite3", "packages")), 0)
             self.assertEqual(summary["counts"]["package_candidates"], 0)
             self.assertEqual(summary["counts"]["publish_candidates"], 0)
+            self.assertEqual(summary["embedding_delivery_outage"]["dependency_class"], "embedding_backend")
+            self.assertEqual(summary["embedding_delivery_outage"]["affected_accepted_report_count"], 2)
+            self.assertEqual(summary["embedding_delivery_outage"]["notification"]["status"], "not_scheduled_live")
+            self.assertEqual(rows(root / "argus.sqlite3", "runs")[0]["status"], "failed")
             self.assertFalse((run_dir / "digest.json").exists())
             self.assertFalse((run_dir / "digest.md").exists())
+
+    def test_live_embedding_outage_alerts_once_and_resolves_on_recovery(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.invalid",
+                    "require_embeddings": True,
+                },
+                schedule={"max_live_publishes_per_tick": 2},
+            )
+            config = yaml.safe_load(path.read_text())
+            config["operator_alerts"] = {
+                "enabled": True,
+                "target": "openclaw_alert",
+                "endpoint": "http://openclaw.invalid/alert",
+                "session_key": "agent:test:argus",
+                "source": "argus-test",
+                "dedupe_window": "1h",
+                "product_degraded_classes": ["required_embedding_outage"],
+            }
+            path.write_text(yaml.safe_dump(config))
+            alert_calls = []
+            original_embedding = server_module.request_openai_embedding
+            original_alert = server_module.post_openclaw_alert
+            original_post = server_module.post_message_to_subspace
+
+            def failing_embedding(*args, **kwargs):
+                raise server_module.PipelineError("OpenAI embedding request failed: quota exceeded")
+
+            def fake_alert(endpoint, session_key, source, message, timeout_seconds):
+                alert_calls.append(
+                    {
+                        "endpoint": endpoint,
+                        "session_key": session_key,
+                        "source": source,
+                        "message": message,
+                        "timeout_seconds": timeout_seconds,
+                    }
+                )
+                return {"ok": True}
+
+            clock = FakeClock(NOW)
+            server_module.request_openai_embedding = failing_embedding
+            server_module.post_openclaw_alert = fake_alert
+            server_module.post_message_to_subspace = fake_subspace_success([], "embedding-recovered")
+            server = ArgusServer(path, clock=clock)
+            try:
+                first_exit, first_summary = server.tick()
+                clock.advance(3600)
+                second_exit, second_summary = server.tick()
+                server_module.request_openai_embedding = self._fake_openai_embedding
+                clock.advance(3600)
+                recovery_exit, recovery_summary = server.tick()
+            finally:
+                server_module.request_openai_embedding = original_embedding
+                server_module.post_openclaw_alert = original_alert
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            self.assertEqual(first_exit, 1)
+            self.assertEqual(second_exit, 1)
+            self.assertEqual(recovery_exit, 0)
+            self.assertEqual(first_summary["embedding_delivery_outage"]["affected_accepted_report_count"], 2)
+            self.assertEqual(first_summary["embedding_delivery_outage"]["package_candidates"], 0)
+            self.assertEqual(first_summary["embedding_delivery_outage"]["publish_candidates"], 0)
+            self.assertEqual(first_summary["embedding_delivery_outage"]["publish_attempt_counts"]["total"], 0)
+            self.assertEqual(first_summary["embedding_delivery_outage"]["delivered_count"], 0)
+            self.assertEqual(first_summary["embedding_delivery_outage"]["notification"]["status"], "delivered")
+            self.assertEqual(second_summary["embedding_delivery_outage"]["notification"]["status"], "suppressed_active_outage")
+            self.assertEqual(recovery_summary["embedding_delivery_recovery"]["status"], "recovered")
+            self.assertEqual(recovery_summary["embedding_delivery_recovery"]["publish_attempt_counts"]["succeeded"], 1)
+            self.assertEqual(recovery_summary["embedding_delivery_recovery"]["delivered_count"], 1)
+            self.assertEqual(len(alert_calls), 2)
+            self.assertIn("accepted 2 reports but delivered 0 because required embeddings failed", alert_calls[0]["message"])
+            self.assertIn("provider=openai", alert_calls[0]["message"])
+            self.assertIn("model=text-embedding-3-small", alert_calls[0]["message"])
+            self.assertIn("error_class=embed_backend_unavailable", alert_calls[0]["message"])
+            self.assertNotIn("sk-", alert_calls[0]["message"])
+            self.assertIn("embedding delivery recovered", alert_calls[1]["message"])
+            self.assertEqual({call["session_key"] for call in alert_calls}, {"agent:test:argus"})
+            self.assertEqual({call["source"] for call in alert_calls}, {"argus-test"})
+            run_statuses = [row["status"] for row in sorted(rows(root / "argus.sqlite3", "runs"), key=lambda row: row["started_at"])]
+            self.assertEqual(run_statuses, ["failed", "failed", "succeeded"])
+            alert_rows = rows(root / "argus.sqlite3", "product_alerts")
+            self.assertEqual(len(alert_rows), 1)
+            self.assertEqual(alert_rows[0]["status"], "resolved")
+            self.assertEqual(alert_rows[0]["occurrence_count"], 2)
+            self.assertEqual(alert_rows[0]["notification_count"], 2)
+            status = server_module.run_status(root / "argus.sqlite3")
+            self.assertEqual(status["product_health"]["status"], "ok")
+            self.assertEqual(status["counts"]["active_product_alerts"], 0)
+            self.assertEqual(status["product_health"]["latest_embedding_delivery_outage"]["recovery"]["status"], "recovered")
+
+    def test_embedding_outage_recovery_resolves_only_current_backend_key(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.invalid",
+                    "require_embeddings": True,
+                },
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                current_outage = {
+                    "provider": "openai",
+                    "model": "text-embedding-3-small",
+                    "space_id": "openai:text-embedding-3-small:1536:v1",
+                    "effective_publish_mode": "live",
+                    "notification": {"emitted": True},
+                }
+                other_outage = {
+                    "provider": "openai",
+                    "model": "other-embedding-model",
+                    "space_id": "openai:other-embedding-model:1536:v1",
+                    "effective_publish_mode": "live",
+                    "notification": {"emitted": True},
+                }
+                for outage in [current_outage, other_outage]:
+                    alert_key = server._embedding_outage_alert_key(outage)
+                    server.connection.execute(
+                        "INSERT INTO product_alerts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            alert_key,
+                            "required_embedding_outage",
+                            "active",
+                            server_module.iso_z(NOW),
+                            server_module.iso_z(NOW),
+                            server_module.iso_z(NOW),
+                            None,
+                            1,
+                            1,
+                            json.dumps({**outage, "alert_key": alert_key}, sort_keys=True),
+                        ),
+                    )
+                recovery = server._resolve_embedding_outage_alerts(
+                    NOW + timedelta(hours=1),
+                    "run-recovered",
+                    "scheduled",
+                    {
+                        "effective_mode": "live",
+                    },
+                    server.config.embedding,
+                    accepted_report_count=1,
+                    package_count=1,
+                    publish_count=1,
+                    publish_attempt_counts={"succeeded": 1, "total": 1, "failure_or_unknown": 0},
+                )
+                server.connection.commit()
+                self.assertEqual(recovery["resolved_alert_count"], 1)
+                alert_rows = sorted(rows(root / "argus.sqlite3", "product_alerts"), key=lambda row: row["detail_json"])
+                self.assertEqual([row["status"] for row in alert_rows].count("resolved"), 1)
+                self.assertEqual([row["status"] for row in alert_rows].count("active"), 1)
+                active_detail = json.loads(next(row["detail_json"] for row in alert_rows if row["status"] == "active"))
+                self.assertEqual(active_detail["model"], "other-embedding-model")
+            finally:
+                server.close()
+
+    def test_live_embedding_outage_fails_without_alert_target(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.invalid",
+                    "require_embeddings": True,
+                },
+                schedule={"max_live_publishes_per_tick": 2},
+            )
+            original_embedding = server_module.request_openai_embedding
+            original_alert = server_module.post_openclaw_alert
+            alert_calls = []
+
+            def failing_embedding(*args, **kwargs):
+                raise server_module.PipelineError("OpenAI embedding request failed: authentication failed")
+
+            def fake_alert(*args, **kwargs):
+                alert_calls.append((args, kwargs))
+                return {"ok": True}
+
+            server_module.request_openai_embedding = failing_embedding
+            server_module.post_openclaw_alert = fake_alert
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                exit_code, summary = server.tick()
+            finally:
+                server_module.request_openai_embedding = original_embedding
+                server_module.post_openclaw_alert = original_alert
+                server.close()
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(summary["exit_status"], "failed_required_embedding")
+            self.assertEqual(summary["embedding_delivery_outage"]["notification"]["status"], "disabled")
+            self.assertEqual(rows(root / "argus.sqlite3", "runs")[0]["status"], "failed")
+            self.assertEqual(alert_calls, [])
+            status = server_module.run_status(root / "argus.sqlite3")
+            self.assertEqual(status["product_health"]["status"], "degraded")
 
     def test_embedding_failure_retries_on_later_cycle(self):
         with TemporaryDirectory() as tmpdir:

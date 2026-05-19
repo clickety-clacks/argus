@@ -31,6 +31,10 @@ API_ADAPTERS = {"api", "arxiv_atom"}
 DEFAULT_SUBSPACE_WEBSOCKET_PATH = "/api/firehose/stream/websocket"
 DEFAULT_SUBSPACE_AGENT_ID_ENV = "ARGUS_SUBSPACE_AGENT_ID"
 DEFAULT_SUBSPACE_SESSION_TOKEN_ENV = "ARGUS_SUBSPACE_SESSION_TOKEN"
+DEFAULT_OPERATOR_ALERT_TARGET = "openclaw_alert"
+OPERATOR_ALERT_TARGETS = {"openclaw_alert", "command"}
+DEFAULT_OPERATOR_ALERT_SOURCE = "argus"
+DEFAULT_OPERATOR_ALERT_CLASSES = ("required_embedding_outage",)
 LEGACY_DAEMON_PUBLISH_KEYS = {"subspace_daemon_socket", "daemon_socket_path", "subspace_daemon_api_path", "daemon_api_path"}
 OPENAI_EMBEDDING_PROVIDER = "openai"
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
@@ -76,6 +80,19 @@ class DeliveryConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class OperatorAlertsConfig:
+    enabled: bool = False
+    target: str = DEFAULT_OPERATOR_ALERT_TARGET
+    endpoint: Optional[str] = None
+    session_key: Optional[str] = None
+    command: Tuple[str, ...] = ()
+    source: str = DEFAULT_OPERATOR_ALERT_SOURCE
+    dedupe_window_seconds: int = DEFAULT_INTERVAL_SECONDS
+    product_degraded_classes: Tuple[str, ...] = DEFAULT_OPERATOR_ALERT_CLASSES
+    timeout_seconds: float = 5.0
+
+
+@dataclasses.dataclass(frozen=True)
 class EmbeddingConfig:
     backend: Optional[str] = None
     command: Optional[str] = None
@@ -93,6 +110,7 @@ class RuntimeConfig:
     scheduler: SchedulerConfig
     publish: PublishConfig
     delivery: DeliveryConfig
+    operator_alerts: OperatorAlertsConfig
     embedding: EmbeddingConfig
     source_fetch_concurrency: int = 4
     fixture_dir: Optional[Path] = None
@@ -179,6 +197,19 @@ def parse_duration_seconds(value: Any) -> int:
 def config_hash(payload: Any) -> str:
     encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def parse_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise PipelineError("Invalid boolean value: {}".format(value))
 
 
 def event_id(prefix: str, observed_at: datetime, detail: str) -> str:
@@ -280,6 +311,37 @@ def publish_config_from_payload(payload: Dict[str, Any]) -> PublishConfig:
     )
 
 
+def operator_alerts_config_from_payload(payload: Dict[str, Any]) -> OperatorAlertsConfig:
+    if not isinstance(payload, dict):
+        raise PipelineError("Invalid operator_alerts config")
+    endpoint = payload.get("endpoint") or payload.get("address") or os.environ.get("ARGUS_OPERATOR_ALERT_ENDPOINT")
+    session_key = payload.get("session_key") or os.environ.get("ARGUS_OPERATOR_ALERT_SESSION_KEY")
+    classes_payload = payload.get("product_degraded_classes", DEFAULT_OPERATOR_ALERT_CLASSES)
+    if isinstance(classes_payload, str):
+        product_degraded_classes = (classes_payload,)
+    else:
+        product_degraded_classes = tuple(str(value) for value in classes_payload)
+    target = str(payload.get("target") or DEFAULT_OPERATOR_ALERT_TARGET)
+    if target not in OPERATOR_ALERT_TARGETS:
+        raise PipelineError("Unsupported operator_alerts.target: {}".format(target))
+    command_payload = payload.get("command") or ()
+    if isinstance(command_payload, str):
+        command = (command_payload,)
+    else:
+        command = tuple(str(value) for value in command_payload)
+    return OperatorAlertsConfig(
+        enabled=parse_bool(payload.get("enabled"), default=False),
+        target=target,
+        endpoint=(str(endpoint) if endpoint else None),
+        session_key=(str(session_key) if session_key else None),
+        command=command,
+        source=str(payload.get("source") or os.environ.get("ARGUS_OPERATOR_ALERT_SOURCE") or DEFAULT_OPERATOR_ALERT_SOURCE),
+        dedupe_window_seconds=parse_duration_seconds(payload.get("dedupe_window", DEFAULT_INTERVAL_SECONDS)),
+        product_degraded_classes=product_degraded_classes,
+        timeout_seconds=float(payload.get("timeout_seconds", 5.0)),
+    )
+
+
 def source_from_runtime(row: Dict[str, Any]) -> SourceConfig:
     source_id = str(row["id"])
     if not SOURCE_ID_RE.match(source_id):
@@ -366,8 +428,10 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
     if not any(source.enabled for source in sources):
         raise PipelineError("at least one enabled source is required")
     publish_payload = payload.get("publish") or {}
+    operator_alerts_payload = payload.get("operator_alerts") or {}
     embedding_payload = payload.get("embedding") or {}
     publish = publish_config_from_payload(publish_payload)
+    operator_alerts = operator_alerts_config_from_payload(operator_alerts_payload)
     if publish.mode not in {"inactive", "dry_run", "live"}:
         raise PipelineError("Invalid publish.mode: {}".format(publish.mode))
     embedding = EmbeddingConfig(
@@ -387,6 +451,7 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
         scheduler=validate_scheduler(payload.get("schedule") or {}),
         publish=publish,
         delivery=validate_delivery(payload.get("delivery") or {}),
+        operator_alerts=operator_alerts,
         embedding=embedding,
         source_fetch_concurrency=source_fetch_concurrency,
         fixture_dir=(Path(runtime["fixture_dir"]) if runtime.get("fixture_dir") else None),
@@ -524,6 +589,18 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
           reason_code TEXT NOT NULL,
           detail_json TEXT NOT NULL,
           created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS product_alerts (
+          alert_key TEXT PRIMARY KEY,
+          alert_type TEXT NOT NULL,
+          status TEXT NOT NULL,
+          first_observed_at TEXT NOT NULL,
+          last_observed_at TEXT NOT NULL,
+          last_alert_at TEXT,
+          resolved_at TEXT,
+          occurrence_count INTEGER NOT NULL,
+          notification_count INTEGER NOT NULL,
+          detail_json TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS source_health (
           source_id TEXT PRIMARY KEY,
@@ -972,6 +1049,50 @@ def openai_api_key() -> Optional[str]:
 
 def sanitize_openai_error_message(message: str) -> str:
     return re.sub(r"sk-[A-Za-z0-9_.*-]+", "[redacted-openai-key]", message)
+
+
+def truncate_alert_message(message: Optional[str], limit: int = 240) -> Optional[str]:
+    if message is None:
+        return None
+    text = sanitize_openai_error_message(str(message)).replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def post_openclaw_alert(endpoint: str, session_key: str, source: str, message: str, timeout_seconds: float) -> Dict[str, Any]:
+    response = requests.post(
+        endpoint,
+        json={"message": message, "source": source, "sessionKey": session_key},
+        timeout=timeout_seconds,
+    )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {"text": response.text[:500]}
+    if response.status_code < 200 or response.status_code >= 300 or not (isinstance(payload, dict) and payload.get("ok") is True):
+        raise PipelineError("alert delivery failed: status={} response={}".format(response.status_code, truncate_alert_message(json.dumps(payload, sort_keys=True))))
+    return payload
+
+
+def run_operator_alert_command(command: Tuple[str, ...], source: str, message: str, timeout_seconds: float) -> Dict[str, Any]:
+    env = {
+        **os.environ,
+        "ARGUS_OPERATOR_ALERT_SOURCE": source,
+        "ARGUS_OPERATOR_ALERT_MESSAGE": message,
+    }
+    completed = subprocess.run(
+        list(command),
+        input=message + "\n",
+        text=True,
+        capture_output=True,
+        timeout=timeout_seconds,
+        env=env,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise PipelineError("alert command failed: status={} output={}".format(completed.returncode, truncate_alert_message(detail)))
+    return {"ok": True}
 
 
 def request_openai_embedding(text: str, model: str, dimensions: int, api_key: str) -> Dict[str, Any]:
@@ -1723,10 +1844,43 @@ class ArgusServer:
                 self._write_decision_artifacts(run_id, output_dir)
                 (output_dir / "package-candidates.jsonl").write_text("".join(json.dumps(row) + "\n" for row in package_payloads))
                 (output_dir / "publish-candidates.jsonl").write_text("".join(json.dumps(row) + "\n" for row in package_payloads))
+                publish_attempt_counts = self._run_publish_attempt_counts(run_id)
                 summary["counts"]["package_candidates"] = len(package_payloads)
                 summary["counts"]["publish_candidates"] = len(package_payloads)
-                summary["counts"]["embedding_failures"] = len(json.loads((output_dir / "embedding-failures.json").read_text()))
+                summary["counts"]["publish_attempts"] = publish_attempt_counts
+                embedding_failures = json.loads((output_dir / "embedding-failures.json").read_text())
+                summary["counts"]["embedding_failures"] = len(embedding_failures)
                 summary["artifact_paths"]["embedding_failures"] = "embedding-failures.json"
+                embedding_outage = self._required_embedding_outage_detail(
+                    run_id,
+                    run_kind,
+                    now,
+                    cycle_snapshot,
+                    cycle_embedding,
+                    len(accepted_candidate_rows),
+                    len(package_payloads),
+                    len(package_payloads),
+                    publish_attempt_counts,
+                    embedding_failures,
+                )
+                if embedding_outage:
+                    summary["embedding_delivery_outage"] = self._record_embedding_outage_alert(now, embedding_outage)
+                    summary["exit_status"] = "failed_required_embedding"
+                    exit_code = 1
+                else:
+                    recovery = self._resolve_embedding_outage_alerts(
+                        now,
+                        run_id,
+                        run_kind,
+                        cycle_snapshot,
+                        cycle_embedding,
+                        len(accepted_candidate_rows),
+                        len(package_payloads),
+                        len(package_payloads),
+                        publish_attempt_counts,
+                    )
+                    if recovery:
+                        summary["embedding_delivery_recovery"] = recovery
                 self._store_run(run_id, run_kind, now, exit_code, output_dir, cycle_snapshot, summary, commit=False)
                 (output_dir / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
                 self.connection.commit()
@@ -2183,6 +2337,252 @@ class ArgusServer:
             ),
         )
         return failure
+
+    def _required_embedding_outage_detail(
+        self,
+        run_id: str,
+        run_kind: str,
+        now: datetime,
+        cycle_snapshot: Dict[str, Any],
+        cycle_embedding: EmbeddingConfig,
+        accepted_report_count: int,
+        package_count: int,
+        publish_count: int,
+        publish_attempt_counts: Dict[str, int],
+        embedding_failures: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if (
+            not embedding_failures
+            or not cycle_snapshot["require_embeddings"]
+            or cycle_snapshot["allow_non_embedded_fallback"]
+            or accepted_report_count <= 0
+        ):
+            return None
+        failure_classes: Dict[str, int] = {}
+        for failure in embedding_failures:
+            failure_class = str(failure.get("class") or "unknown")
+            failure_classes[failure_class] = failure_classes.get(failure_class, 0) + 1
+        first_failure = embedding_failures[0]
+        return {
+            "status": "failed",
+            "dependency_class": "embedding_backend",
+            "reason": "required_embedding_failed",
+            "run_id": run_id,
+            "run_kind": run_kind,
+            "observed_at": iso_z(now),
+            "effective_publish_mode": cycle_snapshot.get("effective_mode"),
+            "accepted_report_count": accepted_report_count,
+            "affected_accepted_report_count": len(embedding_failures),
+            "package_candidates": package_count,
+            "publish_candidates": publish_count,
+            "publish_attempt_counts": publish_attempt_counts,
+            "delivered_count": publish_attempt_counts.get("succeeded", 0),
+            "provider": cycle_embedding.provider,
+            "model": cycle_embedding.model,
+            "space_id": cycle_embedding.space_id,
+            "account": "OPENAI_API_KEY" if cycle_embedding.backend == "openai" else cycle_embedding.backend,
+            "failure_classes": failure_classes,
+            "last_error_class": first_failure.get("class"),
+            "last_error_message": truncate_alert_message(first_failure.get("message")),
+        }
+
+    def _embedding_outage_alert_key(self, outage: Dict[str, Any]) -> str:
+        basis = json.dumps(
+            {
+                "type": "required_embedding_outage",
+                "provider": outage.get("provider"),
+                "model": outage.get("model"),
+                "space_id": outage.get("space_id"),
+                "effective_publish_mode": outage.get("effective_publish_mode"),
+            },
+            sort_keys=True,
+        )
+        return "required_embedding_outage:{}".format(hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24])
+
+    def _embedding_outage_alert_text(self, outage: Dict[str, Any]) -> str:
+        return (
+            "Argus delivery blocked: accepted {accepted} reports but delivered {published} because required embeddings failed "
+            "(provider={provider}, model={model}, account={account}, error_class={error_class})."
+        ).format(
+            accepted=outage["affected_accepted_report_count"],
+            published=outage.get("delivered_count", outage["publish_candidates"]),
+            provider=outage.get("provider") or "unknown",
+            model=outage.get("model") or "unknown",
+            account=outage.get("account") or "unknown",
+            error_class=outage.get("last_error_class") or "unknown",
+        )
+
+    def _send_alert(self, message: str) -> Dict[str, Any]:
+        alert_config = self.config.operator_alerts
+        if not alert_config.enabled:
+            return {"enabled": False, "emitted": False, "status": "disabled"}
+        try:
+            if alert_config.target == "openclaw_alert":
+                if not alert_config.endpoint:
+                    return {"enabled": True, "emitted": False, "status": "missing_endpoint", "target": alert_config.target}
+                if not alert_config.session_key:
+                    return {"enabled": True, "emitted": False, "status": "missing_session_key", "target": alert_config.target}
+                post_openclaw_alert(
+                    alert_config.endpoint,
+                    alert_config.session_key,
+                    alert_config.source,
+                    message,
+                    alert_config.timeout_seconds,
+                )
+            elif alert_config.target == "command":
+                if not alert_config.command:
+                    return {"enabled": True, "emitted": False, "status": "missing_command", "target": alert_config.target}
+                run_operator_alert_command(alert_config.command, alert_config.source, message, alert_config.timeout_seconds)
+            else:
+                return {"enabled": True, "emitted": False, "status": "unsupported_target", "target": alert_config.target}
+        except Exception as exc:
+            return {"enabled": True, "emitted": False, "status": "failed", "target": alert_config.target, "error": truncate_alert_message(str(exc))}
+        return {"enabled": True, "emitted": True, "status": "delivered", "target": alert_config.target}
+
+    def _record_embedding_outage_alert(self, now: datetime, outage: Dict[str, Any]) -> Dict[str, Any]:
+        alert_key = self._embedding_outage_alert_key(outage)
+        row = self.connection.execute("SELECT * FROM product_alerts WHERE alert_key = ?", (alert_key,)).fetchone()
+        continuing_outage = bool(row and row["status"] == "active")
+        previous_detail = json.loads(row["detail_json"]) if continuing_outage else {}
+        previous_last_alert_at = parse_now(row["last_alert_at"]) if row and row["last_alert_at"] else None
+        notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "not_scheduled_live"}
+        alert_class = "required_embedding_outage"
+        eligible_for_notification = (
+            outage.get("run_kind") == "scheduled"
+            and outage.get("effective_publish_mode") == "live"
+            and alert_class in self.config.operator_alerts.product_degraded_classes
+        )
+        if alert_class not in self.config.operator_alerts.product_degraded_classes:
+            notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "class_not_configured"}
+        if eligible_for_notification:
+            if (
+                row
+                and row["status"] == "active"
+                and int(row["notification_count"]) > 0
+            ):
+                notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "suppressed_active_outage"}
+            elif (
+                row
+                and row["status"] == "active"
+                and previous_last_alert_at is not None
+                and (now - previous_last_alert_at).total_seconds() < self.config.operator_alerts.dedupe_window_seconds
+            ):
+                notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "suppressed_active_outage"}
+            else:
+                notification = self._send_alert(self._embedding_outage_alert_text(outage))
+        first_observed_at = row["first_observed_at"] if continuing_outage else iso_z(now)
+        occurrence_count = (int(row["occurrence_count"]) if continuing_outage else 0) + 1
+        notification_count = (int(row["notification_count"]) if continuing_outage else 0) + (1 if notification.get("emitted") else 0)
+        last_alert_at = iso_z(now) if notification.get("emitted") else (row["last_alert_at"] if continuing_outage else None)
+        detail = {**outage, "alert_key": alert_key, "notification": notification}
+        self.connection.execute(
+            """
+            INSERT INTO product_alerts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(alert_key) DO UPDATE SET
+              status=excluded.status,
+              last_observed_at=excluded.last_observed_at,
+              last_alert_at=COALESCE(excluded.last_alert_at, product_alerts.last_alert_at),
+              resolved_at=NULL,
+              occurrence_count=excluded.occurrence_count,
+              notification_count=excluded.notification_count,
+              detail_json=excluded.detail_json
+            """,
+            (
+                alert_key,
+                "required_embedding_outage",
+                "active",
+                first_observed_at,
+                iso_z(now),
+                last_alert_at,
+                None,
+                occurrence_count,
+                notification_count,
+                json.dumps({**previous_detail, **detail}, sort_keys=True),
+            ),
+        )
+        return detail
+
+    def _resolve_embedding_outage_alerts(
+        self,
+        now: datetime,
+        run_id: str,
+        run_kind: str,
+        cycle_snapshot: Dict[str, Any],
+        cycle_embedding: EmbeddingConfig,
+        accepted_report_count: int,
+        package_count: int,
+        publish_count: int,
+        publish_attempt_counts: Dict[str, int],
+    ) -> Optional[Dict[str, Any]]:
+        if accepted_report_count <= 0 or package_count <= 0:
+            return None
+        if cycle_snapshot.get("effective_mode") == "live" and publish_attempt_counts.get("succeeded", 0) <= 0:
+            return None
+        alert_key = self._embedding_outage_alert_key(
+            {
+                "provider": cycle_embedding.provider,
+                "model": cycle_embedding.model,
+                "space_id": cycle_embedding.space_id,
+                "effective_publish_mode": cycle_snapshot.get("effective_mode"),
+            }
+        )
+        matching_rows = self.connection.execute(
+            "SELECT * FROM product_alerts WHERE alert_key = ? AND alert_type = 'required_embedding_outage' AND status = 'active'",
+            (alert_key,),
+        ).fetchall()
+        rows = [
+            row
+            for row in matching_rows
+            if json.loads(row["detail_json"]).get("effective_publish_mode") == cycle_snapshot.get("effective_mode")
+        ]
+        if not rows:
+            return None
+        recovery = {
+            "status": "recovered",
+            "dependency_class": "embedding_backend",
+            "reason": "required_embeddings_available",
+            "run_id": run_id,
+            "run_kind": run_kind,
+            "observed_at": iso_z(now),
+            "accepted_report_count": accepted_report_count,
+            "package_candidates": package_count,
+            "publish_candidates": publish_count,
+            "publish_attempt_counts": publish_attempt_counts,
+            "delivered_count": publish_attempt_counts.get("succeeded", 0),
+            "provider": cycle_embedding.provider,
+            "model": cycle_embedding.model,
+            "space_id": cycle_embedding.space_id,
+        }
+        notification = self._send_alert(
+            "Argus embedding delivery recovered: accepted {accepted} reports and produced {packages} packages "
+            "(provider={provider}, model={model}).".format(
+                accepted=accepted_report_count,
+                packages=package_count,
+                provider=cycle_embedding.provider or "unknown",
+                model=cycle_embedding.model or "unknown",
+            )
+        )
+        for row in rows:
+            detail = {**json.loads(row["detail_json"]), "recovery": recovery, "recovery_notification": notification}
+            self.connection.execute(
+                """
+                UPDATE product_alerts
+                SET status = 'resolved',
+                    last_observed_at = ?,
+                    resolved_at = ?,
+                    notification_count = ?,
+                    detail_json = ?
+                WHERE alert_key = ?
+                """,
+                (
+                    iso_z(now),
+                    iso_z(now),
+                    int(row["notification_count"]) + (1 if notification.get("emitted") else 0),
+                    json.dumps(detail, sort_keys=True),
+                    row["alert_key"],
+                ),
+            )
+        return {**recovery, "resolved_alert_count": len(rows), "notification": notification}
 
     def _carried_by_for_candidate(self, run_id: str, candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
         carriers = [carrier_provenance_for_candidate(candidate)]
@@ -3389,6 +3789,15 @@ def run_status(db_path: Path) -> Dict[str, Any]:
             for row in connection.execute("SELECT reason_code, COUNT(*) AS count FROM skipped_items GROUP BY reason_code")
         }
         embedding_failure_count = connection.execute("SELECT COUNT(*) FROM embeddings WHERE status = 'failed'").fetchone()[0]
+        active_alert_rows = [
+            {**dict(row), "detail": json.loads(row["detail_json"])}
+            for row in connection.execute(
+                "SELECT * FROM product_alerts WHERE status = 'active' ORDER BY last_observed_at DESC, alert_key"
+            )
+        ]
+        latest_embedding_alert_row = connection.execute(
+            "SELECT * FROM product_alerts WHERE alert_type = 'required_embedding_outage' ORDER BY last_observed_at DESC, alert_key LIMIT 1"
+        ).fetchone()
         last_summary = json.loads(run_row["summary_json"]) if run_row and run_row["summary_json"] else None
         return {
             "publish": snapshot,
@@ -3405,12 +3814,22 @@ def run_status(db_path: Path) -> Dict[str, Any]:
                 "last_delivery_error": dict(last_delivery_error_row) if last_delivery_error_row else None,
             },
             "last_run": ({**dict(run_row), "summary": last_summary} if run_row else None),
+            "product_health": {
+                "status": "degraded" if active_alert_rows else "ok",
+                "active_alerts": active_alert_rows,
+                "latest_embedding_delivery_outage": (
+                    json.loads(latest_embedding_alert_row["detail_json"]) if latest_embedding_alert_row else None
+                ),
+                "last_run_embedding_delivery_outage": (last_summary or {}).get("embedding_delivery_outage") if last_summary else None,
+                "last_run_embedding_delivery_recovery": (last_summary or {}).get("embedding_delivery_recovery") if last_summary else None,
+            },
             "counts": {
                 "packages": package_count,
                 "delivery_entries_by_status": all_delivery_counts,
                 "publish_attempts_by_status": publish_counts,
                 "skipped_items_by_reason": skipped_counts,
                 "embedding_failures": embedding_failure_count,
+                "active_product_alerts": len(active_alert_rows),
             },
             "prime": dict(prime_row) if prime_row else None,
             "last_runtime_event": dict(runtime_event_row) if runtime_event_row else None,

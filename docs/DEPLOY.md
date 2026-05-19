@@ -47,6 +47,39 @@ embedding:
 
 The host must provide `OPENAI_API_KEY` through the operator environment or host secret mechanism; do not put the token in YAML or logs. Default config keeps `publish.state: inactive`, `publish.live_approval: false`, and `schedule.max_live_publishes_per_tick: 1`; inactive plus no live approval is the primary safety boundary, and the scheduled publish cap is the first-activation rate boundary.
 
+Required embedding failures are product-delivery failures, not green source-fetch runs. Argus exposes operator alerts as a generic config surface. Defaults are conservative: if `operator_alerts.enabled` is false or the target is incomplete, the run still fails and records product-health evidence, but no outbound alert is sent.
+
+```yaml
+operator_alerts:
+  enabled: false
+  target: openclaw_alert
+  endpoint:
+  session_key:
+  command: []
+  source: argus
+  dedupe_window: 1h
+  product_degraded_classes:
+    - required_embedding_outage
+```
+
+Supported targets are `openclaw_alert`, which posts JSON to an OpenClaw-compatible `/alert` endpoint, and `command`, which runs the configured argv list with the alert text on stdin and in `ARGUS_OPERATOR_ALERT_MESSAGE`.
+
+For the Racter production GDM route, apply this stanza only after operator approval:
+
+```yaml
+operator_alerts:
+  enabled: true
+  target: openclaw_alert
+  endpoint: http://tars.tail4105e8.ts.net:18800/alert
+  session_key: agent:main:main
+  source: argus
+  dedupe_window: 1h
+  product_degraded_classes:
+    - required_embedding_outage
+```
+
+When a scheduled live run accepts reports but required embeddings fail, Argus records `runs.status=failed`, writes `embedding_delivery_outage` in `run-summary.json`, exposes the same evidence under `argus status` `product_health`, and emits one deduped operator alert per continuing outage key when configured. A later run that accepts reports and packages them with required embeddings resolves the local alert row and emits one recovery alert if the target is configured.
+
 ## Runtime commands
 
 Start the long-running process manually for readiness checks:
