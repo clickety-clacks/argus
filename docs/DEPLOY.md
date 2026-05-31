@@ -60,9 +60,12 @@ operator_alerts:
   dedupe_window: 1h
   product_degraded_classes:
     - required_embedding_outage
+    - hard_failure
 ```
 
 Supported targets are `openclaw_alert`, which posts JSON to an OpenClaw-compatible `/alert` endpoint, and `command`, which runs the configured argv list with the alert text on stdin and in `ARGUS_OPERATOR_ALERT_MESSAGE`.
+
+Argus records transient hard failures locally without paging. It sends operator alerts only when a hard-failure stream repeats without recovery; the default repetition threshold is two observations, and the dedupe window suppresses repeat pages for the same continuing stream.
 
 For the Racter production GDM route, apply this stanza only after operator approval:
 
@@ -76,9 +79,10 @@ operator_alerts:
   dedupe_window: 1h
   product_degraded_classes:
     - required_embedding_outage
+    - hard_failure
 ```
 
-When a scheduled live run accepts reports but required embeddings fail, Argus records `runs.status=failed`, writes `embedding_delivery_outage` in `run-summary.json`, exposes the same evidence under `argus status` `product_health`, and emits one deduped operator alert per continuing outage key when configured. A later run that accepts reports and packages them with required embeddings resolves the local alert row and emits one recovery alert if the target is configured.
+When a scheduled live run accepts reports but required embeddings fail, Argus records `runs.status=failed`, writes `embedding_delivery_outage` in `run-summary.json`, exposes the same evidence under `argus status` `product_health`, and emits a deduped operator alert only if the outage repeats without recovery. A later run that accepts reports and packages them with required embeddings resolves the local alert row and emits one recovery alert if the target is configured and the outage had paged.
 
 ## Runtime commands
 

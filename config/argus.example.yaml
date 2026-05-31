@@ -35,6 +35,7 @@ operator_alerts:
   dedupe_window: 1h
   product_degraded_classes:
     - required_embedding_outage
+    - hard_failure
 
 embedding:
   backend: openai

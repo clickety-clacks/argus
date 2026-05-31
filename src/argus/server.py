@@ -34,7 +34,8 @@ DEFAULT_SUBSPACE_SESSION_TOKEN_ENV = "ARGUS_SUBSPACE_SESSION_TOKEN"
 DEFAULT_OPERATOR_ALERT_TARGET = "openclaw_alert"
 OPERATOR_ALERT_TARGETS = {"openclaw_alert", "command"}
 DEFAULT_OPERATOR_ALERT_SOURCE = "argus"
-DEFAULT_OPERATOR_ALERT_CLASSES = ("required_embedding_outage",)
+DEFAULT_OPERATOR_ALERT_CLASSES = ("required_embedding_outage", "hard_failure")
+DEFAULT_HARD_FAILURE_ALERT_MIN_OCCURRENCES = 2
 LEGACY_DAEMON_PUBLISH_KEYS = {"subspace_daemon_socket", "daemon_socket_path", "subspace_daemon_api_path", "daemon_api_path"}
 OPENAI_EMBEDDING_PROVIDER = "openai"
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
@@ -1096,20 +1097,27 @@ def run_operator_alert_command(command: Tuple[str, ...], source: str, message: s
 
 
 def request_openai_embedding(text: str, model: str, dimensions: int, api_key: str) -> Dict[str, Any]:
-    response = requests.post(
-        "https://api.openai.com/v1/embeddings",
-        headers={
-            "Authorization": "Bearer {}".format(api_key),
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "input": text,
-            "dimensions": dimensions,
-            "encoding_format": "float",
-        },
-        timeout=30,
-    )
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/embeddings",
+            headers={
+                "Authorization": "Bearer {}".format(api_key),
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "input": text,
+                "dimensions": dimensions,
+                "encoding_format": "float",
+            },
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise PipelineError(
+            "OpenAI embedding request failed: {}".format(
+                sanitize_openai_error_message("{}: {}".format(exc.__class__.__name__, exc))
+            )
+        ) from exc
     try:
         payload = response.json()
     except ValueError:
@@ -1374,6 +1382,7 @@ class ArgusServer:
         self.running = False
         self.reload_requested = False
         self._cycle_running = False
+        self._tick_exception_alerted = False
         self._persisted_activation_observed_at: Optional[str] = None
         if self.register_service:
             self.start()
@@ -1658,7 +1667,33 @@ class ArgusServer:
         self.running = True
         signal.signal(signal.SIGHUP, self.request_reload)
         while self.running:
-            result = self.tick()
+            self._tick_exception_alerted = False
+            try:
+                result = self.tick()
+            except Exception as exc:
+                now = self.clock.now()
+                detail = {
+                    "dependency_class": "producer_loop",
+                    "reason": "tick_exception_contained",
+                    "error_class": exc.__class__.__name__,
+                    "error_message": truncate_alert_message(str(exc)),
+                }
+                self._record_scheduler_event("producer_loop_exception", None, "failed", detail, now)
+                if not self._tick_exception_alerted:
+                    self._record_hard_failure_alert(
+                        now,
+                        "producer_loop_exception",
+                        detail,
+                        "Argus repeated hard failure: producer loop exception repeated without recovery "
+                        "(error_class={}).".format(detail["error_class"]),
+                    )
+                self.clock.sleep(60.0)
+                continue
+            self._resolve_hard_failure_alerts(
+                self.clock.now(),
+                ("producer_loop_exception",),
+                {"reason": "producer_tick_recovered"},
+            )
             if result is None:
                 state = self._scheduler_state()
                 next_due_at = parse_now(state["next_due_at"]) if state["next_due_at"] else self.clock.now() + timedelta(seconds=60)
@@ -1887,11 +1922,40 @@ class ArgusServer:
             completed_at = self.clock.now()
             self._record_scheduler_completion(run_id, run_kind, completed_at)
             self._record_scheduler_event("cycle_completed", run_id, "ok" if exit_code == 0 else "failed", {"run_kind": run_kind}, completed_at)
+            if run_kind == "scheduled":
+                self._resolve_hard_failure_alerts(
+                    completed_at,
+                    ("scheduled_cycle_exception", "producer_loop_exception"),
+                    {
+                        "reason": "scheduled_cycle_recovered",
+                        "run_id": run_id,
+                        "run_kind": run_kind,
+                    },
+                )
             return exit_code, summary
         except Exception as exc:
             self.connection.rollback()
-            self._mark_run_failed(run_id, run_kind, now, output_dir, cycle_snapshot, exc)
-            self._record_scheduler_event("cycle_completed", run_id, "failed", {"run_kind": run_kind, "error": str(exc)}, self.clock.now())
+            summary = self._mark_run_failed(run_id, run_kind, now, output_dir, cycle_snapshot, exc)
+            completed_at = self.clock.now()
+            detail = {
+                "dependency_class": "scheduled_cycle" if run_kind == "scheduled" else "cycle",
+                "reason": "cycle_exception_contained" if run_kind == "scheduled" else "cycle_exception",
+                "run_id": run_id,
+                "run_kind": run_kind,
+                "error_class": exc.__class__.__name__,
+                "error_message": truncate_alert_message(str(exc)),
+            }
+            self._record_scheduler_event("cycle_completed", run_id, "failed", {"run_kind": run_kind, "error": str(exc)}, completed_at)
+            if run_kind == "scheduled":
+                summary["hard_failure_alert"] = self._record_hard_failure_alert(
+                    completed_at,
+                    "scheduled_cycle_exception",
+                    detail,
+                    "Argus repeated hard failure: scheduled cycle failed repeatedly without recovery "
+                    "(error_class={}, run_id={}).".format(detail["error_class"], run_id),
+                )
+                self._tick_exception_alerted = True
+                self._store_run(run_id, run_kind, now, 1, output_dir, cycle_snapshot, summary)
             raise
         finally:
             self._cycle_running = False
@@ -2086,9 +2150,10 @@ class ArgusServer:
         if commit:
             self.connection.commit()
 
-    def _mark_run_failed(self, run_id: str, run_kind: str, now: datetime, output_dir: Path, snapshot: Dict[str, Any], error: Exception) -> None:
+    def _mark_run_failed(self, run_id: str, run_kind: str, now: datetime, output_dir: Path, snapshot: Dict[str, Any], error: Exception) -> Dict[str, Any]:
         row = self.connection.execute("SELECT summary_json FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         summary = json.loads(row["summary_json"]) if row else {"run_id": run_id, "run_kind": run_kind}
+        summary["exit_status"] = "failed"
         summary["post_pipeline_error"] = {"class": error.__class__.__name__, "message": str(error)}
         if row is None:
             self.connection.execute(
@@ -2101,6 +2166,7 @@ class ArgusServer:
                 ("failed", iso_z(self.clock.now()), json.dumps(summary, sort_keys=True), run_id),
             )
         self.connection.commit()
+        return summary
 
     def _store_source_health(self, run_id: str, now: datetime, output_dir: Path, update_totals: bool = True, commit: bool = True) -> None:
         path = output_dir / "source-health.json"
@@ -2439,12 +2505,156 @@ class ArgusServer:
             return {"enabled": True, "emitted": False, "status": "failed", "target": alert_config.target, "error": truncate_alert_message(str(exc))}
         return {"enabled": True, "emitted": True, "status": "delivered", "target": alert_config.target}
 
+    def _alert_class_configured(self, alert_type: str) -> bool:
+        classes = set(self.config.operator_alerts.product_degraded_classes)
+        return alert_type in classes or "hard_failure" in classes
+
+    def _hard_failure_alert_key(self, alert_type: str, detail: Dict[str, Any]) -> str:
+        basis = json.dumps(
+            {
+                "type": alert_type,
+                "dependency_class": detail.get("dependency_class"),
+                "run_kind": detail.get("run_kind"),
+                "publish_target_key": detail.get("publish_target_key"),
+            },
+            sort_keys=True,
+        )
+        return "{}:{}".format(alert_type, hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24])
+
+    def _record_hard_failure_alert(
+        self,
+        now: datetime,
+        alert_type: str,
+        detail: Dict[str, Any],
+        message: str,
+        minimum_occurrences: int = DEFAULT_HARD_FAILURE_ALERT_MIN_OCCURRENCES,
+    ) -> Dict[str, Any]:
+        alert_key = self._hard_failure_alert_key(alert_type, detail)
+        row = self.connection.execute("SELECT * FROM product_alerts WHERE alert_key = ?", (alert_key,)).fetchone()
+        continuing_failure = bool(row and row["status"] == "active")
+        previous_detail = json.loads(row["detail_json"]) if continuing_failure else {}
+        previous_last_alert_at = parse_now(row["last_alert_at"]) if row and row["last_alert_at"] else None
+        occurrence_count = (int(row["occurrence_count"]) if continuing_failure else 0) + 1
+        notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "below_repetition_threshold"}
+        if not self._alert_class_configured(alert_type):
+            notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "class_not_configured"}
+        elif not self.config.operator_alerts.enabled:
+            notification = {"enabled": False, "emitted": False, "status": "disabled"}
+        elif occurrence_count < minimum_occurrences:
+            notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "below_repetition_threshold"}
+        elif (
+            previous_last_alert_at is not None
+            and (now - previous_last_alert_at).total_seconds() < self.config.operator_alerts.dedupe_window_seconds
+        ):
+            notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "suppressed_dedupe_window"}
+        else:
+            notification = self._send_alert(message)
+        first_observed_at = row["first_observed_at"] if continuing_failure else iso_z(now)
+        notification_count = (int(row["notification_count"]) if continuing_failure else 0) + (1 if notification.get("emitted") else 0)
+        last_alert_at = iso_z(now) if notification.get("emitted") else (row["last_alert_at"] if continuing_failure else None)
+        alert_detail = {
+            **previous_detail,
+            **detail,
+            "alert_key": alert_key,
+            "alert_type": alert_type,
+            "minimum_occurrences": minimum_occurrences,
+            "occurrence_count": occurrence_count,
+            "notification": notification,
+        }
+        self.connection.execute(
+            """
+            INSERT INTO product_alerts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(alert_key) DO UPDATE SET
+              status=excluded.status,
+              last_observed_at=excluded.last_observed_at,
+              last_alert_at=COALESCE(excluded.last_alert_at, product_alerts.last_alert_at),
+              resolved_at=NULL,
+              occurrence_count=excluded.occurrence_count,
+              notification_count=excluded.notification_count,
+              detail_json=excluded.detail_json
+            """,
+            (
+                alert_key,
+                alert_type,
+                "active",
+                first_observed_at,
+                iso_z(now),
+                last_alert_at,
+                None,
+                occurrence_count,
+                notification_count,
+                json.dumps(alert_detail, sort_keys=True),
+            ),
+        )
+        self.connection.commit()
+        return alert_detail
+
+    def _resolve_hard_failure_alerts(
+        self,
+        now: datetime,
+        alert_types: Tuple[str, ...],
+        recovery: Dict[str, Any],
+        alert_keys: Optional[Tuple[str, ...]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if alert_keys is not None:
+            if not alert_keys:
+                return None
+            placeholders = ",".join("?" for _ in alert_keys)
+            rows = self.connection.execute(
+                "SELECT * FROM product_alerts WHERE status = 'active' AND alert_key IN ({})".format(placeholders),
+                alert_keys,
+            ).fetchall()
+        else:
+            placeholders = ",".join("?" for _ in alert_types)
+            rows = self.connection.execute(
+                "SELECT * FROM product_alerts WHERE status = 'active' AND alert_type IN ({})".format(placeholders),
+                alert_types,
+            ).fetchall()
+        if not rows:
+            return None
+        resolved = 0
+        recovery_notifications = []
+        for row in rows:
+            previous_detail = json.loads(row["detail_json"])
+            notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "not_previously_paged"}
+            if int(row["notification_count"]) > 0:
+                notification = self._send_alert(
+                    "Argus hard failure recovered: {alert_type} recovered after {count} observations.".format(
+                        alert_type=row["alert_type"],
+                        count=row["occurrence_count"],
+                    )
+                )
+            detail = {**previous_detail, "recovery": {**recovery, "observed_at": iso_z(now)}, "recovery_notification": notification}
+            self.connection.execute(
+                """
+                UPDATE product_alerts
+                SET status = 'resolved',
+                    last_observed_at = ?,
+                    resolved_at = ?,
+                    notification_count = ?,
+                    detail_json = ?
+                WHERE alert_key = ?
+                """,
+                (
+                    iso_z(now),
+                    iso_z(now),
+                    int(row["notification_count"]) + (1 if notification.get("emitted") else 0),
+                    json.dumps(detail, sort_keys=True),
+                    row["alert_key"],
+                ),
+            )
+            resolved += 1
+            recovery_notifications.append(notification)
+        self.connection.commit()
+        return {"status": "recovered", "resolved_alert_count": resolved, "notifications": recovery_notifications}
+
     def _record_embedding_outage_alert(self, now: datetime, outage: Dict[str, Any]) -> Dict[str, Any]:
         alert_key = self._embedding_outage_alert_key(outage)
         row = self.connection.execute("SELECT * FROM product_alerts WHERE alert_key = ?", (alert_key,)).fetchone()
         continuing_outage = bool(row and row["status"] == "active")
         previous_detail = json.loads(row["detail_json"]) if continuing_outage else {}
         previous_last_alert_at = parse_now(row["last_alert_at"]) if row and row["last_alert_at"] else None
+        occurrence_count = (int(row["occurrence_count"]) if continuing_outage else 0) + 1
         notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "not_scheduled_live"}
         alert_class = "required_embedding_outage"
         eligible_for_notification = (
@@ -2455,12 +2665,10 @@ class ArgusServer:
         if alert_class not in self.config.operator_alerts.product_degraded_classes:
             notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "class_not_configured"}
         if eligible_for_notification:
-            if (
-                row
-                and row["status"] == "active"
-                and int(row["notification_count"]) > 0
-            ):
-                notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "suppressed_active_outage"}
+            if not self.config.operator_alerts.enabled:
+                notification = {"enabled": False, "emitted": False, "status": "disabled"}
+            elif occurrence_count < DEFAULT_HARD_FAILURE_ALERT_MIN_OCCURRENCES:
+                notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "below_repetition_threshold"}
             elif (
                 row
                 and row["status"] == "active"
@@ -2471,7 +2679,6 @@ class ArgusServer:
             else:
                 notification = self._send_alert(self._embedding_outage_alert_text(outage))
         first_observed_at = row["first_observed_at"] if continuing_outage else iso_z(now)
-        occurrence_count = (int(row["occurrence_count"]) if continuing_outage else 0) + 1
         notification_count = (int(row["notification_count"]) if continuing_outage else 0) + (1 if notification.get("emitted") else 0)
         last_alert_at = iso_z(now) if notification.get("emitted") else (row["last_alert_at"] if continuing_outage else None)
         detail = {**outage, "alert_key": alert_key, "notification": notification}
@@ -2553,16 +2760,19 @@ class ArgusServer:
             "model": cycle_embedding.model,
             "space_id": cycle_embedding.space_id,
         }
-        notification = self._send_alert(
-            "Argus embedding delivery recovered: accepted {accepted} reports and produced {packages} packages "
-            "(provider={provider}, model={model}).".format(
-                accepted=accepted_report_count,
-                packages=package_count,
-                provider=cycle_embedding.provider or "unknown",
-                model=cycle_embedding.model or "unknown",
-            )
-        )
         for row in rows:
+            if int(row["notification_count"]) > 0:
+                notification = self._send_alert(
+                    "Argus embedding delivery recovered: accepted {accepted} reports and produced {packages} packages "
+                    "(provider={provider}, model={model}).".format(
+                        accepted=accepted_report_count,
+                        packages=package_count,
+                        provider=cycle_embedding.provider or "unknown",
+                        model=cycle_embedding.model or "unknown",
+                    )
+                )
+            else:
+                notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "not_previously_paged"}
             detail = {**json.loads(row["detail_json"]), "recovery": recovery, "recovery_notification": notification}
             self.connection.execute(
                 """
@@ -3061,6 +3271,29 @@ class ArgusServer:
         counts["failure_or_unknown"] = counts.get("failed", 0) + counts.get("unknown", 0)
         return counts
 
+    def _resolved_subspace_circuit_alert_keys(self, publish_target_key: str) -> Tuple[str, ...]:
+        active_alerts = self.connection.execute(
+            "SELECT alert_key, detail_json FROM product_alerts WHERE alert_type = 'subspace_publish_circuit_breaker' AND status = 'active'"
+        ).fetchall()
+        resolved_keys: List[str] = []
+        for row in active_alerts:
+            detail = json.loads(row["detail_json"])
+            if detail.get("publish_target_key") != publish_target_key:
+                continue
+            blocker_count = self.connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM delivery_entries
+                WHERE publish_target_key = ?
+                  AND status IN ('retry_pending', 'unknown', 'attempting')
+                  AND last_error_class IN ('publish_circuit_breaker', 'publish_run_attempt_cap')
+                """,
+                (publish_target_key,),
+            ).fetchone()[0]
+            if int(blocker_count) == 0:
+                resolved_keys.append(row["alert_key"])
+        return tuple(resolved_keys)
+
     def _trip_delivery_circuit_breaker_if_needed(self, entry: sqlite3.Row, now: datetime) -> bool:
         counts = self._run_publish_attempt_counts(entry["run_id"])
         if counts["total"] >= DELIVERY_MAX_ATTEMPTS_PER_RUN:
@@ -3071,6 +3304,19 @@ class ArgusServer:
                 "publish_run_attempt_cap",
                 "run publish attempt cap reached before delivery send",
             )
+            self._record_hard_failure_alert(
+                now,
+                "subspace_publish_circuit_breaker",
+                {
+                    "dependency_class": "subspace_publish",
+                    "reason": "publish_run_attempt_cap",
+                    "run_id": entry["run_id"],
+                    "plan_id": entry["plan_id"],
+                    "publish_target_key": entry["publish_target_key"],
+                    "publish_attempt_counts": counts,
+                },
+                "Argus Subspace publish circuit breaker opened: run {} reached the publish attempt cap; live delivery is deferred for retry/backoff.".format(entry["run_id"]),
+            )
             return True
         if counts["failure_or_unknown"] >= DELIVERY_CIRCUIT_BREAKER_FAILURES_PER_RUN:
             self._mark_delivery_retry_pending(
@@ -3079,6 +3325,22 @@ class ArgusServer:
                 self.config.delivery.max_retry_delay_seconds,
                 "publish_circuit_breaker",
                 "run publish failure/unknown circuit breaker opened before delivery send",
+            )
+            self._record_hard_failure_alert(
+                now,
+                "subspace_publish_circuit_breaker",
+                {
+                    "dependency_class": "subspace_publish",
+                    "reason": "publish_circuit_breaker",
+                    "run_id": entry["run_id"],
+                    "plan_id": entry["plan_id"],
+                    "publish_target_key": entry["publish_target_key"],
+                    "publish_attempt_counts": counts,
+                },
+                "Argus Subspace publish circuit breaker opened: run {} has {} failed/unknown publish attempts; live delivery is deferred for retry/backoff.".format(
+                    entry["run_id"],
+                    counts["failure_or_unknown"],
+                ),
             )
             return True
         return False
@@ -3329,6 +3591,23 @@ class ArgusServer:
                 )
                 self.connection.commit()
                 failed += 1
+        if succeeded > 0:
+            resolved_circuit_keys = self._resolved_subspace_circuit_alert_keys(target)
+            self._resolve_hard_failure_alerts(
+                now,
+                ("subspace_publish_circuit_breaker",),
+                {
+                    "reason": "subspace_publish_recovered",
+                    "delivery_result": {
+                        "attempted": attempted,
+                        "succeeded": succeeded,
+                        "failed": failed,
+                        "unknown": unknown,
+                        "circuit_opened": circuit_opened,
+                    },
+                },
+                alert_keys=resolved_circuit_keys,
+            )
         return {
             "attempted": attempted,
             "succeeded": succeeded,

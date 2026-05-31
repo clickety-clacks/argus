@@ -245,7 +245,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(config.operator_alerts.command, ())
         self.assertEqual(config.operator_alerts.source, "argus")
         self.assertEqual(config.operator_alerts.dedupe_window_seconds, 3600)
-        self.assertEqual(config.operator_alerts.product_degraded_classes, ("required_embedding_outage",))
+        self.assertEqual(config.operator_alerts.product_degraded_classes, ("required_embedding_outage", "hard_failure"))
         self.assertEqual(config.source_fetch_concurrency, 4)
         self.assertEqual(config.publish.mode, "inactive")
         self.assertTrue(config.publish.require_embeddings)
@@ -1690,8 +1690,8 @@ print(json.dumps({
             self.assertEqual(first_summary["embedding_delivery_outage"]["publish_candidates"], 0)
             self.assertEqual(first_summary["embedding_delivery_outage"]["publish_attempt_counts"]["total"], 0)
             self.assertEqual(first_summary["embedding_delivery_outage"]["delivered_count"], 0)
-            self.assertEqual(first_summary["embedding_delivery_outage"]["notification"]["status"], "delivered")
-            self.assertEqual(second_summary["embedding_delivery_outage"]["notification"]["status"], "suppressed_active_outage")
+            self.assertEqual(first_summary["embedding_delivery_outage"]["notification"]["status"], "below_repetition_threshold")
+            self.assertEqual(second_summary["embedding_delivery_outage"]["notification"]["status"], "delivered")
             self.assertEqual(recovery_summary["embedding_delivery_recovery"]["status"], "recovered")
             self.assertEqual(recovery_summary["embedding_delivery_recovery"]["publish_attempt_counts"]["succeeded"], 1)
             self.assertEqual(recovery_summary["embedding_delivery_recovery"]["delivered_count"], 1)
@@ -1822,6 +1822,169 @@ print(json.dumps({
             self.assertEqual(alert_calls, [])
             status = server_module.run_status(root / "argus.sqlite3")
             self.assertEqual(status["product_health"]["status"], "degraded")
+
+    def test_openai_read_timeout_is_recorded_as_embedding_outage_not_loop_crash(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"mode": "inactive", "require_embeddings": True})
+            original_post = server_module.requests.post
+
+            def timed_out_post(*args, **kwargs):
+                raise server_module.requests.exceptions.ReadTimeout("embedding timed out")
+
+            server_module.request_openai_embedding = self._original_request_openai_embedding
+            server_module.requests.post = timed_out_post
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                exit_code, summary = server.tick()
+            finally:
+                server_module.request_openai_embedding = self._fake_openai_embedding
+                server_module.requests.post = original_post
+                server.close()
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(summary["exit_status"], "failed_required_embedding")
+            failures = json.loads(next((root / "out" / "runs").glob("20260429T120000Z-scheduled-*")).joinpath("embedding-failures.json").read_text())
+            self.assertEqual({failure["class"] for failure in failures}, {"embed_backend_unavailable"})
+            self.assertIn("ReadTimeout", failures[0]["message"])
+            self.assertEqual(rows(root / "argus.sqlite3", "runs")[0]["status"], "failed")
+
+    def test_scheduled_cycle_exception_is_contained_and_pages_only_after_repeat(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"mode": "inactive"})
+            config = yaml.safe_load(path.read_text())
+            config["operator_alerts"] = {
+                "enabled": True,
+                "target": "openclaw_alert",
+                "endpoint": "http://openclaw.invalid/alert",
+                "session_key": "agent:test:argus",
+                "product_degraded_classes": ["hard_failure"],
+            }
+            path.write_text(yaml.safe_dump(config))
+            original_run_pipeline = server_module.run_pipeline_for_sources
+            alert_calls = []
+            failure_classes = [RuntimeError, ValueError]
+
+            def broken_pipeline(*args, **kwargs):
+                failure_class = failure_classes.pop(0)
+                raise failure_class("fixture cycle failed")
+
+            server_module.run_pipeline_for_sources = broken_pipeline
+            clock = FakeClock(NOW)
+            server = ArgusServer(path, clock=clock)
+            server._send_alert = lambda message: alert_calls.append(message) or {"enabled": True, "emitted": True, "status": "delivered", "target": "test"}
+            try:
+                with self.assertRaises(RuntimeError):
+                    server.tick()
+                first_summary = json.loads(rows(root / "argus.sqlite3", "runs")[-1]["summary_json"])
+                clock.advance(3600)
+                with self.assertRaises(ValueError):
+                    server.tick()
+                second_summary = json.loads(rows(root / "argus.sqlite3", "runs")[-1]["summary_json"])
+            finally:
+                server_module.run_pipeline_for_sources = original_run_pipeline
+                server.close()
+            self.assertEqual(first_summary["hard_failure_alert"]["notification"]["status"], "below_repetition_threshold")
+            self.assertEqual(second_summary["hard_failure_alert"]["notification"]["status"], "delivered")
+            self.assertEqual(len(alert_calls), 1)
+            self.assertIn("scheduled cycle failed repeatedly", alert_calls[0])
+            run_statuses = [row["status"] for row in rows(root / "argus.sqlite3", "runs")]
+            self.assertEqual(run_statuses, ["failed", "failed"])
+            state = rows(root / "argus.sqlite3", "scheduler_state")[0]
+            self.assertIsNone(state["running_run_id"])
+            alert_rows = rows(root / "argus.sqlite3", "product_alerts")
+            self.assertEqual(len(alert_rows), 1)
+            self.assertEqual(alert_rows[0]["alert_type"], "scheduled_cycle_exception")
+            self.assertEqual(alert_rows[0]["occurrence_count"], 2)
+            self.assertEqual(alert_rows[0]["notification_count"], 1)
+
+    def test_serve_forever_scheduled_cycle_exception_uses_single_alert_stream(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"mode": "inactive"})
+            config = yaml.safe_load(path.read_text())
+            config["operator_alerts"] = {
+                "enabled": True,
+                "target": "openclaw_alert",
+                "endpoint": "http://openclaw.invalid/alert",
+                "session_key": "agent:test:argus",
+                "product_degraded_classes": ["hard_failure"],
+            }
+            path.write_text(yaml.safe_dump(config))
+            original_run_pipeline = server_module.run_pipeline_for_sources
+            alert_calls = []
+            call_count = {"value": 0}
+            server = ArgusServer(path, clock=FakeClock(NOW))
+
+            def flaky_pipeline(*args, **kwargs):
+                call_count["value"] += 1
+                if call_count["value"] <= 2:
+                    raise RuntimeError("fixture cycle failed")
+                server.running = False
+                return original_run_pipeline(*args, **kwargs)
+
+            server_module.run_pipeline_for_sources = flaky_pipeline
+            server._send_alert = lambda message: alert_calls.append(message) or {"enabled": True, "emitted": True, "status": "delivered", "target": "test"}
+            try:
+                exit_code = server.serve_forever()
+            finally:
+                server_module.run_pipeline_for_sources = original_run_pipeline
+                server.close()
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(call_count["value"], 3)
+            self.assertEqual(len(alert_calls), 2)
+            self.assertIn("scheduled cycle failed repeatedly", alert_calls[0])
+            self.assertIn("hard failure recovered", alert_calls[1])
+            alert_rows = rows(root / "argus.sqlite3", "product_alerts")
+            self.assertEqual([row["alert_type"] for row in alert_rows], ["scheduled_cycle_exception"])
+            self.assertEqual(alert_rows[0]["status"], "resolved")
+            self.assertEqual(alert_rows[0]["occurrence_count"], 2)
+            self.assertEqual(alert_rows[0]["notification_count"], 2)
+
+    def test_serve_forever_survives_tick_exception_and_dedupes_hard_alert(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"mode": "inactive"})
+            config = yaml.safe_load(path.read_text())
+            config["operator_alerts"] = {
+                "enabled": True,
+                "target": "openclaw_alert",
+                "endpoint": "http://openclaw.invalid/alert",
+                "session_key": "agent:test:argus",
+                "dedupe_window": "1h",
+                "product_degraded_classes": ["hard_failure"],
+            }
+            path.write_text(yaml.safe_dump(config))
+            clock = FakeClock(NOW)
+            server = ArgusServer(path, clock=clock)
+            alert_calls = []
+            tick_count = {"value": 0}
+
+            def fake_tick():
+                tick_count["value"] += 1
+                if tick_count["value"] <= 3:
+                    raise RuntimeError("producer tick failed")
+                server.running = False
+                return 0, {"run_kind": "test"}
+
+            server.tick = fake_tick
+            server._send_alert = lambda message: alert_calls.append(message) or {"enabled": True, "emitted": True, "status": "delivered", "target": "test"}
+            try:
+                exit_code = server.serve_forever()
+            finally:
+                server.close()
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(tick_count["value"], 4)
+            self.assertEqual(len(alert_calls), 2)
+            self.assertIn("producer loop exception repeated", alert_calls[0])
+            self.assertIn("hard failure recovered", alert_calls[1])
+            alert_rows = rows(root / "argus.sqlite3", "product_alerts")
+            self.assertEqual(len(alert_rows), 1)
+            self.assertEqual(alert_rows[0]["alert_type"], "producer_loop_exception")
+            self.assertEqual(alert_rows[0]["status"], "resolved")
+            self.assertEqual(alert_rows[0]["occurrence_count"], 3)
+            self.assertEqual(alert_rows[0]["notification_count"], 2)
+            self.assertGreaterEqual(len([event for event in rows(root / "argus.sqlite3", "scheduler_events") if event["event_type"] == "producer_loop_exception"]), 3)
 
     def test_embedding_failure_retries_on_later_cycle(self):
         with TemporaryDirectory() as tmpdir:
@@ -3734,15 +3897,26 @@ print(json.dumps({
                 },
                 schedule={"max_live_publishes_per_tick": 10},
             )
+            config = yaml.safe_load(path.read_text())
+            config["operator_alerts"] = {
+                "enabled": True,
+                "target": "openclaw_alert",
+                "endpoint": "http://openclaw.invalid/alert",
+                "session_key": "agent:test:argus",
+                "product_degraded_classes": ["hard_failure"],
+            }
+            path.write_text(yaml.safe_dump(config))
             server = ArgusServer(path, clock=FakeClock(NOW))
             original_post = server_module.post_message_to_subspace
             calls = []
+            alert_calls = []
 
             def failing_post(*args):
                 calls.append(args)
                 raise server_module.PublishTransportError("temporary Subspace failure")
 
             server_module.post_message_to_subspace = failing_post
+            server._send_alert = lambda message: alert_calls.append(message) or {"enabled": True, "emitted": True, "status": "delivered", "target": "test"}
             try:
                 snapshot = rows(root / "argus.sqlite3", "runtime_config_snapshots")[-1]
                 target = server._current_publish_target_key()
@@ -3785,11 +3959,14 @@ print(json.dumps({
                 server.connection.commit()
 
                 result = server._drain_due_delivery(NOW, max_entries=10)
+                second_result = server._drain_due_delivery(NOW + timedelta(hours=1), max_entries=10)
             finally:
                 server_module.post_message_to_subspace = original_post
                 server.close()
             self.assertEqual(result["attempted"], server_module.DELIVERY_CIRCUIT_BREAKER_FAILURES_PER_RUN)
             self.assertEqual(result["circuit_opened"], 1)
+            self.assertEqual(second_result["attempted"], 0)
+            self.assertGreaterEqual(second_result["circuit_opened"], 1)
             self.assertEqual(len(calls), server_module.DELIVERY_CIRCUIT_BREAKER_FAILURES_PER_RUN)
             attempts = rows(root / "argus.sqlite3", "publish_attempts")
             entries = rows(root / "argus.sqlite3", "delivery_entries")
@@ -3800,6 +3977,68 @@ print(json.dumps({
             self.assertTrue(any(row["last_error_class"] == "publish_circuit_breaker" for row in retry_entries))
             first_retry = min(parse for parse in (row["next_retry_at"] for row in retry_entries) if parse)
             self.assertGreaterEqual(first_retry, "2026-04-29T12:05:00Z")
+            self.assertEqual(len(alert_calls), 1)
+            self.assertIn("Subspace publish circuit breaker opened", alert_calls[0])
+            alert_rows = rows(root / "argus.sqlite3", "product_alerts")
+            self.assertEqual(alert_rows[0]["alert_type"], "subspace_publish_circuit_breaker")
+            self.assertEqual(alert_rows[0]["notification_count"], 1)
+            self.assertGreaterEqual(alert_rows[0]["occurrence_count"], 2)
+
+    def test_subspace_circuit_recovery_is_scoped_to_publish_target_without_blockers(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(root, publish={"mode": "inactive"})
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                alert_a = server._record_hard_failure_alert(
+                    NOW,
+                    "subspace_publish_circuit_breaker",
+                    {"dependency_class": "subspace_publish", "reason": "publish_circuit_breaker", "publish_target_key": "target-a"},
+                    "target a",
+                    minimum_occurrences=1,
+                )
+                alert_b = server._record_hard_failure_alert(
+                    NOW,
+                    "subspace_publish_circuit_breaker",
+                    {"dependency_class": "subspace_publish", "reason": "publish_circuit_breaker", "publish_target_key": "target-b"},
+                    "target b",
+                    minimum_occurrences=1,
+                )
+                server.connection.execute(
+                    """
+                    INSERT INTO delivery_entries
+                    (entry_id, plan_id, run_id, publish_target_key, package_id, publish_idempotency_key,
+                     selected_order_index, due_at, status, attempt_count, last_attempt_at, next_retry_at,
+                     last_error_class, last_error_message, subspace_message_id, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'retry_pending', 1, ?, ?, 'publish_circuit_breaker', 'still blocked', NULL, ?)
+                    """,
+                    (
+                        "entry-target-a",
+                        "plan-target-a",
+                        "run-target-a",
+                        "target-a",
+                        "package-target-a",
+                        "key-target-a",
+                        "2026-04-29T12:00:00Z",
+                        "2026-04-29T12:00:00Z",
+                        "2026-04-29T12:05:00Z",
+                        "2026-04-29T12:00:00Z",
+                    ),
+                )
+                server.connection.commit()
+                self.assertEqual(server._resolved_subspace_circuit_alert_keys("target-a"), ())
+                self.assertEqual(server._resolved_subspace_circuit_alert_keys("target-b"), (alert_b["alert_key"],))
+                server._resolve_hard_failure_alerts(
+                    NOW + timedelta(minutes=10),
+                    ("subspace_publish_circuit_breaker",),
+                    {"reason": "subspace_publish_recovered"},
+                    alert_keys=server._resolved_subspace_circuit_alert_keys("target-b"),
+                )
+            finally:
+                server.close()
+            alert_rows = {row["alert_key"]: row for row in rows(root / "argus.sqlite3", "product_alerts")}
+            self.assertEqual(alert_rows[alert_a["alert_key"]]["status"], "active")
+            self.assertEqual(alert_rows[alert_b["alert_key"]]["status"], "resolved")
 
     def test_per_report_publish_attempt_cap_stops_fourth_send(self):
         with TemporaryDirectory() as tmpdir:
