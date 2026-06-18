@@ -47,6 +47,7 @@ DELIVERY_RETRY_JITTER_RATIO = 0.25
 DELIVERY_MAX_ATTEMPTS_PER_REPORT_KEY = 3
 DELIVERY_MAX_ATTEMPTS_PER_RUN = 50
 DELIVERY_CIRCUIT_BREAKER_FAILURES_PER_RUN = 5
+DELIVERY_CIRCUIT_BREAKER_CLASSES = ("publish_circuit_breaker", "publish_run_attempt_cap")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3294,6 +3295,55 @@ class ArgusServer:
                 resolved_keys.append(row["alert_key"])
         return tuple(resolved_keys)
 
+    def _terminalize_superseded_circuit_breakers(self, publish_target_key: str, now: datetime) -> int:
+        latest_plan = self.connection.execute(
+            """
+            SELECT plan_id
+            FROM delivery_plans
+            WHERE publish_target_key = ?
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT 1
+            """,
+            (publish_target_key,),
+        ).fetchone()
+        if latest_plan is None:
+            return 0
+        placeholders = ",".join("?" for _ in DELIVERY_CIRCUIT_BREAKER_CLASSES)
+        cursor = self.connection.execute(
+            """
+            UPDATE delivery_entries
+            SET status = 'permanent_failure',
+                next_retry_at = NULL,
+                last_error_class = 'stale_subspace_circuit_breaker',
+                last_error_message = 'superseded run Subspace circuit breaker aged out after a newer delivery plan',
+                updated_at = ?
+            WHERE publish_target_key = ?
+              AND plan_id IN (
+                SELECT plan_id
+                FROM delivery_plans
+                WHERE publish_target_key = ?
+                  AND plan_id != ?
+              )
+              AND status IN ('retry_pending', 'attempting')
+              AND last_error_class IN ({})
+            """.format(placeholders),
+            (iso_z(now), publish_target_key, publish_target_key, latest_plan["plan_id"], *DELIVERY_CIRCUIT_BREAKER_CLASSES),
+        )
+        terminalized = int(cursor.rowcount or 0)
+        if terminalized:
+            self.connection.commit()
+            self._resolve_hard_failure_alerts(
+                now,
+                ("subspace_publish_circuit_breaker",),
+                {
+                    "reason": "superseded_subspace_circuit_breaker_aged_out",
+                    "terminalized_delivery_entries": terminalized,
+                    "publish_target_key": publish_target_key,
+                },
+                alert_keys=self._resolved_subspace_circuit_alert_keys(publish_target_key),
+            )
+        return terminalized
+
     def _trip_delivery_circuit_breaker_if_needed(self, entry: sqlite3.Row, now: datetime) -> bool:
         counts = self._run_publish_attempt_counts(entry["run_id"])
         if counts["total"] >= DELIVERY_MAX_ATTEMPTS_PER_RUN:
@@ -3352,6 +3402,7 @@ class ArgusServer:
         target = self._current_publish_target_key()
         if target is None:
             return {}
+        terminalized_stale_circuit_breakers = self._terminalize_superseded_circuit_breakers(target, now)
         due_filter = """
             (
                 status = 'pending' AND due_at <= ?
@@ -3382,7 +3433,9 @@ class ArgusServer:
             FROM delivery_entries
             WHERE ({})
               AND publish_target_key = ?
-            ORDER BY COALESCE(next_retry_at, due_at), due_at, selected_order_index
+            ORDER BY (SELECT created_at FROM delivery_plans WHERE delivery_plans.plan_id = delivery_entries.plan_id) DESC,
+                     (SELECT rowid FROM delivery_plans WHERE delivery_plans.plan_id = delivery_entries.plan_id) DESC,
+                     COALESCE(next_retry_at, due_at), due_at, selected_order_index
             LIMIT ?
             """.format(due_filter),
             (iso_z(now), iso_z(now), target, max_entries or self.config.delivery.live_send_concurrency),
@@ -3614,7 +3667,8 @@ class ArgusServer:
             "failed": failed,
             "unknown": unknown,
             "circuit_opened": circuit_opened,
-        } if due_rows else {}
+            "terminalized_stale_circuit_breakers": terminalized_stale_circuit_breakers,
+        } if due_rows or terminalized_stale_circuit_breakers else {}
 
     def _next_delivery_due_at(self) -> Optional[datetime]:
         try:

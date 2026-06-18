@@ -4040,6 +4040,129 @@ print(json.dumps({
             self.assertEqual(alert_rows[alert_a["alert_key"]]["status"], "active")
             self.assertEqual(alert_rows[alert_b["alert_key"]]["status"], "resolved")
 
+    def test_superseded_circuit_breaker_rows_age_out_without_hiding_current_ack_unknown(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+            )
+            original_post = server_module.post_message_to_subspace
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            calls = []
+
+            def unknown_ack(*args):
+                calls.append(args)
+                raise server_module.PublishAckUnknownError("Subspace post_message reply not received after replay")
+
+            server_module.post_message_to_subspace = unknown_ack
+            try:
+                snapshot = rows(root / "argus.sqlite3", "runtime_config_snapshots")[-1]
+                target = server._current_publish_target_key()
+                self.assertIsNotNone(target)
+                old_alert = server._record_hard_failure_alert(
+                    NOW - timedelta(days=11),
+                    "subspace_publish_circuit_breaker",
+                    {
+                        "dependency_class": "subspace_publish",
+                        "reason": "publish_circuit_breaker",
+                        "run_id": "20260607T113410Z-scheduled-79dee709",
+                        "publish_target_key": target,
+                    },
+                    "old circuit",
+                    minimum_occurrences=1,
+                )
+                package_json = lambda package_id: json.dumps(
+                    {
+                        "schema": "swarm.channel.news.report.v0",
+                        "package_id": package_id,
+                        "supplied_embeddings": [{"space_id": "openai:text-embedding-3-small:1536:v1", "vector": [1.0]}],
+                    },
+                    sort_keys=True,
+                )
+                for run_id, plan_id, package_id, key, created_at, status, last_error_class in [
+                    (
+                        "20260607T113410Z-scheduled-79dee709",
+                        "plan-old",
+                        "package-old",
+                        "key-old",
+                        "2026-06-07T11:34:10Z",
+                        "retry_pending",
+                        "publish_circuit_breaker",
+                    ),
+                    (
+                        "20260618T090843Z-scheduled-d411fd2a",
+                        "plan-current",
+                        "package-current",
+                        "key-current",
+                        "2026-06-18T09:08:43Z",
+                        "pending",
+                        None,
+                    ),
+                ]:
+                    server.connection.execute(
+                        "INSERT OR REPLACE INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (run_id, "scheduled", created_at, created_at, "succeeded", str(root / "out" / run_id), snapshot["snapshot_id"], "{}"),
+                    )
+                    server.connection.execute(
+                        "INSERT INTO packages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (package_id, package_id.replace("package", "report"), "1", "openai:text-embedding-3-small:1536:v1", "vector-hash", 1, package_json(package_id), run_id, created_at),
+                    )
+                    server.connection.execute(
+                        "INSERT INTO delivery_plans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (plan_id, run_id, target, "tranche", created_at, created_at, created_at, 1, 0, created_at, created_at, "{}"),
+                    )
+                    server.connection.execute(
+                        """
+                        INSERT INTO delivery_entries
+                        (entry_id, plan_id, run_id, publish_target_key, package_id, publish_idempotency_key,
+                         selected_order_index, due_at, status, attempt_count, last_attempt_at, next_retry_at,
+                         last_error_class, last_error_message, subspace_message_id, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                        """,
+                        (
+                            "entry-" + package_id,
+                            plan_id,
+                            run_id,
+                            target,
+                            package_id,
+                            key,
+                            created_at,
+                            status,
+                            1 if status == "retry_pending" else 0,
+                            created_at if status == "retry_pending" else None,
+                            created_at if status == "retry_pending" else None,
+                            last_error_class,
+                            "old breaker" if last_error_class else None,
+                            created_at,
+                        ),
+                    )
+                server.connection.commit()
+
+                result = server._drain_due_delivery(datetime(2026, 6, 18, 9, 20, 0, tzinfo=timezone.utc), max_entries=1)
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(result["attempted"], 1)
+            self.assertEqual(result["unknown"], 1)
+            self.assertEqual(result["terminalized_stale_circuit_breakers"], 1)
+            entries = {row["entry_id"]: row for row in rows(root / "argus.sqlite3", "delivery_entries")}
+            self.assertEqual(entries["entry-package-old"]["status"], "permanent_failure")
+            self.assertEqual(entries["entry-package-old"]["last_error_class"], "stale_subspace_circuit_breaker")
+            self.assertEqual(entries["entry-package-current"]["status"], "unknown")
+            self.assertEqual(entries["entry-package-current"]["last_error_class"], "PublishAckUnknownError")
+            attempts = rows(root / "argus.sqlite3", "publish_attempts")
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(attempts[0]["status"], "unknown")
+            alert_rows = {row["alert_key"]: row for row in rows(root / "argus.sqlite3", "product_alerts")}
+            self.assertEqual(alert_rows[old_alert["alert_key"]]["status"], "resolved")
+
     def test_per_report_publish_attempt_cap_stops_fourth_send(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
