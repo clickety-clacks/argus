@@ -170,10 +170,12 @@ class ServerTests(unittest.TestCase):
         self._original_openai_api_key = server_module.openai_api_key
         self._original_subspace_agent_id = os.environ.get("ARGUS_SUBSPACE_AGENT_ID")
         self._original_subspace_session_token = os.environ.get("ARGUS_SUBSPACE_SESSION_TOKEN")
+        self._original_subspace_session_expires_at = os.environ.get("ARGUS_SUBSPACE_SESSION_EXPIRES_AT")
         server_module.openai_api_key = lambda: "test-openai-key"
         server_module.request_openai_embedding = self._fake_openai_embedding
         os.environ["ARGUS_SUBSPACE_AGENT_ID"] = "argus-test-agent"
         os.environ["ARGUS_SUBSPACE_SESSION_TOKEN"] = "argus-test-session-token"
+        os.environ.pop("ARGUS_SUBSPACE_SESSION_EXPIRES_AT", None)
 
     def tearDown(self):
         server_module.request_openai_embedding = self._original_request_openai_embedding
@@ -186,6 +188,10 @@ class ServerTests(unittest.TestCase):
             os.environ.pop("ARGUS_SUBSPACE_SESSION_TOKEN", None)
         else:
             os.environ["ARGUS_SUBSPACE_SESSION_TOKEN"] = self._original_subspace_session_token
+        if self._original_subspace_session_expires_at is None:
+            os.environ.pop("ARGUS_SUBSPACE_SESSION_EXPIRES_AT", None)
+        else:
+            os.environ["ARGUS_SUBSPACE_SESSION_EXPIRES_AT"] = self._original_subspace_session_expires_at
 
     @staticmethod
     def _fake_openai_embedding(text, model, dimensions, api_key):
@@ -3458,6 +3464,37 @@ print(json.dumps({
             self.assertEqual({row["error_class"] for row in attempts}, {"PublishTransportError"})
             self.assertTrue(all(json.loads(row["response_json"])["ok"] is False for row in attempts))
 
+    def test_live_publisher_auth_failure_records_product_alert(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+            )
+            original_post = server_module.post_message_to_subspace
+
+            def fake_post(*args):
+                raise server_module.PublishTransportError(
+                    "Subspace unauthorized",
+                    {"ok": False, "error": {"code": "unauthorized", "message": "session expired"}},
+                )
+
+            server_module.post_message_to_subspace = fake_post
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                server.tick()
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            alert_rows = rows(root / "argus.sqlite3", "product_alerts")
+            self.assertIn("subspace_publish_auth_failure", {row["alert_type"] for row in alert_rows})
+            status = server_module.run_status(root / "argus.sqlite3")
+            self.assertEqual(status["product_health"]["status"], "degraded")
+
     def test_non_retryable_publish_rejection_marks_delivery_permanent_failure(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -3704,6 +3741,54 @@ print(json.dumps({
             finally:
                 server.close()
             self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+
+    def test_live_publish_health_exposes_session_expiry_and_alerts_when_soon(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            expires_at = "2026-04-29T15:00:00Z"
+            os.environ["ARGUS_SUBSPACE_SESSION_EXPIRES_AT"] = expires_at
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "allow_non_embedded_fallback": True,
+                },
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                snapshot = server.status()["publish"]
+            finally:
+                server.close()
+            self.assertEqual(snapshot["effective_mode"], "live")
+            self.assertEqual(snapshot["session_expires_at"], expires_at)
+            self.assertTrue(snapshot["session_expires_soon"])
+            alert_rows = rows(root / "argus.sqlite3", "product_alerts")
+            self.assertEqual({row["alert_type"] for row in alert_rows}, {"subspace_session_expires_soon"})
+            self.assertEqual(alert_rows[0]["notification_count"], 0)
+
+    def test_expired_subspace_session_blocks_live_publish(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            os.environ["ARGUS_SUBSPACE_SESSION_EXPIRES_AT"] = "2026-04-29T11:59:00Z"
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "allow_non_embedded_fallback": True,
+                },
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                snapshot = server.status()["publish"]
+                server.tick()
+            finally:
+                server.close()
+            self.assertEqual(snapshot["effective_mode"], "blocked")
+            self.assertEqual(snapshot["blocked_reason"], "subspace_session_expired")
+            self.assertEqual(len(rows(root / "argus.sqlite3", "publish_attempts")), 0)
+            self.assertEqual({row["alert_type"] for row in rows(root / "argus.sqlite3", "product_alerts")}, {"subspace_session_expired"})
 
     def test_canary_live_publish_limit_selects_without_bursting_all_work(self):
         with TemporaryDirectory() as tmpdir:
@@ -3983,6 +4068,46 @@ print(json.dumps({
             self.assertEqual(alert_rows[0]["alert_type"], "subspace_publish_circuit_breaker")
             self.assertEqual(alert_rows[0]["notification_count"], 1)
             self.assertGreaterEqual(alert_rows[0]["occurrence_count"], 2)
+
+    def test_overdue_live_delivery_records_publish_freshness_stall_alert(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                mode="manual",
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                snapshot = rows(root / "argus.sqlite3", "runtime_config_snapshots")[-1]
+                target = server._current_publish_target_key()
+                server.connection.execute(
+                    "INSERT OR REPLACE INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("run-stalled", "manual", "2026-04-29T11:00:00Z", "2026-04-29T11:00:00Z", "succeeded", str(root / "out" / "run-stalled"), snapshot["snapshot_id"], "{}"),
+                )
+                server.connection.execute(
+                    "INSERT INTO delivery_plans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("plan-stalled", "run-stalled", target, "immediate", "2026-04-29T11:00:00Z", "2026-04-29T11:00:00Z", "2026-04-29T11:00:00Z", 1, 0, "2026-04-29T11:00:00Z", "2026-04-29T11:00:00Z", "{}"),
+                )
+                server.connection.execute(
+                    """
+                    INSERT INTO delivery_entries
+                    (entry_id, plan_id, run_id, publish_target_key, package_id, publish_idempotency_key,
+                     selected_order_index, due_at, status, attempt_count, last_attempt_at, next_retry_at,
+                     last_error_class, last_error_message, subspace_message_id, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'retry_pending', 1, ?, ?, 'PublishTransportError', 'temporary failure', NULL, ?)
+                    """,
+                    ("entry-stalled", "plan-stalled", "run-stalled", target, "missing-package", "key-stalled", "2026-04-29T11:00:00Z", "2026-04-29T11:00:00Z", "2026-04-29T11:30:00Z", "2026-04-29T11:00:00Z"),
+                )
+                server.connection.commit()
+                server.tick()
+            finally:
+                server.close()
+            self.assertIn("subspace_publish_freshness_stall", {row["alert_type"] for row in rows(root / "argus.sqlite3", "product_alerts")})
 
     def test_subspace_circuit_recovery_is_scoped_to_publish_target_without_blockers(self):
         with TemporaryDirectory() as tmpdir:

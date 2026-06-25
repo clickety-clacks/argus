@@ -31,6 +31,8 @@ API_ADAPTERS = {"api", "arxiv_atom"}
 DEFAULT_SUBSPACE_WEBSOCKET_PATH = "/api/firehose/stream/websocket"
 DEFAULT_SUBSPACE_AGENT_ID_ENV = "ARGUS_SUBSPACE_AGENT_ID"
 DEFAULT_SUBSPACE_SESSION_TOKEN_ENV = "ARGUS_SUBSPACE_SESSION_TOKEN"
+DEFAULT_SUBSPACE_SESSION_EXPIRES_AT_ENV = "ARGUS_SUBSPACE_SESSION_EXPIRES_AT"
+SUBSPACE_SESSION_EXPIRES_SOON_SECONDS = 6 * 60 * 60
 DEFAULT_OPERATOR_ALERT_TARGET = "openclaw_alert"
 OPERATOR_ALERT_TARGETS = {"openclaw_alert", "command"}
 DEFAULT_OPERATOR_ALERT_SOURCE = "argus"
@@ -66,6 +68,7 @@ class PublishConfig:
     subspace_endpoint: Optional[str] = None
     subspace_agent_id: Optional[str] = None
     subspace_session_token: Optional[str] = None
+    subspace_session_expires_at: Optional[str] = None
     subspace_websocket_path: str = DEFAULT_SUBSPACE_WEBSOCKET_PATH
     require_embeddings: bool = True
     allow_non_embedded_fallback: bool = False
@@ -307,6 +310,7 @@ def publish_config_from_payload(payload: Dict[str, Any]) -> PublishConfig:
         subspace_endpoint=(str(payload["subspace_endpoint"]) if payload.get("subspace_endpoint") else None),
         subspace_agent_id=(str(payload["subspace_agent_id"]) if payload.get("subspace_agent_id") else os.environ.get(DEFAULT_SUBSPACE_AGENT_ID_ENV)),
         subspace_session_token=os.environ.get(DEFAULT_SUBSPACE_SESSION_TOKEN_ENV),
+        subspace_session_expires_at=os.environ.get(DEFAULT_SUBSPACE_SESSION_EXPIRES_AT_ENV),
         subspace_websocket_path=str(payload.get("subspace_websocket_path") or DEFAULT_SUBSPACE_WEBSOCKET_PATH),
         require_embeddings=bool(payload.get("require_embeddings", True)),
         allow_non_embedded_fallback=bool(payload.get("allow_non_embedded_fallback", False)),
@@ -831,6 +835,8 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
     effective = "inactive"
     blocked_reason = None
     activation_observed_at = None
+    session_expires_at = config.publish.subspace_session_expires_at
+    session_expires_soon = False
     if error:
         blocked_reason = error
     elif config.publish.mode == "dry_run":
@@ -842,18 +848,31 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
         elif not config.publish.subspace_agent_id or not config.publish.subspace_session_token:
             effective = "blocked"
             blocked_reason = "missing_subspace_credentials"
-        elif config.scheduler.max_live_publishes_per_tick is None:
-            effective = "blocked"
-            blocked_reason = "missing_publish_cap"
-        elif config.publish.require_embeddings and not config.publish.allow_non_embedded_fallback and not embedding_config_valid(config.embedding):
-            effective = "blocked"
-            blocked_reason = "missing_embedding_config"
-        elif config.publish.require_embeddings and not config.publish.allow_non_embedded_fallback and not production_embedding_config_allowed(config.embedding):
-            effective = "blocked"
-            blocked_reason = "non_production_embedding_backend"
         else:
-            effective = "live"
-            activation_observed_at = iso_z(observed_at)
+            try:
+                if session_expires_at:
+                    expires_at = parse_now(session_expires_at)
+                    seconds_until_expiry = (expires_at - observed_at).total_seconds()
+                    session_expires_soon = seconds_until_expiry <= SUBSPACE_SESSION_EXPIRES_SOON_SECONDS
+                    if seconds_until_expiry <= 0:
+                        effective = "blocked"
+                        blocked_reason = "subspace_session_expired"
+            except Exception:
+                effective = "blocked"
+                blocked_reason = "invalid_subspace_session_expires_at"
+            if blocked_reason is None:
+                if config.scheduler.max_live_publishes_per_tick is None:
+                    effective = "blocked"
+                    blocked_reason = "missing_publish_cap"
+                elif config.publish.require_embeddings and not config.publish.allow_non_embedded_fallback and not embedding_config_valid(config.embedding):
+                    effective = "blocked"
+                    blocked_reason = "missing_embedding_config"
+                elif config.publish.require_embeddings and not config.publish.allow_non_embedded_fallback and not production_embedding_config_allowed(config.embedding):
+                    effective = "blocked"
+                    blocked_reason = "non_production_embedding_backend"
+                else:
+                    effective = "live"
+                    activation_observed_at = iso_z(observed_at)
     snapshot = {
         "snapshot_id": "sha256:{}:{}".format(config.config_hash, iso_z(observed_at)),
         "config_hash": config.config_hash,
@@ -867,6 +886,8 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
         "embedding_space_id": config.embedding.space_id,
         "embedding_backend": config.embedding.backend,
         "delivery_mode": config.delivery.mode,
+        "session_expires_at": session_expires_at,
+        "session_expires_soon": session_expires_soon,
         "publish_target_key": (
             "sha256:" + hashlib.sha256(("publish-target:v0\n" + str(config.publish.subspace_endpoint)).encode("utf-8")).hexdigest()
             if config.publish.subspace_endpoint
@@ -1243,6 +1264,20 @@ def publish_exception_is_permanent(exc: Exception) -> bool:
     }
 
 
+def publish_exception_is_auth_failure(exc: Exception) -> bool:
+    if not isinstance(exc, PublishTransportError):
+        return False
+    response = exc.response if isinstance(exc.response, dict) else {}
+    error = response.get("error") if isinstance(response.get("error"), dict) else {}
+    reply = response.get("reply") if isinstance(response.get("reply"), dict) else {}
+    response_body = reply.get("response") if isinstance(reply.get("response"), dict) else {}
+    code = str(error.get("code") or response_body.get("code") or response_body.get("reason") or "").lower()
+    message = str(error.get("message") or response_body.get("message") or exc).lower()
+    return code in {"unauthorized", "forbidden", "invalid_session", "expired_session", "invalid_token", "expired_token"} or (
+        "auth" in message or "unauthorized" in message or "forbidden" in message or "expired" in message
+    )
+
+
 def delivery_retry_delay_seconds(max_delay_seconds: int, attempt_number: int, key: str) -> int:
     base_delay = min(max_delay_seconds, DELIVERY_RETRY_BASE_DELAY_SECONDS * (2 ** max(0, attempt_number - 1)))
     jitter_window = int(base_delay * DELIVERY_RETRY_JITTER_RATIO)
@@ -1417,11 +1452,83 @@ class ArgusServer:
                 snapshot["activation_observed_at"] = activation_observed_at
         return snapshot
 
+    def _store_runtime_snapshot(self, snapshot: Dict[str, Any], event_type: str, status: str, error: Optional[str] = None) -> None:
+        store_runtime_snapshot(self.connection, snapshot, event_type, status, error)
+        self._record_subspace_session_health_alerts(parse_now(snapshot["observed_at"]), snapshot)
+
+    def _record_subspace_session_health_alerts(self, now: datetime, snapshot: Dict[str, Any]) -> None:
+        if snapshot.get("requested_mode") != "live":
+            return
+        if snapshot.get("blocked_reason") == "subspace_session_expired":
+            self._record_hard_failure_alert(
+                now,
+                "subspace_session_expired",
+                {
+                    "dependency_class": "subspace_auth",
+                    "reason": "subspace_session_expired",
+                    "publish_target_key": snapshot.get("publish_target_key"),
+                    "session_expires_at": snapshot.get("session_expires_at"),
+                },
+                "Argus Subspace session expired; live publishing is blocked until the session token is refreshed.",
+                minimum_occurrences=1,
+            )
+            return
+        if snapshot.get("session_expires_soon"):
+            self._record_hard_failure_alert(
+                now,
+                "subspace_session_expires_soon",
+                {
+                    "dependency_class": "subspace_auth",
+                    "reason": "subspace_session_expires_soon",
+                    "publish_target_key": snapshot.get("publish_target_key"),
+                    "session_expires_at": snapshot.get("session_expires_at"),
+                },
+                "Argus Subspace session expires soon; refresh the session token before live publishing stalls.",
+                minimum_occurrences=1,
+            )
+
+    def _record_publish_freshness_stall_alert_if_needed(self, now: datetime) -> None:
+        try:
+            publish_snapshot = latest_snapshot(self.connection)
+        except PipelineError:
+            return
+        if publish_snapshot.get("effective_mode") != "live":
+            return
+        row = self.connection.execute(
+            """
+            SELECT plan_id, publish_target_key, COUNT(*) AS stalled_count, MIN(COALESCE(next_retry_at, due_at)) AS oldest_due_at
+            FROM delivery_entries
+            WHERE status = 'retry_pending'
+              AND COALESCE(next_retry_at, due_at) <= ?
+            GROUP BY plan_id, publish_target_key
+            ORDER BY oldest_due_at, plan_id
+            LIMIT 1
+            """,
+            (iso_z(now),),
+        ).fetchone()
+        if row is None:
+            return
+        self._record_hard_failure_alert(
+            now,
+            "subspace_publish_freshness_stall",
+            {
+                "dependency_class": "subspace_publish",
+                "reason": "subspace_publish_freshness_stall",
+                "plan_id": row["plan_id"],
+                "publish_target_key": row["publish_target_key"],
+                "stalled_delivery_entries": int(row["stalled_count"]),
+                "oldest_due_at": row["oldest_due_at"],
+                "session_expires_at": publish_snapshot.get("session_expires_at"),
+            },
+            "Argus Subspace publish freshness stalled; live delivery has overdue pending work.",
+            minimum_occurrences=1,
+        )
+
     def _ensure_control_state(self) -> None:
         now = self.clock.now()
         self._store_config_snapshot(now)
         self._apply_persisted_publish_state()
-        store_runtime_snapshot(self.connection, self._build_publish_snapshot(now), "control_start", "ok")
+        self._store_runtime_snapshot(self._build_publish_snapshot(now), "control_start", "ok")
         if self.connection.execute("SELECT 1 FROM scheduler_state WHERE id = 1").fetchone() is None:
             self._record_scheduler_config(self.config.scheduler, now, recompute_next=True)
 
@@ -1430,7 +1537,7 @@ class ArgusServer:
         self._store_config_snapshot(now)
         self._apply_persisted_publish_state()
         snapshot = self._build_publish_snapshot(now)
-        store_runtime_snapshot(self.connection, snapshot, "service_start" if self.register_service else "control_start", "ok")
+        self._store_runtime_snapshot(snapshot, "service_start" if self.register_service else "control_start", "ok")
         if self.register_service:
             self.connection.execute(
                 "INSERT OR REPLACE INTO service_state VALUES (1, ?, ?, ?, ?)",
@@ -1552,13 +1659,13 @@ class ArgusServer:
                 self._record_scheduler_event("scheduler_reload_failed", None, "failed", {"error": str(exc)}, now)
                 return
             snapshot = self._build_publish_snapshot(now, force_inactive=True, error=str(exc))
-            store_runtime_snapshot(self.connection, snapshot, "reload_failed", "failed", str(exc))
+            self._store_runtime_snapshot(snapshot, "reload_failed", "failed", str(exc))
             self._record_scheduler_event("scheduler_reload_failed", None, "failed", {"error": str(exc)}, now)
             return
         self.config = new_config
         self._store_config_snapshot(now)
         snapshot = self._build_publish_snapshot(now)
-        store_runtime_snapshot(self.connection, snapshot, "reload", "ok")
+        self._store_runtime_snapshot(snapshot, "reload", "ok")
         self._record_scheduler_config(new_config.scheduler, now, recompute_next=True)
         self._record_scheduler_event("scheduler_reload", None, "ok", {"mode": new_config.scheduler.mode}, now)
 
@@ -1590,7 +1697,7 @@ class ArgusServer:
             raise PipelineError("Invalid publish mode: {}".format(state))
         self.config = dataclasses.replace(self.config, publish=dataclasses.replace(self.config.publish, mode=state))
         snapshot = self._build_publish_snapshot(self.clock.now())
-        store_runtime_snapshot(self.connection, snapshot, "set_publish_state", "ok")
+        self._store_runtime_snapshot(snapshot, "set_publish_state", "ok")
         return snapshot
 
     def prime(self, requested_by: str = "cli", source_id: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
@@ -1643,6 +1750,7 @@ class ArgusServer:
         if control_result is not None:
             return control_result
         now = self.clock.now()
+        self._record_publish_freshness_stall_alert_if_needed(now)
         delivery_result = self._drain_due_delivery(now)
         if delivery_result:
             return 0, {"run_kind": "delivery", "exit_status": "ok", "delivery": delivery_result}
@@ -3643,6 +3751,23 @@ class ArgusServer:
                     (delivery_status, next_retry_at, exc.__class__.__name__, str(exc), completed_at, entry["entry_id"]),
                 )
                 self.connection.commit()
+                if publish_exception_is_auth_failure(exc):
+                    self._record_hard_failure_alert(
+                        self.clock.now(),
+                        "subspace_publish_auth_failure",
+                        {
+                            "dependency_class": "subspace_auth",
+                            "reason": "subspace_publish_auth_failure",
+                            "run_id": entry["run_id"],
+                            "plan_id": entry["plan_id"],
+                            "publish_target_key": entry["publish_target_key"],
+                            "error_class": exc.__class__.__name__,
+                            "error_message": truncate_alert_message(str(exc)),
+                            "session_expires_at": publish_snapshot.get("session_expires_at"),
+                        },
+                        "Argus Subspace publish auth failure; live delivery requires a refreshed session token.",
+                        minimum_occurrences=1,
+                    )
                 failed += 1
         if succeeded > 0:
             resolved_circuit_keys = self._resolved_subspace_circuit_alert_keys(target)
