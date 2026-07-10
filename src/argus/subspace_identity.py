@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import os
+import socket
+import ssl
 import tempfile
 import threading
 from dataclasses import dataclass
@@ -56,8 +59,32 @@ def _response_payload(response: requests.Response) -> Dict[str, Any]:
 
 
 def _error_code(payload: Dict[str, Any], fallback: str) -> str:
-    error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    error_value = payload.get("error")
+    if isinstance(error_value, str) and error_value:
+        return error_value
+    error = error_value if isinstance(error_value, dict) else {}
     return str(payload.get("code") or error.get("code") or payload.get("reason") or error.get("reason") or fallback)
+
+
+def _request_exception_cause(exc: requests.RequestException) -> str:
+    current: Optional[BaseException] = exc
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, requests.exceptions.SSLError) or isinstance(current, ssl.SSLError):
+            return "TLS_FAILURE"
+        if isinstance(current, requests.Timeout) or isinstance(current, (TimeoutError, socket.timeout)):
+            return "TIMEOUT"
+        if isinstance(current, ConnectionRefusedError) or (
+            isinstance(current, OSError) and current.errno == errno.ECONNREFUSED
+        ):
+            return "CONNECTION_REFUSED"
+        if isinstance(current, socket.gaierror):
+            return "DNS_RESOLUTION_FAILED"
+        current = current.__cause__ or current.__context__
+    if isinstance(exc, requests.ConnectionError):
+        return "CONNECTION_ERROR"
+    return exc.__class__.__name__
 
 
 @dataclass(frozen=True)
@@ -189,7 +216,7 @@ class DurableSubspaceSession:
                 timeout=self.timeout_seconds,
             )
         except requests.RequestException as exc:
-            cause = exc.__class__.__name__
+            cause = _request_exception_cause(exc)
             self._persist_reauth_failure(now, reason, cause, {})
             raise SubspaceAuthError(cause, "Subspace reauth/start failed: {}".format(exc)) from exc
         start_payload = _response_payload(start)
@@ -218,7 +245,7 @@ class DurableSubspaceSession:
                 timeout=self.timeout_seconds,
             )
         except requests.RequestException as exc:
-            cause = exc.__class__.__name__
+            cause = _request_exception_cause(exc)
             self._persist_reauth_failure(now, reason, cause, {})
             raise SubspaceAuthError(cause, "Subspace reauth/verify failed: {}".format(exc)) from exc
         verify_payload = _response_payload(verify)

@@ -45,7 +45,7 @@ embedding:
   space_id: openai:text-embedding-3-small:1536:v1
 ```
 
-The host must provide `OPENAI_API_KEY` through the operator environment or host secret mechanism; do not put the token in YAML or logs. Default config keeps `publish.state: inactive`, `publish.live_approval: false`, and `schedule.max_live_publishes_per_tick: 1`; inactive plus no live approval is the primary safety boundary, and the scheduled publish cap is the first-activation rate boundary.
+The host must provide `OPENAI_API_KEY` through the operator environment or host secret mechanism; do not put the token in YAML or logs. Default config keeps `publish.mode: inactive` and `schedule.max_live_publishes_per_tick: 1`; inactive mode is the primary safety boundary, and the scheduled publish cap is the first-activation rate boundary.
 
 Production publishing uses the existing Racter Argus Ed25519 identity and a server-scoped durable session file:
 
@@ -129,7 +129,7 @@ argus run-cycle --config /etc/argus/argus.yaml --reason manual
 argus run-cycle --config /etc/argus/argus-e2e-canary.yaml --reason e2e-shrdlu --max-live-publishes 1
 argus reload --config /etc/argus/argus.yaml
 argus set-publish-state --config /etc/argus/argus.yaml --state inactive
-argus set-publish-state --config /etc/argus/argus.yaml --state active
+argus set-publish-state --config /etc/argus/argus.yaml --state live
 argus status --db /var/lib/argus/argus.sqlite3
 argus source-health --db /var/lib/argus/argus.sqlite3
 argus explain-skip --db /var/lib/argus/argus.sqlite3 --run <run_id>
@@ -138,7 +138,7 @@ argus embedding-doctor --config /etc/argus/argus.yaml
 
 `prime` is optional/manual baseline tooling only. Normal scheduled/manual cycles do not require prime and do not use prime as an active/inactive gate. Use `argus prime --source <source-id>` after adding one feed when you want to baseline only that source before any later active publishing.
 
-If publishing is already active and a source is added to an existing Argus database without a prior successful source run, Argus auto-baselines that source during the next cycle. The source health and normalized/dedupe state are recorded, but backlog items from that source do not create package rows or live publish attempts. The existing active-publish requirements still apply unchanged for later new items: `publish.state: active`, `publish.live_approval: true`, valid Subspace config, embedding/fallback policy, and live idempotency.
+If publishing is already live and a source is added to an existing Argus database without a prior successful source run, Argus auto-baselines that source during the next cycle. The source health and normalized/dedupe state are recorded, but backlog items from that source do not create package rows or live publish attempts. The existing live-publish requirements still apply unchanged for later new items: `publish.mode: live`, valid Subspace config, embedding/fallback policy, and live idempotency.
 
 Prime records per-source baseline intent in SQLite. If a primed source fails to parse during the prime run, its baseline remains pending; the first later successful parse for that source writes normalized/dedupe state and source health, but still creates no package rows or live publish attempts for that backlog. A `304 not_modified` fetch does not satisfy a pending baseline because it did not parse source contents. Later newly observed items may package/publish normally subject to the active safety gates.
 
@@ -215,8 +215,7 @@ For first activation, the exact config field is:
 schedule:
   max_live_publishes_per_tick: 1
 publish:
-  state: active
-  live_approval: true
+  mode: live
 ```
 
 After editing `/etc/argus/argus.yaml`, apply the change through the running server:
@@ -233,7 +232,7 @@ Watch the first scheduled tick and publish attempts:
 watch -n 10 'argus status --db /var/lib/argus/argus.sqlite3; sqlite3 /var/lib/argus/argus.sqlite3 "select status, count(*) from publish_attempts group by status; select attempted_at, status, subspace_message_id from publish_attempts order by attempted_at desc limit 5;"'
 ```
 
-Publish retry discipline is intentionally conservative. A sent `post_message` with no observed Subspace ACK is recorded as `unknown` on both `publish_attempts` and `delivery_entries`; Argus does not automatically retry that package because Subspace may have accepted it and the operator must reconcile by idempotency key/message evidence. Retryable transport failures use capped exponential backoff with deterministic jitter, one pending in-flight attempt per publish idempotency key, per-report and per-run attempt caps, and a run-level circuit breaker so a small set of reports cannot amplify into hundreds of live attempts.
+Publish retry discipline preserves Subspace idempotency. A sent `post_message` with no observed Subspace ACK is recorded as `unknown` on the publish attempt and `retry_pending` on the delivery entry, then retried with the same publish idempotency key. An idempotent duplicate-success response records the Subspace message id and succeeds the entry. Retryable transport failures use capped exponential backoff with deterministic jitter, one pending in-flight attempt per publish idempotency key, per-report and per-run attempt caps, and a run-level circuit breaker so a small set of reports cannot amplify into hundreds of live attempts.
 
 Evidence to capture after the first tick:
 
@@ -278,7 +277,7 @@ test -s /var/lib/argus/runs/<run-id>/package-candidates.jsonl
 
 Use those artifacts plus `argus source-health`, `argus explain-skip`, and SQLite state to verify source health, normalized items, dedupe decisions or clusters where applicable, publish/package candidates, and publish attempts/state.
 
-A healthy inactive deployment has no `publish_attempts` rows unless `publish.state: active`, live approval, and Subspace endpoint config are all present.
+A healthy inactive deployment has no `publish_attempts` rows unless `publish.mode: live` and valid Subspace endpoint/credential config are present.
 
 ## arXiv source reliability
 
@@ -298,8 +297,7 @@ Prepare a separate one-item canary config from `config/argus.e2e-canary.example.
 
 ```yaml
 publish:
-  state: active
-  live_approval: true
+  mode: live
   subspace_endpoint: https://subspace.swarm.channel
   subspace_websocket_path: /api/firehose/stream/websocket
   require_embeddings: true
@@ -322,7 +320,7 @@ sqlite3 /var/lib/argus-e2e/argus.sqlite3 'select status, subspace_message_id, re
 
 The checked-in canary config explicitly sets `subspace_credential_mode: env_canary`; set `ARGUS_SUBSPACE_AGENT_ID` and `ARGUS_SUBSPACE_SESSION_TOKEN` only for that approved canary run. It is fixture-backed by design so it emits exactly one operator-controlled package rather than live feed contents. The `--max-live-publishes 1` guard fails the cycle before any Subspace post if more than one active-eligible live send would be emitted. shrdlu-side receipt is verified downstream of Argus by observing the expected Subspace inbound message with the recorded `subspace_message_id` and package `package_id`.
 
-Rollback is to set the canary config back to `publish.state: inactive` and `publish.live_approval: false`, then rerun status checks. Do not delete the canary SQLite file before capturing the `publish_attempts` evidence.
+Rollback is to set the canary config back to `publish.mode: inactive`, then rerun status checks. Do not delete the canary SQLite file before capturing the `publish_attempts` evidence.
 
 ## T261 shrdlu/Subetha URL-dedupe E2E fixture
 

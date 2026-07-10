@@ -10,7 +10,7 @@ Argus does **not** decide what matters. It does **not** write digests, rankings,
 
 Server-mode MVP. The production target is a long-running `argus serve` process with an internal scheduler. Host supervisors may restart the process, but cron/systemd timers/launchd timers must not schedule fetches.
 
-The default server config is inactive: `publish.state: inactive` and no live approval. Active mode is controlled by runtime config/publish state reloads and is forward-only from the activation snapshot.
+The default server config is inactive: `publish.mode: inactive`. Live mode is controlled by runtime config/publish state reloads and is forward-only from the activation snapshot.
 
 ## What it produces
 
@@ -43,6 +43,7 @@ Python dependencies are declared in `pyproject.toml`:
 - `PyYAML`
 - `requests`
 - `websocket-client`
+- `cryptography`
 
 ## Setup
 
@@ -114,7 +115,7 @@ argus prime --config /etc/argus/argus.yaml
 argus prime --config /etc/argus/argus.yaml --source openai
 ```
 
-When publishing is already active and a source appears with no prior successful source run in an existing Argus database, the cycle treats that source as baseline-only: it fetches, records source health, and stores normalized/dedupe state, but it does not create package rows or live publish attempts for that source's backlog. Later cycles may publish only new post-baseline reports from that source, subject to the unchanged `publish.state`, `live_approval`, embedding, and idempotency gates.
+When publishing is already live and a source appears with no prior successful source run in an existing Argus database, the cycle treats that source as baseline-only: it fetches, records source health, and stores normalized/dedupe state, but it does not create package rows or live publish attempts for that source's backlog. Later cycles may publish only new post-baseline reports from that source, subject to the unchanged `publish.mode`, embedding, and idempotency gates.
 
 `--prime` and `--dry-run` are mutually exclusive:
 
@@ -133,7 +134,7 @@ python3 -m json.tool "$OUT/run-summary.json"
 head -20 "$OUT/publish-candidates.jsonl"
 ```
 
-Server-mode safety is `publish.state: inactive` by default. `--dry-run` remains available only on the legacy one-shot CLI.
+Server-mode safety is `publish.mode: inactive` by default. `--dry-run` remains available only on the legacy one-shot CLI.
 
 ## Run tests
 

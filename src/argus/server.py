@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import errno
 import hashlib
 import json
 import os
@@ -1333,12 +1334,48 @@ class PublishAckUnknownError(PublishTransportError):
         super().__init__(message, response, exact_cause="ACK_UNKNOWN", cause_group="acknowledgement")
 
 
+def _publish_response_error_code(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if isinstance(error, str) and error:
+        return error
+    if isinstance(error, dict):
+        code = error.get("code") or error.get("reason")
+        if code:
+            return str(code)
+    code = payload.get("code") or payload.get("reason")
+    if code:
+        return str(code)
+    for key in ("reply", "response"):
+        code = _publish_response_error_code(payload.get(key))
+        if code:
+            return code
+    return None
+
+
+def publish_transport_exception_cause(exc: BaseException) -> str:
+    current: Optional[BaseException] = exc
+    seen: Set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ConnectionRefusedError) or (
+            isinstance(current, OSError) and current.errno == errno.ECONNREFUSED
+        ):
+            return "CONNECTION_REFUSED"
+        if isinstance(current, (TimeoutError, socket.timeout)):
+            return "TIMEOUT"
+        if isinstance(current, socket.gaierror):
+            return "DNS_RESOLUTION_FAILED"
+        if isinstance(current, ssl.SSLError):
+            return "TLS_FAILURE"
+        current = current.__cause__ or current.__context__
+    return "TRANSPORT_FAILURE"
+
+
 def exact_publish_cause(response: Optional[Dict[str, Any]], message: str) -> str:
     payload = response if isinstance(response, dict) else {}
-    error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
-    reply = payload.get("reply") if isinstance(payload.get("reply"), dict) else {}
-    body = reply.get("response") if isinstance(reply.get("response"), dict) else {}
-    code = payload.get("code") or error.get("code") or body.get("code") or body.get("reason")
+    code = _publish_response_error_code(payload)
     if code:
         return str(code)
     lowered = message.lower()
@@ -1402,10 +1439,7 @@ def publish_exception_is_permanent(exc: Exception) -> bool:
     if not isinstance(exc, PublishTransportError):
         return False
     response = exc.response if isinstance(exc.response, dict) else {}
-    error = response.get("error") if isinstance(response.get("error"), dict) else {}
-    reply = response.get("reply") if isinstance(response.get("reply"), dict) else {}
-    response_body = reply.get("response") if isinstance(reply.get("response"), dict) else {}
-    code = str(error.get("code") or response_body.get("code") or response_body.get("reason") or "")
+    code = _publish_response_error_code(response) or ""
     return code in {
         "invalid_package_contract",
         "invalid_request",
@@ -1450,7 +1484,10 @@ def _read_phoenix_reply(
         except Exception as exc:
             if missing_ack_is_unknown:
                 raise PublishAckUnknownError("Subspace {} reply not received: {}".format(operation, exc)) from exc
-            raise PublishTransportError("Subspace {} reply not received: {}".format(operation, exc)) from exc
+            raise PublishTransportError(
+                "Subspace {} reply not received: {}".format(operation, exc),
+                exact_cause=publish_transport_exception_cause(exc),
+            ) from exc
         try:
             frame = json.loads(raw)
         except ValueError as exc:
@@ -1494,7 +1531,10 @@ def post_message_to_subspace(
     try:
         connection = create_connection(url, timeout=timeout, suppress_origin=True)
     except Exception as exc:
-        raise PublishTransportError("Subspace websocket connection failed: {}".format(exc)) from exc
+        raise PublishTransportError(
+            "Subspace websocket connection failed: {}".format(exc),
+            exact_cause=publish_transport_exception_cause(exc),
+        ) from exc
     try:
         join_ref = "1"
         post_ref = "2"
@@ -1521,7 +1561,10 @@ def post_message_to_subspace(
     except PublishTransportError:
         raise
     except Exception as exc:
-        raise PublishTransportError("Subspace websocket publish failed: {}".format(exc)) from exc
+        raise PublishTransportError(
+            "Subspace websocket publish failed: {}".format(exc),
+            exact_cause=publish_transport_exception_cause(exc),
+        ) from exc
     finally:
         try:
             connection.close()
@@ -1713,6 +1756,8 @@ class ArgusServer:
         stale = self.connection.execute(
             """
             SELECT delivery_entries.entry_id,
+                   delivery_entries.publish_idempotency_key,
+                   delivery_entries.attempt_count,
                    (SELECT attempt_id FROM publish_attempts
                     WHERE publish_attempts.publish_idempotency_key = delivery_entries.publish_idempotency_key
                       AND publish_attempts.status = 'pending'
@@ -1722,17 +1767,23 @@ class ArgusServer:
             """
         ).fetchall()
         for row in stale:
+            delay = delivery_retry_delay_seconds(
+                self.config.delivery.max_retry_delay_seconds,
+                max(1, int(row["attempt_count"])),
+                row["publish_idempotency_key"],
+            )
             self._record_delivery_failure(
                 row["entry_id"],
                 now,
-                status="unknown",
+                status="retry_pending",
                 exact_cause="ACK_UNKNOWN",
                 cause_group="acknowledgement",
                 stage="restart_recovery",
-                retry_disposition="unknown",
+                retry_disposition="retry_pending",
                 message="service restarted before delivery result was recorded",
                 error_class="RuntimeError",
                 attempt_id=row["attempt_id"],
+                next_retry_at=iso_z(now + timedelta(seconds=delay)),
             )
         self.connection.execute(
             """
@@ -2191,7 +2242,7 @@ class ArgusServer:
                         publish_attempt_counts,
                     )
                     if recovery:
-                        summary["embedding_delivery_recovery"] = recovery
+                        summary["embedding_backend_recovery"] = recovery
                 self._store_run(run_id, run_kind, now, exit_code, output_dir, cycle_snapshot, summary, commit=False)
                 (output_dir / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
                 self.connection.commit()
@@ -3049,7 +3100,7 @@ class ArgusServer:
         for row in rows:
             if int(row["notification_count"]) > 0:
                 notification = self._send_alert(
-                    "Argus embedding delivery recovered: accepted {accepted} reports and produced {packages} packages "
+                    "Argus embedding backend recovered: accepted {accepted} reports and produced {packages} packages "
                     "(provider={provider}, model={model}).".format(
                         accepted=accepted_report_count,
                         packages=package_count,
@@ -3363,6 +3414,7 @@ class ArgusServer:
 
     def _publish_package_to_subspace(self, package_payload: Dict[str, Any], idempotency_key: str, supplied_embedding: Dict[str, Any]) -> Dict[str, Any]:
         auth_recovery = self._ensure_durable_subspace_session("publish_attempt")
+        durable_authenticated_join = self._durable_subspace_session is not None
         return post_message_to_subspace(
             str(self.config.publish.subspace_endpoint),
             self.config.publish.subspace_websocket_path,
@@ -3371,7 +3423,7 @@ class ArgusServer:
             json.dumps(package_payload, sort_keys=True, separators=(",", ":")),
             [canonical_embedding_for_subspace(supplied_embedding)] if supplied_embedding else [],
             idempotency_key,
-        ) | {"authenticated_join": True, "auth_recovery": auth_recovery}
+        ) | {"authenticated_join": durable_authenticated_join, "auth_recovery": auth_recovery}
 
     def _delivery_window_end(self, now: datetime, run_id: str) -> datetime:
         state = self._scheduler_state()
@@ -3549,7 +3601,7 @@ class ArgusServer:
                 WHERE attempt_id = ?
                 """,
                 (
-                    "unknown" if status == "unknown" else "failed",
+                    "unknown" if status == "unknown" or exact_cause == "ACK_UNKNOWN" else "failed",
                     observed_at,
                     json.dumps(response, sort_keys=True) if response is not None else None,
                     error_class,
@@ -3729,7 +3781,7 @@ class ArgusServer:
         jobs = self.connection.execute(
             """
             SELECT * FROM delivery_outage_notifications
-            WHERE status IN ('pending', 'failed') {}
+            WHERE status IN ('pending', 'attempted', 'failed') AND delivered_at IS NULL {}
             ORDER BY outage_id, channel
             """.format(where),
             args,
@@ -3829,10 +3881,10 @@ class ArgusServer:
         if successful_attempt is None or not successful_attempt["completed_at"] or successful_attempt["completed_at"] < outage["first_observed_at"]:
             return
         has_auth_cause = self.connection.execute(
-            "SELECT 1 FROM delivery_outage_events WHERE outage_id = ? AND cause_group IN ('auth', 'auth_policy') LIMIT 1",
+            "SELECT 1 FROM delivery_outage_events WHERE outage_id = ? AND cause_group = 'auth' LIMIT 1",
             (outage["outage_id"],),
         ).fetchone()
-        if auth_recovery:
+        if auth_recovery and auth_recovery.get("reauthenticated"):
             credential_recovered_at = auth_recovery.get("reauthenticated_at") or iso_z(now)
             credential_evidence = auth_recovery
         elif not has_auth_cause and authenticated_join:
@@ -3905,19 +3957,6 @@ class ArgusServer:
             message=message,
             error_class=error_class,
             next_retry_at=iso_z(retry_at),
-        )
-
-    def _mark_delivery_unknown(self, entry_id: str, now: datetime, error_class: str, message: str) -> None:
-        self._record_delivery_failure(
-            entry_id,
-            now,
-            status="unknown",
-            exact_cause="ACK_UNKNOWN" if error_class in {"PublishAckUnknownError", "RuntimeError"} else error_class,
-            cause_group="acknowledgement",
-            stage="acknowledgement",
-            retry_disposition="unknown",
-            message=message,
-            error_class=error_class,
         )
 
     def _run_publish_attempt_counts(self, run_id: str) -> Dict[str, int]:
@@ -4218,19 +4257,6 @@ class ArgusServer:
                 self.connection.commit()
                 succeeded += 1
                 continue
-            unknown_attempt = self.connection.execute(
-                "SELECT attempt_id FROM publish_attempts WHERE publish_idempotency_key = ? AND status = 'unknown' ORDER BY attempted_at DESC LIMIT 1",
-                (key,),
-            ).fetchone()
-            if unknown_attempt is not None:
-                self._mark_delivery_unknown(
-                    entry["entry_id"],
-                    now,
-                    "PublishAckUnknownError",
-                    "previous Subspace publish attempt has unknown acknowledgement state",
-                )
-                unknown += 1
-                continue
             inflight_attempt = self.connection.execute(
                 "SELECT attempt_id FROM publish_attempts WHERE publish_idempotency_key = ? AND status = 'pending' ORDER BY attempted_at DESC LIMIT 1",
                 (key,),
@@ -4320,17 +4346,19 @@ class ArgusServer:
                 succeeded += 1
             except PublishAckUnknownError as exc:
                 response = getattr(exc, "response", None)
+                delay = delivery_retry_delay_seconds(self.config.delivery.max_retry_delay_seconds, attempt_number, key)
                 self._record_delivery_failure(
                     entry["entry_id"],
                     self.clock.now(),
-                    status="unknown",
+                    status="retry_pending",
                     exact_cause="ACK_UNKNOWN",
                     cause_group="acknowledgement",
                     stage="acknowledgement",
-                    retry_disposition="unknown",
+                    retry_disposition="retry_pending",
                     message=str(exc),
                     error_class=exc.__class__.__name__,
                     attempt_id=attempt,
+                    next_retry_at=iso_z(self.clock.now() + timedelta(seconds=delay)),
                     response=response,
                 )
                 unknown += 1
@@ -4919,7 +4947,7 @@ def run_status(db_path: Path) -> Dict[str, Any]:
                     json.loads(latest_embedding_alert_row["detail_json"]) if latest_embedding_alert_row else None
                 ),
                 "last_run_embedding_delivery_outage": (last_summary or {}).get("embedding_delivery_outage") if last_summary else None,
-                "last_run_embedding_delivery_recovery": (last_summary or {}).get("embedding_delivery_recovery") if last_summary else None,
+                "last_run_embedding_backend_recovery": (last_summary or {}).get("embedding_backend_recovery") if last_summary else None,
             },
             "counts": {
                 "packages": package_count,

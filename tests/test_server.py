@@ -20,6 +20,7 @@ import yaml
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import argus.server as server_module
+import argus.subspace_identity as subspace_identity_module
 from argus.pipeline import command_main, iso_z, run_pipeline_for_sources
 from argus.server import ArgusServer, FakeClock, load_runtime_config
 
@@ -32,7 +33,7 @@ def write_config(root: Path, *, mode: str = "interval", interval: str = "1h", pu
     fixture_dir = root / "feeds"
     fixture_dir.mkdir(exist_ok=True)
     shutil.copy(FEEDS / "stateful_source.xml", fixture_dir / "stateful-source.xml")
-    publish_config = dict(publish or {"state": "inactive"})
+    publish_config = dict(publish or {"mode": "inactive"})
     publish_config.setdefault("subspace_credential_mode", "env_canary")
     config = {
         "runtime": {
@@ -187,6 +188,8 @@ class LocalReauthServer:
     def __init__(self, public_key: str, expires_at: str | None = None):
         self.public_key = public_key
         self.expires_at = expires_at
+        self.start_error: tuple[int, dict] | None = None
+        self.verify_error: tuple[int, dict] | None = None
         self.verify_count = 0
         self.challenges: dict[str, str] = {}
         fixture = self
@@ -197,6 +200,9 @@ class LocalReauthServer:
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 if self.path == "/api/agents/reauth/start":
                     self.assert_agent(payload)
+                    if fixture.start_error is not None:
+                        self.reply(*fixture.start_error)
+                        return
                     challenge_id = "challenge-{}".format(len(fixture.challenges) + 1)
                     challenge = "nonce-{}".format(len(fixture.challenges) + 1)
                     fixture.challenges[challenge_id] = challenge
@@ -204,6 +210,9 @@ class LocalReauthServer:
                     return
                 if self.path == "/api/agents/reauth/verify":
                     self.assert_agent(payload)
+                    if fixture.verify_error is not None:
+                        self.reply(*fixture.verify_error)
+                        return
                     challenge = fixture.challenges.pop(payload.get("challengeId"), None)
                     if challenge is None:
                         self.reply(400, {"code": "CHALLENGE_INVALID"})
@@ -1479,8 +1488,9 @@ class ServerTests(unittest.TestCase):
             finally:
                 second.close()
             self.assertEqual(attempt["status"], "unknown")
-            self.assertEqual(entry["status"], "unknown")
-            self.assertIsNone(entry["next_retry_at"])
+            self.assertEqual(entry["status"], "retry_pending")
+            self.assertIsNotNone(entry["next_retry_at"])
+            self.assertGreater(entry["next_retry_at"], iso_z(NOW))
             self.assertIn("service restarted", entry["last_error_message"])
 
     def test_same_second_manual_runs_get_distinct_run_ids(self):
@@ -1795,9 +1805,9 @@ print(json.dumps({
             self.assertEqual(first_summary["embedding_delivery_outage"]["delivered_count"], 0)
             self.assertEqual(first_summary["embedding_delivery_outage"]["notification"]["status"], "below_repetition_threshold")
             self.assertEqual(second_summary["embedding_delivery_outage"]["notification"]["status"], "delivered")
-            self.assertEqual(recovery_summary["embedding_delivery_recovery"]["status"], "recovered")
-            self.assertEqual(recovery_summary["embedding_delivery_recovery"]["publish_attempt_counts"]["succeeded"], 1)
-            self.assertEqual(recovery_summary["embedding_delivery_recovery"]["delivered_count"], 1)
+            self.assertEqual(recovery_summary["embedding_backend_recovery"]["status"], "recovered")
+            self.assertEqual(recovery_summary["embedding_backend_recovery"]["publish_attempt_counts"]["succeeded"], 1)
+            self.assertEqual(recovery_summary["embedding_backend_recovery"]["delivered_count"], 1)
             self.assertEqual(len(alert_calls), 3)
             self.assertIn("Argus scheduled-news outage", alert_calls[0]["message"])
             self.assertIn("exact_cause=embed_backend_unavailable", alert_calls[0]["message"])
@@ -1806,7 +1816,7 @@ print(json.dumps({
             self.assertIn("model=text-embedding-3-small", alert_calls[1]["message"])
             self.assertIn("error_class=embed_backend_unavailable", alert_calls[1]["message"])
             self.assertNotIn("sk-", alert_calls[1]["message"])
-            self.assertIn("embedding delivery recovered", alert_calls[2]["message"])
+            self.assertIn("embedding backend recovered", alert_calls[2]["message"])
             self.assertEqual({call["session_key"] for call in alert_calls}, {"agent:test:argus"})
             self.assertEqual({call["source"] for call in alert_calls}, {"argus-test"})
             run_statuses = [row["status"] for row in sorted(rows(root / "argus.sqlite3", "runs"), key=lambda row: row["started_at"])]
@@ -1817,7 +1827,8 @@ print(json.dumps({
             self.assertEqual(alert_rows[0]["occurrence_count"], 2)
             self.assertEqual(alert_rows[0]["notification_count"], 2)
             status = server_module.run_status(root / "argus.sqlite3")
-            self.assertEqual(status["product_health"]["status"], "ok")
+            self.assertEqual(status["product_health"]["status"], "degraded")
+            self.assertEqual(status["product_health"]["active_scheduled_delivery_outages"][0]["status"], "active")
             self.assertEqual(status["counts"]["active_product_alerts"], 0)
             self.assertEqual(status["product_health"]["latest_embedding_delivery_outage"]["recovery"]["status"], "recovered")
 
@@ -3957,7 +3968,7 @@ print(json.dumps({
             self.assertEqual({row["status"] for row in attempts}, {"failed"})
             self.assertEqual({row["error_message"] for row in attempts}, {"Subspace response missing subspace_message_id"})
 
-    def test_missing_post_ack_records_unknown_without_retrying_hot_loop(self):
+    def test_missing_post_ack_retries_same_key_and_accepts_duplicate_success(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             path = write_config(
@@ -3971,11 +3982,28 @@ print(json.dumps({
             calls = []
             original_post = server_module.post_message_to_subspace
 
-            def unknown_ack(*args):
-                calls.append(args)
-                raise server_module.PublishAckUnknownError("Subspace post_message reply not received after replay")
+            def unknown_then_success(endpoint, websocket_path, agent_id, session_token, text, embeddings, idempotency_key):
+                del endpoint, websocket_path, agent_id, session_token, text, embeddings
+                calls.append(idempotency_key)
+                if len(calls) == 1:
+                    raise server_module.PublishAckUnknownError("Subspace post_message reply not received after replay")
+                if idempotency_key == calls[0]:
+                    return {
+                        "ok": True,
+                        "results": [
+                            {
+                                "duplicate": True,
+                                "subspace_message_id": "duplicate-success-message",
+                                "idempotency_key": idempotency_key,
+                            }
+                        ],
+                    }
+                return {
+                    "ok": True,
+                    "results": [{"sent": True, "subspace_message_id": "other-message", "idempotency_key": idempotency_key}],
+                }
 
-            server_module.post_message_to_subspace = unknown_ack
+            server_module.post_message_to_subspace = unknown_then_success
             server = ArgusServer(path, clock=FakeClock(NOW))
             try:
                 server.tick()
@@ -3985,10 +4013,12 @@ print(json.dumps({
                 server.close()
             attempts = rows(root / "argus.sqlite3", "publish_attempts")
             entries = rows(root / "argus.sqlite3", "delivery_entries")
-            self.assertEqual(len(calls), 2)
-            self.assertEqual([row["status"] for row in attempts], ["unknown", "unknown"])
-            self.assertEqual({row["status"] for row in entries}, {"unknown"})
-            self.assertTrue(all(row["next_retry_at"] is None for row in entries))
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(calls[0], calls[1])
+            self.assertEqual([row["status"] for row in attempts], ["unknown", "succeeded", "succeeded"])
+            self.assertEqual({row["status"] for row in entries}, {"succeeded"})
+            recovered_entry = next(row for row in entries if row["publish_idempotency_key"] == calls[0])
+            self.assertEqual(recovered_entry["subspace_message_id"], "duplicate-success-message")
 
     def test_publish_failures_use_jittered_backoff_and_trip_run_circuit_breaker(self):
         with TemporaryDirectory() as tmpdir:
@@ -4260,7 +4290,8 @@ print(json.dumps({
             entries = {row["entry_id"]: row for row in rows(root / "argus.sqlite3", "delivery_entries")}
             self.assertEqual(entries["entry-package-old"]["status"], "permanent_failure")
             self.assertEqual(entries["entry-package-old"]["last_error_class"], "stale_subspace_circuit_breaker")
-            self.assertEqual(entries["entry-package-current"]["status"], "unknown")
+            self.assertEqual(entries["entry-package-current"]["status"], "retry_pending")
+            self.assertIsNotNone(entries["entry-package-current"]["next_retry_at"])
             self.assertEqual(entries["entry-package-current"]["last_error_class"], "ACK_UNKNOWN")
             attempts = rows(root / "argus.sqlite3", "publish_attempts")
             self.assertEqual(len(attempts), 1)
@@ -4628,6 +4659,135 @@ print(json.dumps({
             self.assertIn("packages", status["counts"])
             self.assertIn("skipped_items_by_reason", status["counts"])
 
+    def test_production_auth_error_envelopes_preserve_exact_codes(self):
+        class ReplyConnection:
+            def __init__(self, code):
+                self.code = code
+
+            def recv(self):
+                return json.dumps(["1", "1", "firehose", "phx_reply", {"status": "error", "response": {"error": self.code}}])
+
+        for code in ("TOKEN_INVALID", "TOKEN_REVOKED", "BANNED", "RATE_LIMITED"):
+            with self.subTest(code=code):
+                with self.assertRaises(server_module.PublishTransportError) as raised:
+                    server_module._read_phoenix_reply(ReplyConnection(code), "1", "join")
+                self.assertEqual(raised.exception.exact_cause, code)
+                self.assertEqual(subspace_identity_module._error_code({"error": code}, "fallback"), code)
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            identity_path, session_path, public_key = write_durable_identity(root)
+            with LocalReauthServer(public_key) as auth:
+                auth.verify_error = (401, {"error": "TOKEN_INVALID"})
+                path = write_config(
+                    root,
+                    publish={
+                        "mode": "live",
+                        "subspace_credential_mode": "durable_identity",
+                        "subspace_endpoint": auth.endpoint,
+                        "subspace_identity_path": str(identity_path),
+                        "subspace_session_path": str(session_path),
+                        "allow_non_embedded_fallback": True,
+                    },
+                )
+                server = ArgusServer(path, clock=FakeClock(NOW))
+                try:
+                    self.assertEqual(server._durable_session_error["exact_cause"], "TOKEN_INVALID")
+                    state = json.loads(session_path.read_text())
+                    self.assertEqual(state["last_reauth"]["exact_cause"], "TOKEN_INVALID")
+                finally:
+                    server.close()
+
+    def test_transport_cause_comes_from_original_exception_chain(self):
+        def refused_connection(*_args, **_kwargs):
+            try:
+                raise ConnectionRefusedError("opaque lower-level refusal")
+            except ConnectionRefusedError as exc:
+                raise RuntimeError("generic websocket wrapper") from exc
+
+        with self.assertRaises(server_module.PublishTransportError) as raised:
+            server_module.post_message_to_subspace(
+                "https://subspace.swarm.channel",
+                "/api/firehose/stream/websocket",
+                "argus-agent",
+                "session-token",
+                "{}",
+                [],
+                "stable-key",
+                create_connection=refused_connection,
+            )
+        self.assertEqual(raised.exception.exact_cause, "CONNECTION_REFUSED")
+
+    def test_durable_identity_renews_approaching_finite_expiry(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            identity_path, session_path, public_key = write_durable_identity(root)
+            with LocalReauthServer(public_key, iso_z(NOW + timedelta(days=1))) as auth:
+                path = write_config(
+                    root,
+                    publish={
+                        "mode": "live",
+                        "subspace_credential_mode": "durable_identity",
+                        "subspace_endpoint": auth.endpoint,
+                        "subspace_identity_path": str(identity_path),
+                        "subspace_session_path": str(session_path),
+                        "subspace_renew_before": "6h",
+                        "allow_non_embedded_fallback": True,
+                    },
+                )
+                first = ArgusServer(path, clock=FakeClock(NOW))
+                first.close()
+                self.assertEqual(auth.verify_count, 1)
+                state = json.loads(session_path.read_text())
+                state["session_expires_at"] = iso_z(NOW + timedelta(hours=1))
+                session_path.write_text(json.dumps(state, sort_keys=True) + "\n")
+                auth.expires_at = iso_z(NOW + timedelta(days=2))
+                second = ArgusServer(path, clock=FakeClock(NOW))
+                try:
+                    self.assertEqual(auth.verify_count, 2)
+                    self.assertEqual(second.config.publish.subspace_agent_id, public_key)
+                    self.assertEqual(second.config.publish.subspace_session_token, "session-2")
+                finally:
+                    second.close()
+
+    def test_env_canary_scheduled_success_cannot_clear_without_durable_identity_join(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_credential_mode": "env_canary",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "require_embeddings": True,
+                },
+            )
+            original_post = server_module.post_message_to_subspace
+
+            def rate_limited(*_args):
+                raise server_module.PublishTransportError(
+                    "publish rejected",
+                    {"ok": False, "reply": {"response": {"error": "RATE_LIMITED"}}},
+                )
+
+            clock = FakeClock(NOW)
+            server_module.post_message_to_subspace = rate_limited
+            server = ArgusServer(path, clock=clock)
+            try:
+                server.tick()
+                outage = rows(root / "argus.sqlite3", "delivery_outages")[0]
+                self.assertEqual(outage["status"], "active")
+                self.assertEqual(rows(root / "argus.sqlite3", "delivery_outage_events")[0]["exact_cause"], "RATE_LIMITED")
+                server_module.post_message_to_subspace = fake_subspace_success([], "env-canary-message")
+                clock.advance(901)
+                server._drain_due_delivery(clock.now(), max_entries=1)
+            finally:
+                server_module.post_message_to_subspace = original_post
+                server.close()
+            outage = rows(root / "argus.sqlite3", "delivery_outages")[0]
+            self.assertEqual(outage["status"], "active")
+            self.assertIsNone(outage["credential_recovered_at"])
+            self.assertTrue(outage["recovery_subspace_message_id"].startswith("env-canary-message-"))
+
     def test_durable_identity_recovers_revoked_token_with_same_idempotency_key_and_guarded_clear(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -4668,7 +4828,7 @@ print(json.dumps({
                     if len(calls) == 1:
                         raise server_module.PublishTransportError(
                             "token revoked",
-                            {"ok": False, "reply": {"response": {"code": "TOKEN_REVOKED"}}},
+                            {"ok": False, "reply": {"response": {"error": "TOKEN_REVOKED"}}},
                         )
                     return {
                         "ok": True,
@@ -4759,10 +4919,42 @@ print(json.dumps({
                 try:
                     first.tick()
                     outage_before = rows(root / "argus.sqlite3", "delivery_outages")[0]
+                    entry = rows(root / "argus.sqlite3", "delivery_entries")[0]
+                    self.assertGreater(len(rows(root / "argus.sqlite3", "packages")), 0)
+                    self.assertEqual(outage_before["status"], "active")
                     first._record_auth_recovery_for_active_outage(
                         clock.now(), {"reauthenticated": True, "reauthenticated_at": iso_z(clock.now())}
                     )
                     self.assertEqual(rows(root / "argus.sqlite3", "delivery_outages")[0]["status"], "active")
+                    first._record_scheduled_delivery_success(
+                        entry["entry_id"],
+                        clock.now(),
+                        "",
+                        True,
+                        {"reauthenticated": True, "reauthenticated_at": iso_z(clock.now())},
+                    )
+                    self.assertEqual(rows(root / "argus.sqlite3", "delivery_outages")[0]["status"], "active")
+                    first.connection.execute("UPDATE runs SET run_kind = 'manual' WHERE run_id = ?", (entry["run_id"],))
+                    first.connection.commit()
+                    first._record_scheduled_delivery_success(
+                        entry["entry_id"],
+                        clock.now(),
+                        "manual-canary-message",
+                        True,
+                        {"reauthenticated": True, "reauthenticated_at": iso_z(clock.now())},
+                    )
+                    self.assertEqual(rows(root / "argus.sqlite3", "delivery_outages")[0]["status"], "active")
+                    first.connection.execute("UPDATE runs SET run_kind = 'scheduled' WHERE run_id = ?", (entry["run_id"],))
+                    first.connection.commit()
+                    first.connection.execute(
+                        """
+                        UPDATE delivery_outage_notifications
+                        SET status = 'attempted', last_error = NULL
+                        WHERE outage_id = ? AND channel = 'direct_pushover'
+                        """,
+                        (outage_before["outage_id"],),
+                    )
+                    first.connection.commit()
                 finally:
                     first.close()
 
