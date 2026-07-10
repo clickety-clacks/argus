@@ -1608,6 +1608,7 @@ class ArgusServer:
         self._tick_exception_alerted = False
         self._persisted_activation_observed_at: Optional[str] = None
         self._initialize_durable_subspace_session()
+        self._reconcile_active_delivery_outage_recovery(self.clock.now())
         if self.register_service:
             self.start()
         else:
@@ -2950,6 +2951,9 @@ class ArgusServer:
         alert_types: Tuple[str, ...],
         recovery: Dict[str, Any],
         alert_keys: Optional[Tuple[str, ...]] = None,
+        *,
+        emit_recovery_notification: bool = True,
+        commit: bool = True,
     ) -> Optional[Dict[str, Any]]:
         if alert_keys is not None:
             if not alert_keys:
@@ -2972,7 +2976,9 @@ class ArgusServer:
         for row in rows:
             previous_detail = json.loads(row["detail_json"])
             notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "not_previously_paged"}
-            if int(row["notification_count"]) > 0:
+            if int(row["notification_count"]) > 0 and not emit_recovery_notification:
+                notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "not_retained"}
+            elif int(row["notification_count"]) > 0:
                 recovery_message_id = recovery.get("recovery_subspace_message_id")
                 recovery_suffix = ""
                 if recovery_message_id:
@@ -3005,7 +3011,8 @@ class ArgusServer:
             )
             resolved += 1
             recovery_notifications.append(notification)
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return {"status": "recovered", "resolved_alert_count": resolved, "notifications": recovery_notifications}
 
     def _record_embedding_outage_alert(self, now: datetime, outage: Dict[str, Any]) -> Dict[str, Any]:
@@ -3875,14 +3882,107 @@ class ArgusServer:
         target = self._current_publish_target_key()
         if target is None:
             return
+        recovered_at = evidence.get("reauthenticated_at") or evidence.get("observed_at")
+        if not recovered_at:
+            return
         self.connection.execute(
             """
             UPDATE delivery_outages
             SET credential_recovered_at = ?, credential_recovery_json = ?
             WHERE outage_key = ? AND status = 'active' AND first_observed_at <= ?
             """,
-            (iso_z(now), json.dumps(evidence, sort_keys=True), self._delivery_outage_key(target), iso_z(now)),
+            (str(recovered_at), json.dumps(evidence, sort_keys=True), self._delivery_outage_key(target), str(recovered_at)),
         )
+        self.connection.commit()
+
+    def _reconcile_active_delivery_outage_recovery(self, now: datetime) -> None:
+        target = self._current_publish_target_key()
+        if target is None:
+            return
+        outage = self.connection.execute(
+            "SELECT * FROM delivery_outages WHERE outage_key = ? AND status = 'active'",
+            (self._delivery_outage_key(target),),
+        ).fetchone()
+        if outage is None:
+            return
+        if not outage["credential_recovered_at"] and self._durable_subspace_session is not None:
+            last_reauth = self._durable_subspace_session.public_status().get("last_reauth")
+            if (
+                isinstance(last_reauth, dict)
+                and last_reauth.get("status") == "succeeded"
+                and last_reauth.get("observed_at")
+                and str(last_reauth["observed_at"]) >= outage["first_observed_at"]
+            ):
+                evidence = {
+                    **last_reauth,
+                    "reauthenticated": True,
+                    "reauthenticated_at": str(last_reauth["observed_at"]),
+                }
+                self.connection.execute(
+                    """
+                    UPDATE delivery_outages
+                    SET credential_recovered_at = ?, credential_recovery_json = ?
+                    WHERE outage_id = ? AND status = 'active' AND credential_recovered_at IS NULL
+                    """,
+                    (str(last_reauth["observed_at"]), json.dumps(evidence, sort_keys=True), outage["outage_id"]),
+                )
+        successful = self.connection.execute(
+            """
+            SELECT delivery_entries.entry_id, delivery_entries.run_id,
+                   publish_attempts.completed_at, publish_attempts.subspace_message_id,
+                   publish_attempts.response_json
+            FROM publish_attempts
+            JOIN delivery_entries
+              ON delivery_entries.publish_idempotency_key = publish_attempts.publish_idempotency_key
+            JOIN runs ON runs.run_id = delivery_entries.run_id
+            WHERE delivery_entries.publish_target_key = ?
+              AND runs.run_kind = 'scheduled'
+              AND publish_attempts.status = 'succeeded'
+              AND publish_attempts.subspace_message_id IS NOT NULL
+              AND publish_attempts.completed_at >= ?
+            ORDER BY publish_attempts.completed_at ASC
+            LIMIT 1
+            """,
+            (target, outage["first_observed_at"]),
+        ).fetchone()
+        if successful is not None:
+            response = json.loads(successful["response_json"]) if successful["response_json"] else {}
+            auth_recovery = response.get("auth_recovery") if isinstance(response.get("auth_recovery"), dict) else None
+            if auth_recovery and auth_recovery.get("reauthenticated"):
+                recovered_at = auth_recovery.get("reauthenticated_at") or successful["completed_at"]
+                credential_evidence = auth_recovery
+            elif response.get("authenticated_join"):
+                recovered_at = successful["completed_at"]
+                credential_evidence = {
+                    "kind": "durable_identity_authenticated_join",
+                    "observed_at": successful["completed_at"],
+                }
+            else:
+                recovered_at = None
+                credential_evidence = None
+            self.connection.execute(
+                """
+                UPDATE delivery_outages
+                SET credential_recovered_at = COALESCE(credential_recovered_at, ?),
+                    credential_recovery_json = COALESCE(credential_recovery_json, ?),
+                    recovery_run_id = ?, recovery_entry_id = ?, recovery_subspace_message_id = ?
+                WHERE outage_id = ? AND status = 'active'
+                """,
+                (
+                    recovered_at,
+                    json.dumps(credential_evidence, sort_keys=True) if credential_evidence else None,
+                    successful["run_id"],
+                    successful["entry_id"],
+                    successful["subspace_message_id"],
+                    outage["outage_id"],
+                ),
+            )
+            self._clear_delivery_outage_and_resolve_alerts(
+                outage["outage_id"],
+                target,
+                now,
+                str(successful["subspace_message_id"]),
+            )
         self.connection.commit()
 
     def _record_scheduled_delivery_success(
@@ -3920,14 +4020,10 @@ class ArgusServer:
         ).fetchone()
         if successful_attempt is None or not successful_attempt["completed_at"] or successful_attempt["completed_at"] < outage["first_observed_at"]:
             return
-        has_auth_cause = self.connection.execute(
-            "SELECT 1 FROM delivery_outage_events WHERE outage_id = ? AND cause_group = 'auth' LIMIT 1",
-            (outage["outage_id"],),
-        ).fetchone()
         if auth_recovery and auth_recovery.get("reauthenticated"):
             credential_recovered_at = auth_recovery.get("reauthenticated_at") or iso_z(now)
             credential_evidence = auth_recovery
-        elif not has_auth_cause and authenticated_join:
+        elif authenticated_join:
             credential_recovered_at = iso_z(now)
             credential_evidence = {"kind": "durable_identity_authenticated_join", "observed_at": iso_z(now)}
         else:
@@ -3950,30 +4046,43 @@ class ArgusServer:
                 outage["outage_id"],
             ),
         )
-        cleared = self._clear_delivery_outage_if_recovered(outage["outage_id"], now)
-        if cleared:
-            self._resolve_hard_failure_alerts(
-                now,
-                ("subspace_publish_circuit_breaker",),
-                {
-                    "reason": "scheduled_delivery_outage_cleared",
-                    "publish_target_key": entry["publish_target_key"],
-                    "outage_id": outage["outage_id"],
-                    "recovery_subspace_message_id": message_id,
-                },
-                alert_keys=self._resolved_subspace_circuit_alert_keys(entry["publish_target_key"]),
-            )
-            self._resolve_hard_failure_alerts(
-                now,
-                ("scheduled_cycle_exception", "producer_loop_exception"),
-                {
-                    "reason": "scheduled_delivery_outage_cleared",
-                    "publish_target_key": entry["publish_target_key"],
-                    "outage_id": outage["outage_id"],
-                    "recovery_subspace_message_id": message_id,
-                },
-            )
+        self._clear_delivery_outage_and_resolve_alerts(
+            outage["outage_id"], entry["publish_target_key"], now, message_id
+        )
         self.connection.commit()
+
+    def _clear_delivery_outage_and_resolve_alerts(
+        self,
+        outage_id: str,
+        publish_target_key: str,
+        now: datetime,
+        message_id: str,
+    ) -> bool:
+        cleared = self._clear_delivery_outage_if_recovered(outage_id, now)
+        if not cleared:
+            return False
+        recovery = {
+            "reason": "scheduled_delivery_outage_cleared",
+            "publish_target_key": publish_target_key,
+            "outage_id": outage_id,
+            "recovery_subspace_message_id": message_id,
+        }
+        self._resolve_hard_failure_alerts(
+            now,
+            ("subspace_publish_circuit_breaker",),
+            recovery,
+            alert_keys=self._resolved_subspace_circuit_alert_keys(publish_target_key),
+            emit_recovery_notification=False,
+            commit=False,
+        )
+        self._resolve_hard_failure_alerts(
+            now,
+            ("scheduled_cycle_exception", "producer_loop_exception"),
+            recovery,
+            emit_recovery_notification=False,
+            commit=False,
+        )
+        return True
 
     def _clear_delivery_outage_if_recovered(self, outage_id: str, now: datetime) -> bool:
         outage = self.connection.execute("SELECT * FROM delivery_outages WHERE outage_id = ?", (outage_id,)).fetchone()

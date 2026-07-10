@@ -4927,11 +4927,170 @@ print(json.dumps({
             scheduled_row = next(row for row in rows(root / "argus.sqlite3", "product_alerts") if row["alert_key"] == scheduled_alert["alert_key"])
             self.assertEqual(scheduled_row["status"], "resolved")
             recovery_alerts = [message for kind, message in alerts if kind == "operator" and "hard failure recovered" in message]
-            self.assertEqual(len(recovery_alerts), 2)
-            self.assertTrue(all("scheduled-recovery-message" in message for message in recovery_alerts))
+            self.assertEqual(recovery_alerts, [])
+            for alert_row in (circuit_row, scheduled_row):
+                detail = json.loads(alert_row["detail_json"])
+                self.assertEqual(detail["recovery"]["recovery_subspace_message_id"], "scheduled-recovery-message")
+                self.assertEqual(detail["recovery_notification"]["status"], "not_retained")
             session = json.loads(session_path.read_text())
             self.assertEqual(session["agent_id"], public_key)
             self.assertEqual(session["session_token"], "session-2")
+
+    def test_restart_reconciles_reauth_persisted_before_outage_credential_evidence(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            identity_path, session_path, public_key = write_durable_identity(root)
+            original_post = server_module.post_message_to_subspace
+            calls = []
+            with LocalReauthServer(public_key) as auth:
+                path = write_config(
+                    root,
+                    publish={
+                        "mode": "live",
+                        "subspace_credential_mode": "durable_identity",
+                        "subspace_endpoint": auth.endpoint,
+                        "subspace_identity_path": str(identity_path),
+                        "subspace_session_path": str(session_path),
+                        "allow_non_embedded_fallback": True,
+                    },
+                )
+
+                def revoked_then_success(endpoint, websocket_path, agent_id, session_token, text, embeddings, idempotency_key):
+                    calls.append((session_token, idempotency_key))
+                    if len(calls) == 1:
+                        raise server_module.PublishTransportError(
+                            "token revoked",
+                            {"ok": False, "reply": {"response": {"error": "TOKEN_REVOKED"}}},
+                        )
+                    return {
+                        "ok": True,
+                        "results": [{"sent": True, "subspace_message_id": "restart-reauth-recovery"}],
+                    }
+
+                server_module.post_message_to_subspace = revoked_then_success
+                first = ArgusServer(path, clock=FakeClock(NOW))
+                try:
+                    def crash_after_session_persisted(now, evidence):
+                        raise SystemExit("crash after durable session persistence")
+
+                    first._record_auth_recovery_for_active_outage = crash_after_session_persisted
+                    with self.assertRaises(SystemExit):
+                        first.tick()
+                finally:
+                    first.close()
+                outage = rows(root / "argus.sqlite3", "delivery_outages")[0]
+                self.assertEqual(outage["status"], "active")
+                self.assertIsNone(outage["credential_recovered_at"])
+                self.assertEqual(json.loads(session_path.read_text())["session_token"], "session-2")
+
+                second = ArgusServer(path, clock=FakeClock(NOW))
+                try:
+                    reconciled = rows(root / "argus.sqlite3", "delivery_outages")[0]
+                    self.assertEqual(reconciled["status"], "active")
+                    self.assertIsNotNone(reconciled["credential_recovered_at"])
+                    second._drain_due_delivery(NOW, max_entries=1)
+                finally:
+                    second.close()
+                    server_module.post_message_to_subspace = original_post
+            outage = rows(root / "argus.sqlite3", "delivery_outages")[0]
+            self.assertEqual(outage["status"], "cleared")
+            self.assertEqual(outage["recovery_subspace_message_id"], "restart-reauth-recovery")
+            self.assertEqual([call[1] for call in calls], [calls[0][1], calls[0][1]])
+
+    def test_restart_reconciles_committed_publish_and_atomically_resolves_legacy_alerts(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            identity_path, session_path, public_key = write_durable_identity(root)
+            original_post = server_module.post_message_to_subspace
+            original_operator = server_module.post_openclaw_alert
+            alert_calls = []
+            with LocalReauthServer(public_key) as auth:
+                path = write_config(
+                    root,
+                    publish={
+                        "mode": "live",
+                        "subspace_credential_mode": "durable_identity",
+                        "subspace_endpoint": auth.endpoint,
+                        "subspace_identity_path": str(identity_path),
+                        "subspace_session_path": str(session_path),
+                        "allow_non_embedded_fallback": True,
+                    },
+                )
+                config = yaml.safe_load(path.read_text())
+                config["operator_alerts"] = {
+                    "enabled": True,
+                    "target": "openclaw_alert",
+                    "endpoint": "http://operator.invalid/alert",
+                    "session_key": "agent:test:argus",
+                }
+                path.write_text(yaml.safe_dump(config))
+                publish_calls = []
+
+                def refused_then_success(endpoint, websocket_path, agent_id, session_token, text, embeddings, idempotency_key):
+                    publish_calls.append(idempotency_key)
+                    if len(publish_calls) == 1:
+                        raise server_module.PublishTransportError("connection refused")
+                    return {
+                        "ok": True,
+                        "results": [{"sent": True, "subspace_message_id": "restart-committed-publish"}],
+                    }
+
+                server_module.post_message_to_subspace = refused_then_success
+                server_module.post_openclaw_alert = lambda *args: alert_calls.append(args[3]) or {"ok": True}
+                clock = FakeClock(NOW)
+                first = ArgusServer(path, clock=clock)
+                try:
+                    first.tick()
+                    target = first._current_publish_target_key()
+                    circuit = first._record_hard_failure_alert(
+                        clock.now(),
+                        "subspace_publish_circuit_breaker",
+                        {"dependency_class": "subspace_publish", "reason": "publish_circuit_breaker", "publish_target_key": target},
+                        "circuit opened",
+                        minimum_occurrences=1,
+                    )
+                    scheduled = first._record_hard_failure_alert(
+                        clock.now(),
+                        "scheduled_cycle_exception",
+                        {"dependency_class": "scheduled_cycle", "reason": "cycle_exception_contained", "publish_target_key": target},
+                        "scheduled cycle failed",
+                        minimum_occurrences=1,
+                    )
+                    original_clear = first._clear_delivery_outage_and_resolve_alerts
+
+                    def crash_before_recovery_commit(*args):
+                        original_clear(*args)
+                        raise SystemExit("crash before recovery transaction commit")
+
+                    first._clear_delivery_outage_and_resolve_alerts = crash_before_recovery_commit
+                    clock.advance(901)
+                    with self.assertRaises(SystemExit):
+                        first._drain_due_delivery(clock.now(), max_entries=1)
+                finally:
+                    first.close()
+                self.assertEqual(rows(root / "argus.sqlite3", "delivery_outages")[0]["status"], "active")
+                alert_rows = {row["alert_key"]: row for row in rows(root / "argus.sqlite3", "product_alerts")}
+                self.assertEqual(alert_rows[circuit["alert_key"]]["status"], "active")
+                self.assertEqual(alert_rows[scheduled["alert_key"]]["status"], "active")
+                attempts = rows(root / "argus.sqlite3", "publish_attempts")
+                self.assertEqual(attempts[-1]["status"], "succeeded")
+                self.assertEqual(attempts[-1]["subspace_message_id"], "restart-committed-publish")
+
+                second = ArgusServer(path, clock=clock)
+                second.close()
+                server_module.post_message_to_subspace = original_post
+                server_module.post_openclaw_alert = original_operator
+            outage = rows(root / "argus.sqlite3", "delivery_outages")[0]
+            self.assertEqual(outage["status"], "cleared")
+            self.assertEqual(outage["recovery_subspace_message_id"], "restart-committed-publish")
+            alert_rows = {row["alert_key"]: row for row in rows(root / "argus.sqlite3", "product_alerts")}
+            for alert in (circuit, scheduled):
+                recovered = alert_rows[alert["alert_key"]]
+                self.assertEqual(recovered["status"], "resolved")
+                detail = json.loads(recovered["detail_json"])
+                self.assertEqual(detail["recovery"]["recovery_subspace_message_id"], "restart-committed-publish")
+                self.assertEqual(detail["recovery_notification"]["status"], "not_retained")
+            self.assertFalse(any("hard failure recovered" in message for message in alert_calls))
 
     def test_non_auth_outage_and_failed_first_alert_survive_restart_until_scheduled_message_id(self):
         with TemporaryDirectory() as tmpdir:
