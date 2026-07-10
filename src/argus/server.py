@@ -763,6 +763,8 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
           first_observed_at TEXT NOT NULL,
           last_observed_at TEXT NOT NULL,
           last_exact_cause TEXT NOT NULL,
+          credential_generation_at_open INTEGER NOT NULL DEFAULT 0,
+          publish_attempt_rowid_at_open INTEGER NOT NULL DEFAULT 0,
           credential_recovered_at TEXT,
           credential_recovery_json TEXT,
           recovery_run_id TEXT,
@@ -901,6 +903,11 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
     if "first_requested_mode" not in accepted_report_columns:
         connection.execute("ALTER TABLE accepted_reports ADD COLUMN first_requested_mode TEXT NOT NULL DEFAULT 'inactive'")
         connection.execute("UPDATE accepted_reports SET first_requested_mode = first_effective_mode WHERE first_requested_mode IS NULL")
+    delivery_outage_columns = {row["name"] for row in connection.execute("PRAGMA table_info(delivery_outages)")}
+    if "credential_generation_at_open" not in delivery_outage_columns:
+        connection.execute("ALTER TABLE delivery_outages ADD COLUMN credential_generation_at_open INTEGER NOT NULL DEFAULT 0")
+    if "publish_attempt_rowid_at_open" not in delivery_outage_columns:
+        connection.execute("ALTER TABLE delivery_outages ADD COLUMN publish_attempt_rowid_at_open INTEGER NOT NULL DEFAULT 0")
     for row in connection.execute(
         """
         SELECT report_id, source_id, canonical_url
@@ -1981,6 +1988,15 @@ class ArgusServer:
                     "error_class": exc.__class__.__name__,
                     "error_message": truncate_alert_message(str(exc)),
                 }
+                target = self._current_publish_target_key()
+                if target is not None:
+                    outage = self.connection.execute(
+                        "SELECT outage_id FROM delivery_outages WHERE outage_key = ? AND status = 'active'",
+                        (self._delivery_outage_key(target),),
+                    ).fetchone()
+                    if outage is not None:
+                        detail["publish_target_key"] = target
+                        detail["outage_id"] = outage["outage_id"]
                 self._record_scheduler_event("producer_loop_exception", None, "failed", detail, now)
                 if not self._tick_exception_alerted:
                     self._record_hard_failure_alert(
@@ -2290,6 +2306,9 @@ class ArgusServer:
                 "error_class": exc.__class__.__name__,
                 "error_message": truncate_alert_message(str(exc)),
             }
+            if outage_id:
+                detail["publish_target_key"] = cycle_snapshot.get("publish_target_key")
+                detail["outage_id"] = outage_id
             self._record_scheduler_event("cycle_completed", run_id, "failed", {"run_kind": run_kind, "error": str(exc)}, completed_at)
             if run_kind == "scheduled":
                 summary["hard_failure_alert"] = self._record_hard_failure_alert(
@@ -3701,6 +3720,14 @@ class ArgusServer:
             (outage_key,),
         ).fetchone()
         if outage is None:
+            credential_generation = 0
+            if self._durable_subspace_session is not None:
+                credential_generation = int(
+                    self._durable_subspace_session.public_status().get("reauth_generation") or 0
+                )
+            publish_attempt_rowid = int(
+                self.connection.execute("SELECT COALESCE(MAX(rowid), 0) FROM publish_attempts").fetchone()[0]
+            )
             outage_id = "sha256:" + hashlib.sha256(
                 ("delivery-outage:v0\n{}\n{}\n{}".format(outage_key, entry_id or run_id, observed_at)).encode("utf-8")
             ).hexdigest()
@@ -3708,11 +3735,21 @@ class ArgusServer:
                 """
                 INSERT INTO delivery_outages
                 (outage_id, outage_key, publish_target_key, status, first_observed_at, last_observed_at,
-                 last_exact_cause, credential_recovered_at, credential_recovery_json, recovery_run_id,
+                 last_exact_cause, credential_generation_at_open, publish_attempt_rowid_at_open,
+                 credential_recovered_at, credential_recovery_json, recovery_run_id,
                  recovery_entry_id, recovery_subspace_message_id, cleared_at)
-                VALUES (?, ?, ?, 'active', ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL)
+                VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL)
                 """,
-                (outage_id, outage_key, publish_target_key, observed_at, observed_at, exact_cause),
+                (
+                    outage_id,
+                    outage_key,
+                    publish_target_key,
+                    observed_at,
+                    observed_at,
+                    exact_cause,
+                    credential_generation,
+                    publish_attempt_rowid,
+                ),
             )
             for channel in ("direct_pushover", "operator_alert"):
                 self.connection.execute(
@@ -3883,15 +3920,24 @@ class ArgusServer:
         if target is None:
             return
         recovered_at = evidence.get("reauthenticated_at") or evidence.get("observed_at")
-        if not recovered_at:
+        reauth_generation = int(evidence.get("reauth_generation") or 0)
+        if not recovered_at or not reauth_generation:
             return
         self.connection.execute(
             """
             UPDATE delivery_outages
             SET credential_recovered_at = ?, credential_recovery_json = ?
-            WHERE outage_key = ? AND status = 'active' AND first_observed_at <= ?
+            WHERE outage_key = ? AND status = 'active'
+              AND first_observed_at <= ?
+              AND credential_generation_at_open < ?
             """,
-            (str(recovered_at), json.dumps(evidence, sort_keys=True), self._delivery_outage_key(target), str(recovered_at)),
+            (
+                str(recovered_at),
+                json.dumps(evidence, sort_keys=True),
+                self._delivery_outage_key(target),
+                str(recovered_at),
+                reauth_generation,
+            ),
         )
         self.connection.commit()
 
@@ -3905,12 +3951,17 @@ class ArgusServer:
         ).fetchone()
         if outage is None:
             return
-        if not outage["credential_recovered_at"] and self._durable_subspace_session is not None:
+        has_auth_cause = self.connection.execute(
+            "SELECT 1 FROM delivery_outage_events WHERE outage_id = ? AND cause_group = 'auth' LIMIT 1",
+            (outage["outage_id"],),
+        ).fetchone() is not None
+        if has_auth_cause and not outage["credential_recovered_at"] and self._durable_subspace_session is not None:
             last_reauth = self._durable_subspace_session.public_status().get("last_reauth")
             if (
                 isinstance(last_reauth, dict)
                 and last_reauth.get("status") == "succeeded"
                 and last_reauth.get("observed_at")
+                and int(last_reauth.get("reauth_generation") or 0) > int(outage["credential_generation_at_open"])
                 and str(last_reauth["observed_at"]) >= outage["first_observed_at"]
             ):
                 evidence = {
@@ -3929,6 +3980,7 @@ class ArgusServer:
         successful = self.connection.execute(
             """
             SELECT delivery_entries.entry_id, delivery_entries.run_id,
+                   publish_attempts.rowid AS publish_attempt_rowid,
                    publish_attempts.completed_at, publish_attempts.subspace_message_id,
                    publish_attempts.response_json
             FROM publish_attempts
@@ -3939,19 +3991,25 @@ class ArgusServer:
               AND runs.run_kind = 'scheduled'
               AND publish_attempts.status = 'succeeded'
               AND publish_attempts.subspace_message_id IS NOT NULL
+              AND publish_attempts.rowid > ?
               AND publish_attempts.completed_at >= ?
-            ORDER BY publish_attempts.completed_at ASC
+            ORDER BY publish_attempts.rowid ASC
             LIMIT 1
             """,
-            (target, outage["first_observed_at"]),
+            (target, int(outage["publish_attempt_rowid_at_open"]), outage["first_observed_at"]),
         ).fetchone()
         if successful is not None:
             response = json.loads(successful["response_json"]) if successful["response_json"] else {}
             auth_recovery = response.get("auth_recovery") if isinstance(response.get("auth_recovery"), dict) else None
-            if auth_recovery and auth_recovery.get("reauthenticated"):
+            if (
+                has_auth_cause
+                and auth_recovery
+                and auth_recovery.get("reauthenticated")
+                and int(auth_recovery.get("reauth_generation") or 0) > int(outage["credential_generation_at_open"])
+            ):
                 recovered_at = auth_recovery.get("reauthenticated_at") or successful["completed_at"]
                 credential_evidence = auth_recovery
-            elif response.get("authenticated_join"):
+            elif not has_auth_cause and response.get("authenticated_join"):
                 recovered_at = successful["completed_at"]
                 credential_evidence = {
                     "kind": "durable_identity_authenticated_join",
@@ -4012,18 +4070,32 @@ class ArgusServer:
             return
         successful_attempt = self.connection.execute(
             """
-            SELECT completed_at FROM publish_attempts
+            SELECT rowid AS publish_attempt_rowid, completed_at FROM publish_attempts
             WHERE publish_idempotency_key = ? AND status = 'succeeded' AND subspace_message_id = ?
             ORDER BY completed_at DESC LIMIT 1
             """,
             (entry["publish_idempotency_key"], message_id),
         ).fetchone()
-        if successful_attempt is None or not successful_attempt["completed_at"] or successful_attempt["completed_at"] < outage["first_observed_at"]:
+        if (
+            successful_attempt is None
+            or int(successful_attempt["publish_attempt_rowid"]) <= int(outage["publish_attempt_rowid_at_open"])
+            or not successful_attempt["completed_at"]
+            or successful_attempt["completed_at"] < outage["first_observed_at"]
+        ):
             return
-        if auth_recovery and auth_recovery.get("reauthenticated"):
+        has_auth_cause = self.connection.execute(
+            "SELECT 1 FROM delivery_outage_events WHERE outage_id = ? AND cause_group = 'auth' LIMIT 1",
+            (outage["outage_id"],),
+        ).fetchone() is not None
+        if (
+            has_auth_cause
+            and auth_recovery
+            and auth_recovery.get("reauthenticated")
+            and int(auth_recovery.get("reauth_generation") or 0) > int(outage["credential_generation_at_open"])
+        ):
             credential_recovered_at = auth_recovery.get("reauthenticated_at") or iso_z(now)
             credential_evidence = auth_recovery
-        elif authenticated_join:
+        elif not has_auth_cause and authenticated_join:
             credential_recovered_at = iso_z(now)
             credential_evidence = {"kind": "durable_identity_authenticated_join", "observed_at": iso_z(now)}
         else:
@@ -4079,10 +4151,35 @@ class ArgusServer:
             now,
             ("scheduled_cycle_exception", "producer_loop_exception"),
             recovery,
+            alert_keys=self._outage_linked_hard_failure_alert_keys(
+                ("scheduled_cycle_exception", "producer_loop_exception"),
+                publish_target_key,
+                outage_id,
+            ),
             emit_recovery_notification=False,
             commit=False,
         )
         return True
+
+    def _outage_linked_hard_failure_alert_keys(
+        self,
+        alert_types: Tuple[str, ...],
+        publish_target_key: str,
+        outage_id: str,
+    ) -> Tuple[str, ...]:
+        placeholders = ",".join("?" for _ in alert_types)
+        rows = self.connection.execute(
+            "SELECT alert_key, detail_json FROM product_alerts WHERE status = 'active' AND alert_type IN ({})".format(
+                placeholders
+            ),
+            alert_types,
+        ).fetchall()
+        keys = []
+        for row in rows:
+            detail = json.loads(row["detail_json"])
+            if detail.get("publish_target_key") == publish_target_key and detail.get("outage_id") == outage_id:
+                keys.append(row["alert_key"])
+        return tuple(keys)
 
     def _clear_delivery_outage_if_recovered(self, outage_id: str, now: datetime) -> bool:
         outage = self.connection.execute("SELECT * FROM delivery_outages WHERE outage_id = ?", (outage_id,)).fetchone()

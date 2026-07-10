@@ -142,6 +142,7 @@ class DurableSubspaceSession:
                 "session_token": None,
                 "session_expires_at": None,
                 "token_issued_at": None,
+                "reauth_generation": 0,
                 "last_reauth": None,
                 "last_authenticated_join_at": None,
             }
@@ -259,15 +260,18 @@ class DurableSubspaceSession:
             self._persist_reauth_failure(now, reason, cause, verify_payload)
             raise SubspaceAuthError(cause, "Subspace reauth/verify response is missing sessionToken", verify_payload)
         expires_at = verify_payload.get("sessionExpiresAt")
+        reauth_generation = int(self.state.get("reauth_generation") or 0) + 1
         self.state.update(
             {
                 "session_token": str(token),
                 "session_expires_at": str(expires_at) if expires_at else None,
                 "token_issued_at": iso_z(now),
+                "reauth_generation": reauth_generation,
                 "last_reauth": {
                     "status": "succeeded",
                     "observed_at": iso_z(now),
                     "reason": reason,
+                    "reauth_generation": reauth_generation,
                     "session_expires_at": str(expires_at) if expires_at else None,
                 },
             }
@@ -277,6 +281,7 @@ class DurableSubspaceSession:
             "reauthenticated": True,
             "reauthenticated_at": iso_z(now),
             "reason": reason,
+            "reauth_generation": reauth_generation,
             "session_expires_at": self.session_expires_at,
         }
 
@@ -304,6 +309,7 @@ class DurableSubspaceSession:
             "publish_target_key": self.publish_target_key,
             "session_expires_at": self.session_expires_at,
             "token_issued_at": self.state.get("token_issued_at"),
+            "reauth_generation": int(self.state.get("reauth_generation") or 0),
             "last_reauth": self.state.get("last_reauth"),
             "last_authenticated_join_at": self.state.get("last_authenticated_join_at"),
         }
