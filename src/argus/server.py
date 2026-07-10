@@ -2955,10 +2955,15 @@ class ArgusServer:
             previous_detail = json.loads(row["detail_json"])
             notification = {"enabled": self.config.operator_alerts.enabled, "emitted": False, "status": "not_previously_paged"}
             if int(row["notification_count"]) > 0:
+                recovery_message_id = recovery.get("recovery_subspace_message_id")
+                recovery_suffix = ""
+                if recovery_message_id:
+                    recovery_suffix = " Scheduled Subspace message id: {}.".format(recovery_message_id)
                 notification = self._send_alert(
-                    "Argus hard failure recovered: {alert_type} recovered after {count} observations.".format(
+                    "Argus hard failure recovered: {alert_type} recovered after {count} observations.{suffix}".format(
                         alert_type=row["alert_type"],
                         count=row["occurrence_count"],
+                        suffix=recovery_suffix,
                     )
                 )
             detail = {**previous_detail, "recovery": {**recovery, "observed_at": iso_z(now)}, "recovery_notification": notification}
@@ -3910,7 +3915,19 @@ class ArgusServer:
                 outage["outage_id"],
             ),
         )
-        self._clear_delivery_outage_if_recovered(outage["outage_id"], now)
+        cleared = self._clear_delivery_outage_if_recovered(outage["outage_id"], now)
+        if cleared:
+            self._resolve_hard_failure_alerts(
+                now,
+                ("subspace_publish_circuit_breaker",),
+                {
+                    "reason": "scheduled_delivery_outage_cleared",
+                    "publish_target_key": entry["publish_target_key"],
+                    "outage_id": outage["outage_id"],
+                    "recovery_subspace_message_id": message_id,
+                },
+                alert_keys=self._resolved_subspace_circuit_alert_keys(entry["publish_target_key"]),
+            )
         self.connection.commit()
 
     def _clear_delivery_outage_if_recovered(self, outage_id: str, now: datetime) -> bool:
@@ -4040,19 +4057,7 @@ class ArgusServer:
                 message="superseded run Subspace circuit breaker aged out after a newer delivery plan",
                 error_class="stale_subspace_circuit_breaker",
             )
-        terminalized = len(stale_entries)
-        if terminalized:
-            self._resolve_hard_failure_alerts(
-                now,
-                ("subspace_publish_circuit_breaker",),
-                {
-                    "reason": "superseded_subspace_circuit_breaker_aged_out",
-                    "terminalized_delivery_entries": terminalized,
-                    "publish_target_key": publish_target_key,
-                },
-                alert_keys=self._resolved_subspace_circuit_alert_keys(publish_target_key),
-            )
-        return terminalized
+        return len(stale_entries)
 
     def _trip_delivery_circuit_breaker_if_needed(self, entry: sqlite3.Row, now: datetime) -> bool:
         counts = self._run_publish_attempt_counts(entry["run_id"])
@@ -4417,23 +4422,6 @@ class ArgusServer:
                             next_retry_at=iso_z(self.clock.now() + timedelta(seconds=delay)),
                             response=getattr(reauth_exc, "response", None),
                         )
-        if succeeded > 0:
-            resolved_circuit_keys = self._resolved_subspace_circuit_alert_keys(target)
-            self._resolve_hard_failure_alerts(
-                now,
-                ("subspace_publish_circuit_breaker",),
-                {
-                    "reason": "subspace_publish_recovered",
-                    "delivery_result": {
-                        "attempted": attempted,
-                        "succeeded": succeeded,
-                        "failed": failed,
-                        "unknown": unknown,
-                        "circuit_opened": circuit_opened,
-                    },
-                },
-                alert_keys=resolved_circuit_keys,
-            )
         return {
             "attempted": attempted,
             "succeeded": succeeded,

@@ -4119,7 +4119,7 @@ print(json.dumps({
             self.assertEqual(alert_rows[0]["notification_count"], 1)
             self.assertGreaterEqual(alert_rows[0]["occurrence_count"], 2)
 
-    def test_subspace_circuit_recovery_is_scoped_to_publish_target_without_blockers(self):
+    def test_subspace_circuit_recovery_requires_canonical_outage_clear(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             path = write_config(root, publish={"mode": "inactive"})
@@ -4163,17 +4163,11 @@ print(json.dumps({
                 server.connection.commit()
                 self.assertEqual(server._resolved_subspace_circuit_alert_keys("target-a"), ())
                 self.assertEqual(server._resolved_subspace_circuit_alert_keys("target-b"), (alert_b["alert_key"],))
-                server._resolve_hard_failure_alerts(
-                    NOW + timedelta(minutes=10),
-                    ("subspace_publish_circuit_breaker",),
-                    {"reason": "subspace_publish_recovered"},
-                    alert_keys=server._resolved_subspace_circuit_alert_keys("target-b"),
-                )
             finally:
                 server.close()
             alert_rows = {row["alert_key"]: row for row in rows(root / "argus.sqlite3", "product_alerts")}
             self.assertEqual(alert_rows[alert_a["alert_key"]]["status"], "active")
-            self.assertEqual(alert_rows[alert_b["alert_key"]]["status"], "resolved")
+            self.assertEqual(alert_rows[alert_b["alert_key"]]["status"], "active")
 
     def test_superseded_circuit_breaker_rows_age_out_without_hiding_current_ack_unknown(self):
         with TemporaryDirectory() as tmpdir:
@@ -4297,7 +4291,7 @@ print(json.dumps({
             self.assertEqual(len(attempts), 1)
             self.assertEqual(attempts[0]["status"], "unknown")
             alert_rows = {row["alert_key"]: row for row in rows(root / "argus.sqlite3", "product_alerts")}
-            self.assertEqual(alert_rows[old_alert["alert_key"]]["status"], "resolved")
+            self.assertEqual(alert_rows[old_alert["alert_key"]]["status"], "active")
 
     def test_per_report_publish_attempt_cap_stops_fourth_send(self):
         with TemporaryDirectory() as tmpdir:
@@ -4840,6 +4834,18 @@ print(json.dumps({
                 server_module.post_direct_pushover = lambda *args: alerts.append(("pushover", args[3])) or {"status": 1, "request": "receipt"}
                 server = ArgusServer(path, clock=FakeClock(NOW))
                 try:
+                    target = server._current_publish_target_key()
+                    circuit_alert = server._record_hard_failure_alert(
+                        NOW,
+                        "subspace_publish_circuit_breaker",
+                        {
+                            "dependency_class": "subspace_publish",
+                            "reason": "publish_circuit_breaker",
+                            "publish_target_key": target,
+                        },
+                        "circuit opened",
+                        minimum_occurrences=1,
+                    )
                     exit_code, _summary = server.tick()
                 finally:
                     server.close()
@@ -4866,6 +4872,11 @@ print(json.dumps({
             self.assertEqual([row["exact_cause"] for row in rows(root / "argus.sqlite3", "delivery_outage_events")], ["TOKEN_REVOKED"])
             self.assertEqual({row["status"] for row in rows(root / "argus.sqlite3", "delivery_outage_notifications")}, {"delivered"})
             self.assertEqual({kind for kind, _message in alerts}, {"operator", "pushover"})
+            circuit_row = next(row for row in rows(root / "argus.sqlite3", "product_alerts") if row["alert_key"] == circuit_alert["alert_key"])
+            self.assertEqual(circuit_row["status"], "resolved")
+            recovery_alerts = [message for kind, message in alerts if kind == "operator" and "hard failure recovered" in message]
+            self.assertEqual(len(recovery_alerts), 1)
+            self.assertIn("scheduled-recovery-message", recovery_alerts[0])
             session = json.loads(session_path.read_text())
             self.assertEqual(session["agent_id"], public_key)
             self.assertEqual(session["session_token"], "session-2")
