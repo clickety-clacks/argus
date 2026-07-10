@@ -87,6 +87,8 @@ Scheduled-news delivery outages are separate from that legacy hard-failure strea
 
 `argus status` exposes active scheduled-delivery outages, immutable exact-cause events, both notification receipts, credential-recovery evidence, and the scheduled Subspace message-id gate. An outage clears only after post-outage durable credential recovery (reauth for auth causes or an authenticated durable-identity join for non-auth causes) and a real scheduled live publish with a non-empty Subspace message id. Manual/canary success, packaging, source fetch, credential recovery alone, and success without a message id do not clear it.
 
+Legacy scheduled-cycle and Subspace circuit alerts cannot announce recovery while that target-scoped outage remains active. When tied to that outage and previously paged, they resolve with the canonical outage clear and their recovery alert includes the scheduled Subspace message id.
+
 For the Racter production GDM route, apply this stanza only after operator approval:
 
 ```yaml

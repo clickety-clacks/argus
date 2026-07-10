@@ -1991,11 +1991,12 @@ class ArgusServer:
                     )
                 self.clock.sleep(60.0)
                 continue
-            self._resolve_hard_failure_alerts(
-                self.clock.now(),
-                ("producer_loop_exception",),
-                {"reason": "producer_tick_recovered"},
-            )
+            if not self._has_active_delivery_outage():
+                self._resolve_hard_failure_alerts(
+                    self.clock.now(),
+                    ("producer_loop_exception",),
+                    {"reason": "producer_tick_recovered"},
+                )
             if result is None:
                 state = self._scheduler_state()
                 next_due_at = parse_now(state["next_due_at"]) if state["next_due_at"] else self.clock.now() + timedelta(seconds=60)
@@ -2249,12 +2250,12 @@ class ArgusServer:
             completed_at = self.clock.now()
             self._record_scheduler_completion(run_id, run_kind, completed_at)
             self._record_scheduler_event("cycle_completed", run_id, "ok" if exit_code == 0 else "failed", {"run_kind": run_kind}, completed_at)
-            if run_kind == "scheduled":
+            if run_kind == "scheduled" and not self._has_active_delivery_outage():
                 self._resolve_hard_failure_alerts(
                     completed_at,
                     ("scheduled_cycle_exception", "producer_loop_exception"),
                     {
-                        "reason": "scheduled_cycle_recovered",
+                        "reason": "scheduled_cycle_recovered_without_delivery_outage",
                         "run_id": run_id,
                         "run_kind": run_kind,
                     },
@@ -2262,18 +2263,24 @@ class ArgusServer:
             return exit_code, summary
         except Exception as exc:
             self.connection.rollback()
-            summary = self._mark_run_failed(run_id, run_kind, now, output_dir, cycle_snapshot, exc)
+            summary = self._mark_run_failed(run_id, run_kind, now, output_dir, cycle_snapshot, exc, commit=False)
             completed_at = self.clock.now()
+            outage_id = None
             if run_kind == "scheduled":
                 exact_cause = str(exc).split(":", 1)[0] if str(exc) else exc.__class__.__name__
-                self._record_scheduled_pre_send_failure(
+                outage_id = self._record_scheduled_pre_send_failure(
                     run_id,
                     completed_at,
                     cycle_snapshot,
                     exact_cause,
                     str(exc),
                     stage="scheduled_cycle",
+                    commit=False,
+                    deliver_notifications=False,
                 )
+            self.connection.commit()
+            if outage_id:
+                self._deliver_pending_outage_notifications(outage_id)
             detail = {
                 "dependency_class": "scheduled_cycle" if run_kind == "scheduled" else "cycle",
                 "reason": "cycle_exception_contained" if run_kind == "scheduled" else "cycle_exception",
@@ -2487,7 +2494,17 @@ class ArgusServer:
         if commit:
             self.connection.commit()
 
-    def _mark_run_failed(self, run_id: str, run_kind: str, now: datetime, output_dir: Path, snapshot: Dict[str, Any], error: Exception) -> Dict[str, Any]:
+    def _mark_run_failed(
+        self,
+        run_id: str,
+        run_kind: str,
+        now: datetime,
+        output_dir: Path,
+        snapshot: Dict[str, Any],
+        error: Exception,
+        *,
+        commit: bool = True,
+    ) -> Dict[str, Any]:
         row = self.connection.execute("SELECT summary_json FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         summary = json.loads(row["summary_json"]) if row else {"run_id": run_id, "run_kind": run_kind}
         summary["exit_status"] = "failed"
@@ -2502,7 +2519,8 @@ class ArgusServer:
                 "UPDATE runs SET status = ?, completed_at = ?, summary_json = ? WHERE run_id = ?",
                 ("failed", iso_z(self.clock.now()), json.dumps(summary, sort_keys=True), run_id),
             )
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return summary
 
     def _store_source_health(self, run_id: str, now: datetime, output_dir: Path, update_totals: bool = True, commit: bool = True) -> None:
@@ -3570,6 +3588,15 @@ class ArgusServer:
     def _delivery_outage_key(self, publish_target_key: str) -> str:
         return "scheduled-news:{}".format(publish_target_key)
 
+    def _has_active_delivery_outage(self) -> bool:
+        target = self._current_publish_target_key()
+        if target is None:
+            return False
+        return self.connection.execute(
+            "SELECT 1 FROM delivery_outages WHERE outage_key = ? AND status = 'active' LIMIT 1",
+            (self._delivery_outage_key(target),),
+        ).fetchone() is not None
+
     def _record_delivery_failure(
         self,
         entry_id: str,
@@ -3657,6 +3684,8 @@ class ArgusServer:
         error_class: Optional[str],
         message: str,
         response: Optional[Dict[str, Any]] = None,
+        commit: bool = True,
+        deliver_notifications: bool = True,
     ) -> str:
         observed_at = iso_z(now)
         outage_key = self._delivery_outage_key(publish_target_key)
@@ -3723,8 +3752,10 @@ class ArgusServer:
                 json.dumps({"response": response} if response is not None else {}, sort_keys=True),
             ),
         )
-        self.connection.commit()
-        self._deliver_pending_outage_notifications(outage_id)
+        if commit:
+            self.connection.commit()
+        if deliver_notifications:
+            self._deliver_pending_outage_notifications(outage_id)
         return outage_id
 
     def _record_scheduled_pre_send_failure(
@@ -3736,6 +3767,8 @@ class ArgusServer:
         message: str,
         *,
         stage: str,
+        commit: bool = True,
+        deliver_notifications: bool = True,
     ) -> Optional[str]:
         if snapshot.get("requested_mode") != "live" or not snapshot.get("publish_target_key"):
             return None
@@ -3755,6 +3788,8 @@ class ArgusServer:
             retry_disposition="retry_pending",
             error_class=exact_cause,
             message=message,
+            commit=commit,
+            deliver_notifications=deliver_notifications,
         )
 
     def _outage_alert_message(self, outage: sqlite3.Row) -> str:
@@ -3927,6 +3962,16 @@ class ArgusServer:
                     "recovery_subspace_message_id": message_id,
                 },
                 alert_keys=self._resolved_subspace_circuit_alert_keys(entry["publish_target_key"]),
+            )
+            self._resolve_hard_failure_alerts(
+                now,
+                ("scheduled_cycle_exception", "producer_loop_exception"),
+                {
+                    "reason": "scheduled_delivery_outage_cleared",
+                    "publish_target_key": entry["publish_target_key"],
+                    "outage_id": outage["outage_id"],
+                    "recovery_subspace_message_id": message_id,
+                },
             )
         self.connection.commit()
 

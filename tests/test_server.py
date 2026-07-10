@@ -2014,6 +2014,45 @@ print(json.dumps({
             self.assertEqual(alert_rows[0]["occurrence_count"], 2)
             self.assertEqual(alert_rows[0]["notification_count"], 1)
 
+    def test_scheduled_pre_send_failure_commits_outage_and_alert_jobs_before_notification_attempt(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = write_config(
+                root,
+                publish={
+                    "mode": "live",
+                    "subspace_endpoint": "https://subspace.swarm.channel",
+                    "allow_non_embedded_fallback": True,
+                },
+            )
+            original_run_pipeline = server_module.run_pipeline_for_sources
+            server_module.run_pipeline_for_sources = lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("scheduled pre-send dependency failed")
+            )
+            server = ArgusServer(path, clock=FakeClock(NOW))
+
+            def crash_before_first_notification(outage_id=None):
+                if outage_id is not None:
+                    raise SystemExit("simulated crash before first notification attempt")
+
+            server._deliver_pending_outage_notifications = crash_before_first_notification
+            try:
+                with self.assertRaisesRegex(SystemExit, "simulated crash"):
+                    server.tick()
+            finally:
+                server_module.run_pipeline_for_sources = original_run_pipeline
+                server.close()
+            self.assertEqual([row["status"] for row in rows(root / "argus.sqlite3", "runs")], ["failed"])
+            outages = rows(root / "argus.sqlite3", "delivery_outages")
+            self.assertEqual(len(outages), 1)
+            self.assertEqual(outages[0]["status"], "active")
+            events = rows(root / "argus.sqlite3", "delivery_outage_events")
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["exact_cause"], "scheduled pre-send dependency failed")
+            notifications = rows(root / "argus.sqlite3", "delivery_outage_notifications")
+            self.assertEqual({row["channel"] for row in notifications}, {"direct_pushover", "operator_alert"})
+            self.assertEqual({row["status"] for row in notifications}, {"pending"})
+
     def test_serve_forever_scheduled_cycle_exception_uses_single_alert_stream(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -4846,6 +4885,17 @@ print(json.dumps({
                         "circuit opened",
                         minimum_occurrences=1,
                     )
+                    scheduled_alert = server._record_hard_failure_alert(
+                        NOW,
+                        "scheduled_cycle_exception",
+                        {
+                            "dependency_class": "scheduled_cycle",
+                            "reason": "cycle_exception_contained",
+                            "publish_target_key": target,
+                        },
+                        "scheduled cycle failed",
+                        minimum_occurrences=1,
+                    )
                     exit_code, _summary = server.tick()
                 finally:
                     server.close()
@@ -4874,9 +4924,11 @@ print(json.dumps({
             self.assertEqual({kind for kind, _message in alerts}, {"operator", "pushover"})
             circuit_row = next(row for row in rows(root / "argus.sqlite3", "product_alerts") if row["alert_key"] == circuit_alert["alert_key"])
             self.assertEqual(circuit_row["status"], "resolved")
+            scheduled_row = next(row for row in rows(root / "argus.sqlite3", "product_alerts") if row["alert_key"] == scheduled_alert["alert_key"])
+            self.assertEqual(scheduled_row["status"], "resolved")
             recovery_alerts = [message for kind, message in alerts if kind == "operator" and "hard failure recovered" in message]
-            self.assertEqual(len(recovery_alerts), 1)
-            self.assertIn("scheduled-recovery-message", recovery_alerts[0])
+            self.assertEqual(len(recovery_alerts), 2)
+            self.assertTrue(all("scheduled-recovery-message" in message for message in recovery_alerts))
             session = json.loads(session_path.read_text())
             self.assertEqual(session["agent_id"], public_key)
             self.assertEqual(session["session_token"], "session-2")
