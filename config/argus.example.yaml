@@ -14,6 +14,10 @@ schedule:
 publish:
   mode: inactive
   subspace_endpoint: https://subspace.swarm.channel
+  subspace_credential_mode: durable_identity
+  subspace_identity_path: /var/lib/argus/identity.json
+  subspace_session_path: /var/lib/argus/subspace-session.json
+  subspace_renew_before: 6h
   subspace_websocket_path: /api/firehose/stream/websocket
   require_embeddings: true
 
@@ -36,6 +40,11 @@ operator_alerts:
   product_degraded_classes:
     - required_embedding_outage
     - hard_failure
+
+direct_pushover:
+  enabled: false
+  endpoint: https://api.pushover.net/1/messages.json
+  timeout_seconds: 5
 
 embedding:
   backend: openai

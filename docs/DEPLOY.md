@@ -47,6 +47,22 @@ embedding:
 
 The host must provide `OPENAI_API_KEY` through the operator environment or host secret mechanism; do not put the token in YAML or logs. Default config keeps `publish.state: inactive`, `publish.live_approval: false`, and `schedule.max_live_publishes_per_tick: 1`; inactive plus no live approval is the primary safety boundary, and the scheduled publish cap is the first-activation rate boundary.
 
+Production publishing uses the existing Racter Argus Ed25519 identity and a server-scoped durable session file:
+
+```yaml
+publish:
+  mode: inactive
+  subspace_endpoint: https://subspace.swarm.channel
+  subspace_credential_mode: durable_identity
+  subspace_identity_path: /var/lib/argus/identity.json
+  subspace_session_path: /var/lib/argus/subspace-session.json
+  subspace_renew_before: 6h
+```
+
+The identity JSON contains the existing identity name, base64url Ed25519 public key, and base64url raw private key. The session JSON is created and atomically replaced by Argus with mode `0600`; it is target-scoped and contains the matching agent id, nullable token/expiry, issuance time, and last reauth result. Argus refuses a mismatched identity/session pair. Missing tokens, approaching finite expiry, `TOKEN_INVALID`, and `TOKEN_REVOKED` use the Subspace challenge-response reauth endpoints automatically. Do not generate a replacement identity for an existing Racter deployment.
+
+`ARGUS_SUBSPACE_AGENT_ID` and `ARGUS_SUBSPACE_SESSION_TOKEN` are accepted only when an explicit canary config sets `subspace_credential_mode: env_canary`. They cannot make the production `durable_identity` path live-ready.
+
 Required embedding failures are product-delivery failures, not green source-fetch runs. Argus exposes operator alerts as a generic config surface. Defaults are conservative: if `operator_alerts.enabled` is false or the target is incomplete, the run still fails and records product-health evidence, but no outbound alert is sent.
 
 ```yaml
@@ -66,6 +82,10 @@ operator_alerts:
 Supported targets are `openclaw_alert`, which posts JSON to an OpenClaw-compatible `/alert` endpoint, and `command`, which runs the configured argv list with the alert text on stdin and in `ARGUS_OPERATOR_ALERT_MESSAGE`.
 
 Argus records transient hard failures locally without paging. It sends operator alerts only when a hard-failure stream repeats without recovery; the default repetition threshold is two observations, and the dedupe window suppresses repeat pages for the same continuing stream.
+
+Scheduled-news delivery outages are separate from that legacy hard-failure stream. The first failed scheduled live delivery opens one target-scoped SQLite outage and immediately creates independent notification jobs for direct Pushover and the configured OpenClaw-compatible `/alert` route. Each channel has its own durable delivered receipt; a failed first send remains retryable across restart and is never treated as delivered or suppressed by the repeat-alert dedupe window. Configure direct Pushover with `direct_pushover.enabled: true` plus `ARGUS_PUSHOVER_APP_TOKEN` and `ARGUS_PUSHOVER_USER_KEY`, and configure `operator_alerts.target: openclaw_alert` for the owning operator session.
+
+`argus status` exposes active scheduled-delivery outages, immutable exact-cause events, both notification receipts, credential-recovery evidence, and the scheduled Subspace message-id gate. An outage clears only after post-outage durable credential recovery (reauth for auth causes or an authenticated durable-identity join for non-auth causes) and a real scheduled live publish with a non-empty Subspace message id. Manual/canary success, packaging, source fetch, credential recovery alone, and success without a message id do not clear it.
 
 For the Racter production GDM route, apply this stanza only after operator approval:
 
@@ -300,7 +320,7 @@ argus status --db /var/lib/argus-e2e/argus.sqlite3
 sqlite3 /var/lib/argus-e2e/argus.sqlite3 'select status, subspace_message_id, response_json from publish_attempts;'
 ```
 
-Set `ARGUS_SUBSPACE_AGENT_ID` and `ARGUS_SUBSPACE_SESSION_TOKEN` in the operator environment before the approved canary run. The checked-in canary config is fixture-backed by design so it emits exactly one operator-controlled package rather than live feed contents. The `--max-live-publishes 1` guard fails the cycle before any Subspace post if more than one active-eligible live send would be emitted. shrdlu-side receipt is verified downstream of Argus by observing the expected Subspace inbound message with the recorded `subspace_message_id` and package `package_id`.
+The checked-in canary config explicitly sets `subspace_credential_mode: env_canary`; set `ARGUS_SUBSPACE_AGENT_ID` and `ARGUS_SUBSPACE_SESSION_TOKEN` only for that approved canary run. It is fixture-backed by design so it emits exactly one operator-controlled package rather than live feed contents. The `--max-live-publishes 1` guard fails the cycle before any Subspace post if more than one active-eligible live send would be emitted. shrdlu-side receipt is verified downstream of Argus by observing the expected Subspace inbound message with the recorded `subspace_message_id` and package `package_id`.
 
 Rollback is to set the canary config back to `publish.state: inactive` and `publish.live_approval: false`, then rerun status checks. Do not delete the canary SQLite file before capturing the `publish_attempts` evidence.
 
@@ -313,7 +333,7 @@ The fixture has exactly two enabled sources:
 - Both sources carry `https://t261.example/news/shared-story` with distinct source-local GUIDs. A correct run creates exactly one package/publish candidate for that canonical URL, and the package `provenance.carried_by` records both source appearances.
 - Both sources also carry `t261-same-guid-different-url` with different canonical URLs. A correct run keeps both packages because feed GUID identity is source-local and does not globally suppress unrelated URLs.
 
-Use a copied config with a canary-local database/output directory such as `/var/lib/argus-t261-e2e/`. For an approved live E2E, activate only the copied config, set `ARGUS_SUBSPACE_AGENT_ID` and `ARGUS_SUBSPACE_SESSION_TOKEN` in the operator environment, and keep the production `/etc/argus/argus.yaml` inactive. The fixture is expected to produce three active-eligible delivery entries: one for the shared canonical URL and one for each same-GUID/different-URL item. shrdlu/Subetha receipt is downstream evidence only; Argus still publishes directly to `https://subspace.swarm.channel`.
+Use a copied config with a canary-local database/output directory such as `/var/lib/argus-t261-e2e/`. For an approved live E2E, activate only the copied `env_canary` config, set `ARGUS_SUBSPACE_AGENT_ID` and `ARGUS_SUBSPACE_SESSION_TOKEN` in the operator environment, and keep the production `/etc/argus/argus.yaml` inactive. The fixture is expected to produce three active-eligible delivery entries: one for the shared canonical URL and one for each same-GUID/different-URL item. shrdlu/Subetha receipt is downstream evidence only; Argus still publishes directly to `https://subspace.swarm.channel`.
 
 ## shrdlu receptor readiness
 

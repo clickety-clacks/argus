@@ -2,21 +2,25 @@ from __future__ import annotations
 
 import json
 import hashlib
+import base64
 import os
 import shutil
 import sqlite3
 import subprocess
 import unittest
+import threading
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import yaml
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import argus.server as server_module
-from argus.pipeline import command_main, run_pipeline_for_sources
+from argus.pipeline import command_main, iso_z, run_pipeline_for_sources
 from argus.server import ArgusServer, FakeClock, load_runtime_config
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "argus"
@@ -28,6 +32,8 @@ def write_config(root: Path, *, mode: str = "interval", interval: str = "1h", pu
     fixture_dir = root / "feeds"
     fixture_dir.mkdir(exist_ok=True)
     shutil.copy(FEEDS / "stateful_source.xml", fixture_dir / "stateful-source.xml")
+    publish_config = dict(publish or {"state": "inactive"})
+    publish_config.setdefault("subspace_credential_mode", "env_canary")
     config = {
         "runtime": {
             "database_path": str(root / "argus.sqlite3"),
@@ -42,7 +48,7 @@ def write_config(root: Path, *, mode: str = "interval", interval: str = "1h", pu
             "missed_tick_policy": "coalesce_one",
             "max_live_publishes_per_tick": 2,
         },
-        "publish": publish or {"state": "inactive"},
+        "publish": publish_config,
         "embedding": (
             {
                 "backend": "openai",
@@ -162,6 +168,100 @@ def fake_subspace_success(calls, message_id_prefix: str = "msg"):
         }
 
     return fake_post
+
+
+def write_durable_identity(root: Path) -> tuple[Path, Path, str]:
+    private_key = Ed25519PrivateKey.generate()
+    public_key = base64.urlsafe_b64encode(private_key.public_key().public_bytes_raw()).decode("ascii").rstrip("=")
+    private_value = base64.urlsafe_b64encode(private_key.private_bytes_raw()).decode("ascii").rstrip("=")
+    identity_path = root / "identity.json"
+    session_path = root / "session.json"
+    identity_path.write_text(
+        json.dumps({"name": "argus-racter", "public_key": public_key, "private_key": private_value}) + "\n"
+    )
+    identity_path.chmod(0o600)
+    return identity_path, session_path, public_key
+
+
+class LocalReauthServer:
+    def __init__(self, public_key: str, expires_at: str | None = None):
+        self.public_key = public_key
+        self.expires_at = expires_at
+        self.verify_count = 0
+        self.challenges: dict[str, str] = {}
+        fixture = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("content-length", "0"))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                if self.path == "/api/agents/reauth/start":
+                    self.assert_agent(payload)
+                    challenge_id = "challenge-{}".format(len(fixture.challenges) + 1)
+                    challenge = "nonce-{}".format(len(fixture.challenges) + 1)
+                    fixture.challenges[challenge_id] = challenge
+                    self.reply(200, {"challengeId": challenge_id, "challenge": challenge})
+                    return
+                if self.path == "/api/agents/reauth/verify":
+                    self.assert_agent(payload)
+                    challenge = fixture.challenges.pop(payload.get("challengeId"), None)
+                    if challenge is None:
+                        self.reply(400, {"code": "CHALLENGE_INVALID"})
+                        return
+                    canonical = json.dumps(
+                        {"agentId": fixture.public_key, "challenge": challenge}, separators=(",", ":")
+                    )
+                    signature = base64.urlsafe_b64decode(payload["signature"] + "==")
+                    public_bytes = base64.urlsafe_b64decode(fixture.public_key + "=")
+                    try:
+                        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+                        Ed25519PublicKey.from_public_bytes(public_bytes).verify(signature, canonical.encode("utf-8"))
+                    except Exception:
+                        self.reply(403, {"code": "SIGNATURE_INVALID"})
+                        return
+                    fixture.verify_count += 1
+                    self.reply(
+                        200,
+                        {
+                            "agentId": fixture.public_key,
+                            "sessionToken": "session-{}".format(fixture.verify_count),
+                            "sessionExpiresAt": fixture.expires_at,
+                        },
+                    )
+                    return
+                self.reply(404, {"code": "NOT_FOUND"})
+
+            def assert_agent(self, payload):
+                if payload.get("agentId") != fixture.public_key:
+                    raise AssertionError("Argus changed the durable machine identity")
+
+            def reply(self, status, payload):
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                return
+
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @property
+    def endpoint(self) -> str:
+        return "http://127.0.0.1:{}".format(self.server.server_port)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_args):
+        self.server.shutdown()
+        self.thread.join(timeout=2)
+        self.server.server_close()
 
 
 class ServerTests(unittest.TestCase):
@@ -885,6 +985,7 @@ class ServerTests(unittest.TestCase):
                 config = yaml.safe_load(path.read_text())
                 config["publish"] = {
                     "mode": "live",
+                    "subspace_credential_mode": "env_canary",
                     "subspace_endpoint": "https://subspace.invalid",
                     "allow_non_embedded_fallback": True,
                 }
@@ -944,6 +1045,7 @@ class ServerTests(unittest.TestCase):
                 config = yaml.safe_load(path.read_text())
                 config["publish"] = {
                     "mode": "live",
+                    "subspace_credential_mode": "env_canary",
                     "subspace_endpoint": "https://subspace.invalid",
                     "require_embeddings": True,
                 }
@@ -1002,6 +1104,7 @@ class ServerTests(unittest.TestCase):
 
                 config["publish"] = {
                     "mode": "live",
+                    "subspace_credential_mode": "env_canary",
                     "subspace_endpoint": "https://subspace.invalid",
                     "allow_non_embedded_fallback": True,
                 }
@@ -1695,13 +1798,15 @@ print(json.dumps({
             self.assertEqual(recovery_summary["embedding_delivery_recovery"]["status"], "recovered")
             self.assertEqual(recovery_summary["embedding_delivery_recovery"]["publish_attempt_counts"]["succeeded"], 1)
             self.assertEqual(recovery_summary["embedding_delivery_recovery"]["delivered_count"], 1)
-            self.assertEqual(len(alert_calls), 2)
-            self.assertIn("accepted 2 reports but delivered 0 because required embeddings failed", alert_calls[0]["message"])
-            self.assertIn("provider=openai", alert_calls[0]["message"])
-            self.assertIn("model=text-embedding-3-small", alert_calls[0]["message"])
-            self.assertIn("error_class=embed_backend_unavailable", alert_calls[0]["message"])
-            self.assertNotIn("sk-", alert_calls[0]["message"])
-            self.assertIn("embedding delivery recovered", alert_calls[1]["message"])
+            self.assertEqual(len(alert_calls), 3)
+            self.assertIn("Argus scheduled-news outage", alert_calls[0]["message"])
+            self.assertIn("exact_cause=embed_backend_unavailable", alert_calls[0]["message"])
+            self.assertIn("accepted 2 reports but delivered 0 because required embeddings failed", alert_calls[1]["message"])
+            self.assertIn("provider=openai", alert_calls[1]["message"])
+            self.assertIn("model=text-embedding-3-small", alert_calls[1]["message"])
+            self.assertIn("error_class=embed_backend_unavailable", alert_calls[1]["message"])
+            self.assertNotIn("sk-", alert_calls[1]["message"])
+            self.assertIn("embedding delivery recovered", alert_calls[2]["message"])
             self.assertEqual({call["session_key"] for call in alert_calls}, {"agent:test:argus"})
             self.assertEqual({call["source"] for call in alert_calls}, {"argus-test"})
             run_statuses = [row["status"] for row in sorted(rows(root / "argus.sqlite3", "runs"), key=lambda row: row["started_at"])]
@@ -2303,7 +2408,7 @@ print(json.dumps({
                         ("source:{}".format(report["source_id"]), "feed_entry_id", key_hash, report["report_id"], report["feed_entry_id"]),
                     )
                     connection.execute(
-                        "INSERT INTO accepted_reports VALUES (?, ?, ?, ?, ?)",
+                        "INSERT INTO accepted_reports (report_id, first_accepted_run_id, first_effective_mode, first_snapshot_id, first_accepted_at) VALUES (?, ?, ?, ?, ?)",
                         (report["report_id"], "legacy-run", "inactive", "legacy-snapshot", report["fetched_at"]),
                     )
                     connection.execute(
@@ -2380,7 +2485,7 @@ print(json.dumps({
                     ("source:{}".format(legacy_report["source_id"]), "feed_entry_id", key_hash, legacy_report["report_id"], legacy_report["feed_entry_id"]),
                 )
                 connection.execute(
-                    "INSERT INTO accepted_reports VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO accepted_reports (report_id, first_accepted_run_id, first_effective_mode, first_snapshot_id, first_accepted_at) VALUES (?, ?, ?, ?, ?)",
                     (legacy_report["report_id"], "legacy-run", "inactive", "legacy-snapshot", legacy_report["fetched_at"]),
                 )
                 connection.execute(
@@ -4156,7 +4261,7 @@ print(json.dumps({
             self.assertEqual(entries["entry-package-old"]["status"], "permanent_failure")
             self.assertEqual(entries["entry-package-old"]["last_error_class"], "stale_subspace_circuit_breaker")
             self.assertEqual(entries["entry-package-current"]["status"], "unknown")
-            self.assertEqual(entries["entry-package-current"]["last_error_class"], "PublishAckUnknownError")
+            self.assertEqual(entries["entry-package-current"]["last_error_class"], "ACK_UNKNOWN")
             attempts = rows(root / "argus.sqlite3", "publish_attempts")
             self.assertEqual(len(attempts), 1)
             self.assertEqual(attempts[0]["status"], "unknown")
@@ -4522,6 +4627,175 @@ print(json.dumps({
             self.assertIsNotNone(status["last_reload_failure"])
             self.assertIn("packages", status["counts"])
             self.assertIn("skipped_items_by_reason", status["counts"])
+
+    def test_durable_identity_recovers_revoked_token_with_same_idempotency_key_and_guarded_clear(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            identity_path, session_path, public_key = write_durable_identity(root)
+            original_post = server_module.post_message_to_subspace
+            original_operator = server_module.post_openclaw_alert
+            original_pushover = server_module.post_direct_pushover
+            original_app_token = os.environ.get("ARGUS_PUSHOVER_APP_TOKEN")
+            original_user_key = os.environ.get("ARGUS_PUSHOVER_USER_KEY")
+            os.environ["ARGUS_PUSHOVER_APP_TOKEN"] = "test-app-token"
+            os.environ["ARGUS_PUSHOVER_USER_KEY"] = "test-user-key"
+            calls = []
+            alerts = []
+            with LocalReauthServer(public_key) as auth:
+                path = write_config(
+                    root,
+                    publish={
+                        "mode": "live",
+                        "subspace_credential_mode": "durable_identity",
+                        "subspace_endpoint": auth.endpoint,
+                        "subspace_identity_path": str(identity_path),
+                        "subspace_session_path": str(session_path),
+                        "allow_non_embedded_fallback": True,
+                    },
+                )
+                config = yaml.safe_load(path.read_text())
+                config["operator_alerts"] = {
+                    "enabled": True,
+                    "target": "openclaw_alert",
+                    "endpoint": "http://operator.invalid/alert",
+                    "session_key": "agent:test:argus",
+                }
+                config["direct_pushover"] = {"enabled": True}
+                path.write_text(yaml.safe_dump(config))
+
+                def publish(endpoint, websocket_path, agent_id, session_token, text, embeddings, idempotency_key):
+                    calls.append((agent_id, session_token, idempotency_key))
+                    if len(calls) == 1:
+                        raise server_module.PublishTransportError(
+                            "token revoked",
+                            {"ok": False, "reply": {"response": {"code": "TOKEN_REVOKED"}}},
+                        )
+                    return {
+                        "ok": True,
+                        "results": [{"sent": True, "subspace_message_id": "scheduled-recovery-message"}],
+                    }
+
+                server_module.post_message_to_subspace = publish
+                server_module.post_openclaw_alert = lambda *args: alerts.append(("operator", args[3])) or {"ok": True}
+                server_module.post_direct_pushover = lambda *args: alerts.append(("pushover", args[3])) or {"status": 1, "request": "receipt"}
+                server = ArgusServer(path, clock=FakeClock(NOW))
+                try:
+                    exit_code, _summary = server.tick()
+                finally:
+                    server.close()
+                    server_module.post_message_to_subspace = original_post
+                    server_module.post_openclaw_alert = original_operator
+                    server_module.post_direct_pushover = original_pushover
+                    if original_app_token is None:
+                        os.environ.pop("ARGUS_PUSHOVER_APP_TOKEN", None)
+                    else:
+                        os.environ["ARGUS_PUSHOVER_APP_TOKEN"] = original_app_token
+                    if original_user_key is None:
+                        os.environ.pop("ARGUS_PUSHOVER_USER_KEY", None)
+                    else:
+                        os.environ["ARGUS_PUSHOVER_USER_KEY"] = original_user_key
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(auth.verify_count, 2)
+            self.assertEqual([call[0] for call in calls], [public_key, public_key])
+            self.assertEqual([call[2] for call in calls], [calls[0][2], calls[0][2]])
+            self.assertEqual([call[1] for call in calls], ["session-1", "session-2"])
+            outage = rows(root / "argus.sqlite3", "delivery_outages")[0]
+            self.assertEqual(outage["status"], "cleared")
+            self.assertEqual(outage["recovery_subspace_message_id"], "scheduled-recovery-message")
+            self.assertIsNotNone(outage["credential_recovered_at"])
+            self.assertEqual([row["exact_cause"] for row in rows(root / "argus.sqlite3", "delivery_outage_events")], ["TOKEN_REVOKED"])
+            self.assertEqual({row["status"] for row in rows(root / "argus.sqlite3", "delivery_outage_notifications")}, {"delivered"})
+            self.assertEqual({kind for kind, _message in alerts}, {"operator", "pushover"})
+            session = json.loads(session_path.read_text())
+            self.assertEqual(session["agent_id"], public_key)
+            self.assertEqual(session["session_token"], "session-2")
+
+    def test_non_auth_outage_and_failed_first_alert_survive_restart_until_scheduled_message_id(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            identity_path, session_path, public_key = write_durable_identity(root)
+            original_post = server_module.post_message_to_subspace
+            original_operator = server_module.post_openclaw_alert
+            original_pushover = server_module.post_direct_pushover
+            original_app_token = os.environ.get("ARGUS_PUSHOVER_APP_TOKEN")
+            original_user_key = os.environ.get("ARGUS_PUSHOVER_USER_KEY")
+            os.environ["ARGUS_PUSHOVER_APP_TOKEN"] = "test-app-token"
+            os.environ["ARGUS_PUSHOVER_USER_KEY"] = "test-user-key"
+            operator_calls = []
+            pushover_calls = []
+            with LocalReauthServer(public_key) as auth:
+                path = write_config(
+                    root,
+                    publish={
+                        "mode": "live",
+                        "subspace_credential_mode": "durable_identity",
+                        "subspace_endpoint": auth.endpoint,
+                        "subspace_identity_path": str(identity_path),
+                        "subspace_session_path": str(session_path),
+                        "allow_non_embedded_fallback": True,
+                    },
+                )
+                config = yaml.safe_load(path.read_text())
+                config["operator_alerts"] = {
+                    "enabled": True,
+                    "target": "openclaw_alert",
+                    "endpoint": "http://operator.invalid/alert",
+                    "session_key": "agent:test:argus",
+                }
+                config["direct_pushover"] = {"enabled": True}
+                path.write_text(yaml.safe_dump(config))
+                server_module.post_openclaw_alert = lambda *args: operator_calls.append(args[3]) or {"ok": True}
+
+                def failing_pushover(*args):
+                    pushover_calls.append(args[3])
+                    raise server_module.PipelineError("Pushover unavailable")
+
+                server_module.post_direct_pushover = failing_pushover
+                server_module.post_message_to_subspace = lambda *args: (_ for _ in ()).throw(
+                    server_module.PublishTransportError("connection refused")
+                )
+                clock = FakeClock(NOW)
+                first = ArgusServer(path, clock=clock)
+                try:
+                    first.tick()
+                    outage_before = rows(root / "argus.sqlite3", "delivery_outages")[0]
+                    first._record_auth_recovery_for_active_outage(
+                        clock.now(), {"reauthenticated": True, "reauthenticated_at": iso_z(clock.now())}
+                    )
+                    self.assertEqual(rows(root / "argus.sqlite3", "delivery_outages")[0]["status"], "active")
+                finally:
+                    first.close()
+
+                server_module.post_direct_pushover = lambda *args: pushover_calls.append(args[3]) or {"status": 1, "request": "retry-receipt"}
+                second = ArgusServer(path, clock=clock)
+                try:
+                    notifications = {row["channel"]: row for row in rows(root / "argus.sqlite3", "delivery_outage_notifications")}
+                    self.assertEqual(notifications["operator_alert"]["attempt_count"], 1)
+                    self.assertEqual(notifications["direct_pushover"]["attempt_count"], 2)
+                    self.assertEqual(notifications["direct_pushover"]["status"], "delivered")
+                    self.assertEqual(rows(root / "argus.sqlite3", "delivery_outages")[0]["outage_id"], outage_before["outage_id"])
+                    server_module.post_message_to_subspace = fake_subspace_success([], "restart-recovery")
+                    clock.advance(901)
+                    second._drain_due_delivery(clock.now(), max_entries=1)
+                finally:
+                    second.close()
+                    server_module.post_message_to_subspace = original_post
+                    server_module.post_openclaw_alert = original_operator
+                    server_module.post_direct_pushover = original_pushover
+                    if original_app_token is None:
+                        os.environ.pop("ARGUS_PUSHOVER_APP_TOKEN", None)
+                    else:
+                        os.environ["ARGUS_PUSHOVER_APP_TOKEN"] = original_app_token
+                    if original_user_key is None:
+                        os.environ.pop("ARGUS_PUSHOVER_USER_KEY", None)
+                    else:
+                        os.environ["ARGUS_PUSHOVER_USER_KEY"] = original_user_key
+            outage_after = rows(root / "argus.sqlite3", "delivery_outages")[0]
+            self.assertEqual(outage_after["status"], "cleared")
+            self.assertTrue(outage_after["recovery_subspace_message_id"].startswith("restart-recovery-"))
+            self.assertEqual(rows(root / "argus.sqlite3", "delivery_outage_events")[0]["exact_cause"], "CONNECTION_REFUSED")
+            self.assertEqual(len(operator_calls), 1)
+            self.assertEqual(len(pushover_calls), 2)
 
 
 if __name__ == "__main__":

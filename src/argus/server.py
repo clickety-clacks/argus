@@ -6,7 +6,9 @@ import json
 import os
 import re
 import signal
+import socket
 import sqlite3
+import ssl
 import subprocess
 import tempfile
 import time
@@ -19,6 +21,7 @@ import yaml
 import requests
 
 from .pipeline import PipelineError, SourceConfig, date_bucket, iso_z, normalize_feed_entry_id, normalize_title, parse_now, run_pipeline_for_sources, utc_now
+from .subspace_identity import DurableSubspaceSession, SubspaceAuthError
 
 
 MIN_INTERVAL_SECONDS = 5 * 60
@@ -31,6 +34,10 @@ API_ADAPTERS = {"api", "arxiv_atom"}
 DEFAULT_SUBSPACE_WEBSOCKET_PATH = "/api/firehose/stream/websocket"
 DEFAULT_SUBSPACE_AGENT_ID_ENV = "ARGUS_SUBSPACE_AGENT_ID"
 DEFAULT_SUBSPACE_SESSION_TOKEN_ENV = "ARGUS_SUBSPACE_SESSION_TOKEN"
+DEFAULT_SUBSPACE_CREDENTIAL_MODE = "durable_identity"
+SUBSPACE_CREDENTIAL_MODES = {"durable_identity", "env_canary"}
+DEFAULT_SUBSPACE_RENEW_BEFORE_SECONDS = 6 * 60 * 60
+DEFAULT_SUBSPACE_AUTH_TIMEOUT_SECONDS = 10.0
 DEFAULT_OPERATOR_ALERT_TARGET = "openclaw_alert"
 OPERATOR_ALERT_TARGETS = {"openclaw_alert", "command"}
 DEFAULT_OPERATOR_ALERT_SOURCE = "argus"
@@ -66,6 +73,11 @@ class PublishConfig:
     subspace_endpoint: Optional[str] = None
     subspace_agent_id: Optional[str] = None
     subspace_session_token: Optional[str] = None
+    subspace_credential_mode: str = DEFAULT_SUBSPACE_CREDENTIAL_MODE
+    subspace_identity_path: Optional[Path] = None
+    subspace_session_path: Optional[Path] = None
+    subspace_renew_before_seconds: int = DEFAULT_SUBSPACE_RENEW_BEFORE_SECONDS
+    subspace_auth_timeout_seconds: float = DEFAULT_SUBSPACE_AUTH_TIMEOUT_SECONDS
     subspace_websocket_path: str = DEFAULT_SUBSPACE_WEBSOCKET_PATH
     require_embeddings: bool = True
     allow_non_embedded_fallback: bool = False
@@ -95,6 +107,15 @@ class OperatorAlertsConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class DirectPushoverConfig:
+    enabled: bool = False
+    endpoint: str = "https://api.pushover.net/1/messages.json"
+    app_token: Optional[str] = None
+    user_key: Optional[str] = None
+    timeout_seconds: float = 5.0
+
+
+@dataclasses.dataclass(frozen=True)
 class EmbeddingConfig:
     backend: Optional[str] = None
     command: Optional[str] = None
@@ -113,6 +134,7 @@ class RuntimeConfig:
     publish: PublishConfig
     delivery: DeliveryConfig
     operator_alerts: OperatorAlertsConfig
+    direct_pushover: DirectPushoverConfig
     embedding: EmbeddingConfig
     source_fetch_concurrency: int = 4
     fixture_dir: Optional[Path] = None
@@ -301,12 +323,26 @@ def publish_config_from_payload(payload: Dict[str, Any]) -> PublishConfig:
             )
         )
     if "subspace_session_token" in payload:
-        raise PipelineError("publish.subspace_session_token must be supplied via ARGUS_SUBSPACE_SESSION_TOKEN")
+        raise PipelineError("publish.subspace_session_token is not a production credential source; ARGUS_SUBSPACE_SESSION_TOKEN is env_canary only")
+    credential_mode = str(payload.get("subspace_credential_mode") or DEFAULT_SUBSPACE_CREDENTIAL_MODE)
+    if credential_mode not in SUBSPACE_CREDENTIAL_MODES:
+        raise PipelineError("Unsupported publish.subspace_credential_mode: {}".format(credential_mode))
+    identity_path = payload.get("subspace_identity_path")
+    session_path = payload.get("subspace_session_path")
     return PublishConfig(
         mode=str(payload.get("mode", payload.get("state", "inactive"))),
         subspace_endpoint=(str(payload["subspace_endpoint"]) if payload.get("subspace_endpoint") else None),
-        subspace_agent_id=(str(payload["subspace_agent_id"]) if payload.get("subspace_agent_id") else os.environ.get(DEFAULT_SUBSPACE_AGENT_ID_ENV)),
-        subspace_session_token=os.environ.get(DEFAULT_SUBSPACE_SESSION_TOKEN_ENV),
+        subspace_agent_id=(
+            str(payload["subspace_agent_id"])
+            if payload.get("subspace_agent_id")
+            else (os.environ.get(DEFAULT_SUBSPACE_AGENT_ID_ENV) if credential_mode == "env_canary" else None)
+        ),
+        subspace_session_token=(os.environ.get(DEFAULT_SUBSPACE_SESSION_TOKEN_ENV) if credential_mode == "env_canary" else None),
+        subspace_credential_mode=credential_mode,
+        subspace_identity_path=(Path(str(identity_path)) if identity_path else None),
+        subspace_session_path=(Path(str(session_path)) if session_path else None),
+        subspace_renew_before_seconds=parse_duration_seconds(payload.get("subspace_renew_before", DEFAULT_SUBSPACE_RENEW_BEFORE_SECONDS)),
+        subspace_auth_timeout_seconds=float(payload.get("subspace_auth_timeout_seconds", DEFAULT_SUBSPACE_AUTH_TIMEOUT_SECONDS)),
         subspace_websocket_path=str(payload.get("subspace_websocket_path") or DEFAULT_SUBSPACE_WEBSOCKET_PATH),
         require_embeddings=bool(payload.get("require_embeddings", True)),
         allow_non_embedded_fallback=bool(payload.get("allow_non_embedded_fallback", False)),
@@ -340,6 +376,18 @@ def operator_alerts_config_from_payload(payload: Dict[str, Any]) -> OperatorAler
         source=str(payload.get("source") or os.environ.get("ARGUS_OPERATOR_ALERT_SOURCE") or DEFAULT_OPERATOR_ALERT_SOURCE),
         dedupe_window_seconds=parse_duration_seconds(payload.get("dedupe_window", DEFAULT_INTERVAL_SECONDS)),
         product_degraded_classes=product_degraded_classes,
+        timeout_seconds=float(payload.get("timeout_seconds", 5.0)),
+    )
+
+
+def direct_pushover_config_from_payload(payload: Dict[str, Any]) -> DirectPushoverConfig:
+    if not isinstance(payload, dict):
+        raise PipelineError("Invalid direct_pushover config")
+    return DirectPushoverConfig(
+        enabled=parse_bool(payload.get("enabled"), default=False),
+        endpoint=str(payload.get("endpoint") or "https://api.pushover.net/1/messages.json"),
+        app_token=(str(os.environ["ARGUS_PUSHOVER_APP_TOKEN"]) if os.environ.get("ARGUS_PUSHOVER_APP_TOKEN") else None),
+        user_key=(str(os.environ["ARGUS_PUSHOVER_USER_KEY"]) if os.environ.get("ARGUS_PUSHOVER_USER_KEY") else None),
         timeout_seconds=float(payload.get("timeout_seconds", 5.0)),
     )
 
@@ -431,9 +479,11 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
         raise PipelineError("at least one enabled source is required")
     publish_payload = payload.get("publish") or {}
     operator_alerts_payload = payload.get("operator_alerts") or {}
+    direct_pushover_payload = payload.get("direct_pushover") or {}
     embedding_payload = payload.get("embedding") or {}
     publish = publish_config_from_payload(publish_payload)
     operator_alerts = operator_alerts_config_from_payload(operator_alerts_payload)
+    direct_pushover = direct_pushover_config_from_payload(direct_pushover_payload)
     if publish.mode not in {"inactive", "dry_run", "live"}:
         raise PipelineError("Invalid publish.mode: {}".format(publish.mode))
     embedding = EmbeddingConfig(
@@ -454,6 +504,7 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
         publish=publish,
         delivery=validate_delivery(payload.get("delivery") or {}),
         operator_alerts=operator_alerts,
+        direct_pushover=direct_pushover,
         embedding=embedding,
         source_fetch_concurrency=source_fetch_concurrency,
         fixture_dir=(Path(runtime["fixture_dir"]) if runtime.get("fixture_dir") else None),
@@ -536,7 +587,8 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
           first_accepted_run_id TEXT NOT NULL,
           first_effective_mode TEXT NOT NULL,
           first_snapshot_id TEXT NOT NULL,
-          first_accepted_at TEXT NOT NULL
+          first_accepted_at TEXT NOT NULL,
+          first_requested_mode TEXT NOT NULL DEFAULT 'inactive'
         );
         CREATE TABLE IF NOT EXISTS normalized_reports (
           report_id TEXT PRIMARY KEY,
@@ -702,6 +754,50 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_delivery_due
           ON delivery_entries(status, due_at, next_retry_at, selected_order_index);
+        CREATE TABLE IF NOT EXISTS delivery_outages (
+          outage_id TEXT PRIMARY KEY,
+          outage_key TEXT NOT NULL,
+          publish_target_key TEXT NOT NULL,
+          status TEXT NOT NULL,
+          first_observed_at TEXT NOT NULL,
+          last_observed_at TEXT NOT NULL,
+          last_exact_cause TEXT NOT NULL,
+          credential_recovered_at TEXT,
+          credential_recovery_json TEXT,
+          recovery_run_id TEXT,
+          recovery_entry_id TEXT,
+          recovery_subspace_message_id TEXT,
+          cleared_at TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_outage_active
+          ON delivery_outages(outage_key) WHERE status = 'active';
+        CREATE TABLE IF NOT EXISTS delivery_outage_events (
+          failure_event_id TEXT PRIMARY KEY,
+          outage_id TEXT NOT NULL,
+          observed_at TEXT NOT NULL,
+          run_id TEXT,
+          plan_id TEXT,
+          entry_id TEXT,
+          attempt_id TEXT,
+          stage TEXT NOT NULL,
+          exact_cause TEXT NOT NULL,
+          cause_group TEXT NOT NULL,
+          retry_disposition TEXT NOT NULL,
+          error_class TEXT,
+          failure_text TEXT NOT NULL,
+          detail_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS delivery_outage_notifications (
+          outage_id TEXT NOT NULL,
+          channel TEXT NOT NULL,
+          status TEXT NOT NULL,
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          last_attempt_at TEXT,
+          delivered_at TEXT,
+          last_error TEXT,
+          receipt_json TEXT,
+          PRIMARY KEY (outage_id, channel)
+        );
         CREATE TABLE IF NOT EXISTS runtime_config_snapshots (
           snapshot_id TEXT PRIMARY KEY,
           config_hash TEXT NOT NULL,
@@ -800,6 +896,10 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
     scheduler_columns = {row["name"] for row in connection.execute("PRAGMA table_info(scheduler_state)")}
     if "max_live_publishes_per_tick" not in scheduler_columns:
         connection.execute("ALTER TABLE scheduler_state ADD COLUMN max_live_publishes_per_tick INTEGER")
+    accepted_report_columns = {row["name"] for row in connection.execute("PRAGMA table_info(accepted_reports)")}
+    if "first_requested_mode" not in accepted_report_columns:
+        connection.execute("ALTER TABLE accepted_reports ADD COLUMN first_requested_mode TEXT NOT NULL DEFAULT 'inactive'")
+        connection.execute("UPDATE accepted_reports SET first_requested_mode = first_effective_mode WHERE first_requested_mode IS NULL")
     for row in connection.execute(
         """
         SELECT report_id, source_id, canonical_url
@@ -839,6 +939,11 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
         if not config.publish.subspace_endpoint:
             effective = "blocked"
             blocked_reason = "missing_subspace_endpoint"
+        elif config.publish.subspace_credential_mode == "durable_identity" and (
+            not config.publish.subspace_identity_path or not config.publish.subspace_session_path
+        ):
+            effective = "blocked"
+            blocked_reason = "missing_durable_subspace_identity_config"
         elif not config.publish.subspace_agent_id or not config.publish.subspace_session_token:
             effective = "blocked"
             blocked_reason = "missing_subspace_credentials"
@@ -867,6 +972,8 @@ def build_publish_snapshot(config: RuntimeConfig, observed_at: datetime, force_i
         "embedding_space_id": config.embedding.space_id,
         "embedding_backend": config.embedding.backend,
         "delivery_mode": config.delivery.mode,
+        "subspace_credential_mode": config.publish.subspace_credential_mode,
+        "durable_identity_configured": bool(config.publish.subspace_identity_path and config.publish.subspace_session_path),
         "publish_target_key": (
             "sha256:" + hashlib.sha256(("publish-target:v0\n" + str(config.publish.subspace_endpoint)).encode("utf-8")).hexdigest()
             if config.publish.subspace_endpoint
@@ -1077,6 +1184,18 @@ def post_openclaw_alert(endpoint: str, session_key: str, source: str, message: s
     return payload
 
 
+def post_direct_pushover(endpoint: str, app_token: str, user_key: str, message: str, timeout_seconds: float) -> Dict[str, Any]:
+    response = requests.post(
+        endpoint,
+        data={"token": app_token, "user": user_key, "message": message, "title": "Argus scheduled-news outage"},
+        timeout=timeout_seconds,
+    )
+    payload = response.json()
+    if response.status_code < 200 or response.status_code >= 300 or payload.get("status") != 1:
+        raise PipelineError("Pushover delivery failed: status={} response={}".format(response.status_code, truncate_alert_message(json.dumps(payload, sort_keys=True))))
+    return payload
+
+
 def run_operator_alert_command(command: Tuple[str, ...], source: str, message: str, timeout_seconds: float) -> Dict[str, Any]:
     env = {
         **os.environ,
@@ -1196,13 +1315,66 @@ def package_payload_for(candidate: Dict[str, Any], package_id: str, carried_by: 
 
 
 class PublishTransportError(PipelineError):
-    def __init__(self, message: str, response: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        response: Optional[Dict[str, Any]] = None,
+        exact_cause: Optional[str] = None,
+        cause_group: str = "transport",
+    ) -> None:
         super().__init__(message)
         self.response = response
+        self.exact_cause = exact_cause or exact_publish_cause(response, message)
+        self.cause_group = cause_group
 
 
 class PublishAckUnknownError(PublishTransportError):
-    pass
+    def __init__(self, message: str, response: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message, response, exact_cause="ACK_UNKNOWN", cause_group="acknowledgement")
+
+
+def exact_publish_cause(response: Optional[Dict[str, Any]], message: str) -> str:
+    payload = response if isinstance(response, dict) else {}
+    error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    reply = payload.get("reply") if isinstance(payload.get("reply"), dict) else {}
+    body = reply.get("response") if isinstance(reply.get("response"), dict) else {}
+    code = payload.get("code") or error.get("code") or body.get("code") or body.get("reason")
+    if code:
+        return str(code)
+    lowered = message.lower()
+    if "connection refused" in lowered:
+        return "CONNECTION_REFUSED"
+    if "timed out" in lowered or "timeout" in lowered:
+        return "TIMEOUT"
+    if "name or service not known" in lowered or "nodename nor servname" in lowered:
+        return "DNS_RESOLUTION_FAILED"
+    if "certificate" in lowered or "tls" in lowered or "ssl" in lowered:
+        return "TLS_FAILURE"
+    return "TRANSPORT_FAILURE"
+
+
+def publish_failure_details(exc: Exception) -> Tuple[str, str, str]:
+    if isinstance(exc, SubspaceAuthError):
+        return exc.exact_cause, "auth", exc.__class__.__name__
+    if isinstance(exc, PublishTransportError):
+        cause = exc.exact_cause
+        group = exc.cause_group
+        if cause in {"TOKEN_INVALID", "TOKEN_REVOKED"}:
+            group = "auth"
+        elif cause == "BANNED":
+            group = "auth_policy"
+        elif cause == "RATE_LIMITED":
+            group = "rate_limit"
+        return cause, group, exc.__class__.__name__
+    if isinstance(exc, ConnectionRefusedError):
+        return "CONNECTION_REFUSED", "transport", exc.__class__.__name__
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return "TIMEOUT", "transport", exc.__class__.__name__
+    if isinstance(exc, socket.gaierror):
+        return "DNS_RESOLUTION_FAILED", "transport", exc.__class__.__name__
+    if isinstance(exc, ssl.SSLError):
+        return "TLS_FAILURE", "transport", exc.__class__.__name__
+    return exc.__class__.__name__, "dependency", exc.__class__.__name__
 
 
 def canonical_embedding_for_subspace(supplied_embedding: Dict[str, Any]) -> Dict[str, Any]:
@@ -1358,7 +1530,12 @@ def post_message_to_subspace(
     response = reply.get("response") if isinstance(reply.get("response"), dict) else {}
     message_id = response.get("id")
     if not message_id:
-        raise PublishTransportError("Subspace response missing subspace_message_id", {"ok": True, "reply": reply})
+        raise PublishTransportError(
+            "Subspace response missing subspace_message_id",
+            {"ok": True, "reply": reply},
+            exact_cause="MISSING_SUBSPACE_MESSAGE_ID",
+            cause_group="contract",
+        )
     return {
         "ok": True,
         "transport": "subspace_websocket",
@@ -1380,15 +1557,74 @@ class ArgusServer:
         self.register_service = register_service
         self.config = load_runtime_config(config_path)
         self.connection = connect_database(self.config.database_path)
+        self._durable_subspace_session: Optional[DurableSubspaceSession] = None
+        self._durable_session_error: Optional[Dict[str, str]] = None
         self.running = False
         self.reload_requested = False
         self._cycle_running = False
         self._tick_exception_alerted = False
         self._persisted_activation_observed_at: Optional[str] = None
+        self._initialize_durable_subspace_session()
         if self.register_service:
             self.start()
         else:
             self._ensure_control_state()
+
+    def _initialize_durable_subspace_session(self) -> None:
+        publish = self.config.publish
+        if publish.subspace_credential_mode != "durable_identity":
+            return
+        if not publish.subspace_endpoint or not publish.subspace_identity_path or not publish.subspace_session_path:
+            return
+        target = self._current_publish_target_key()
+        if target is None:
+            return
+        try:
+            session = DurableSubspaceSession(
+                publish.subspace_endpoint,
+                target,
+                publish.subspace_identity_path,
+                publish.subspace_session_path,
+                publish.subspace_renew_before_seconds,
+                publish.subspace_auth_timeout_seconds,
+            )
+            recovery = session.ensure_session(self.clock.now(), "startup")
+            self._durable_subspace_session = session
+            self._durable_session_error = None
+            self.config = dataclasses.replace(
+                self.config,
+                publish=dataclasses.replace(
+                    publish,
+                    subspace_agent_id=session.agent_id,
+                    subspace_session_token=session.session_token,
+                ),
+            )
+            if recovery.get("reauthenticated"):
+                self._record_auth_recovery_for_active_outage(self.clock.now(), recovery)
+        except Exception as exc:
+            exact_cause = getattr(exc, "exact_cause", exc.__class__.__name__)
+            self._durable_session_error = {"exact_cause": str(exact_cause), "message": str(exc)}
+
+    def _ensure_durable_subspace_session(self, reason: str) -> Optional[Dict[str, Any]]:
+        if self.config.publish.subspace_credential_mode != "durable_identity":
+            return None
+        if self._durable_subspace_session is None:
+            self._initialize_durable_subspace_session()
+        session = self._durable_subspace_session
+        if session is None:
+            cause = (self._durable_session_error or {}).get("exact_cause") or "MISSING_DURABLE_SUBSPACE_IDENTITY"
+            raise SubspaceAuthError(cause, (self._durable_session_error or {}).get("message") or cause)
+        recovery = session.ensure_session(self.clock.now(), reason)
+        self.config = dataclasses.replace(
+            self.config,
+            publish=dataclasses.replace(
+                self.config.publish,
+                subspace_agent_id=session.agent_id,
+                subspace_session_token=session.session_token,
+            ),
+        )
+        self._durable_session_error = None
+        return recovery
 
     def _apply_persisted_publish_state(self) -> None:
         row = self.connection.execute(
@@ -1424,6 +1660,7 @@ class ArgusServer:
         store_runtime_snapshot(self.connection, self._build_publish_snapshot(now), "control_start", "ok")
         if self.connection.execute("SELECT 1 FROM scheduler_state WHERE id = 1").fetchone() is None:
             self._record_scheduler_config(self.config.scheduler, now, recompute_next=True)
+        self._deliver_pending_outage_notifications()
 
     def start(self) -> None:
         now = self.clock.now()
@@ -1447,6 +1684,7 @@ class ArgusServer:
                 self.connection.commit()
                 self._record_scheduler_event("cycle_recovered_after_restart", stale["running_run_id"], "failed", {}, now)
             self._recover_stale_delivery_attempts(now)
+            self._deliver_pending_outage_notifications()
         self._record_scheduler_config(self.config.scheduler, now, recompute_next=True)
         self._record_scheduler_event("scheduler_ready", None, "ok", {"mode": self.config.scheduler.mode}, now)
 
@@ -1469,47 +1707,41 @@ class ArgusServer:
             "UPDATE runs SET status = ?, completed_at = ?, summary_json = ? WHERE run_id = ?",
             ("failed", iso_z(now), json.dumps(summary, sort_keys=True), run_id),
         )
-        self.connection.execute(
-            """
-            UPDATE publish_attempts
-            SET status = ?, completed_at = ?, error_class = ?, error_message = ?
-            WHERE status = 'pending'
-            """,
-            ("unknown", iso_z(now), "RuntimeError", "cycle recovered after restart before publish result was recorded"),
-        )
-        self.connection.execute(
-            """
-            UPDATE delivery_entries
-            SET status = 'unknown',
-                next_retry_at = NULL,
-                last_error_class = ?,
-                last_error_message = ?,
-                updated_at = ?
-            WHERE status = 'attempting'
-            """,
-            ("RuntimeError", "cycle recovered after restart before delivery result was recorded", iso_z(now)),
-        )
+        self.connection.commit()
 
     def _recover_stale_delivery_attempts(self, now: datetime) -> None:
+        stale = self.connection.execute(
+            """
+            SELECT delivery_entries.entry_id,
+                   (SELECT attempt_id FROM publish_attempts
+                    WHERE publish_attempts.publish_idempotency_key = delivery_entries.publish_idempotency_key
+                      AND publish_attempts.status = 'pending'
+                    ORDER BY attempted_at DESC LIMIT 1) AS attempt_id
+            FROM delivery_entries
+            WHERE status = 'attempting'
+            """
+        ).fetchall()
+        for row in stale:
+            self._record_delivery_failure(
+                row["entry_id"],
+                now,
+                status="unknown",
+                exact_cause="ACK_UNKNOWN",
+                cause_group="acknowledgement",
+                stage="restart_recovery",
+                retry_disposition="unknown",
+                message="service restarted before delivery result was recorded",
+                error_class="RuntimeError",
+                attempt_id=row["attempt_id"],
+            )
         self.connection.execute(
             """
             UPDATE publish_attempts
-            SET status = ?, completed_at = ?, error_class = ?, error_message = ?
+            SET status = 'unknown', completed_at = ?, error_class = 'RuntimeError',
+                error_message = 'service restarted before publish result was recorded'
             WHERE status = 'pending'
             """,
-            ("unknown", iso_z(now), "RuntimeError", "service restarted before publish result was recorded"),
-        )
-        self.connection.execute(
-            """
-            UPDATE delivery_entries
-            SET status = 'unknown',
-                next_retry_at = NULL,
-                last_error_class = ?,
-                last_error_message = ?,
-                updated_at = ?
-            WHERE status = 'attempting'
-            """,
-            ("RuntimeError", "service restarted before delivery result was recorded", iso_z(now)),
+            (iso_z(now),),
         )
         self.connection.commit()
 
@@ -1556,6 +1788,9 @@ class ArgusServer:
             self._record_scheduler_event("scheduler_reload_failed", None, "failed", {"error": str(exc)}, now)
             return
         self.config = new_config
+        self._durable_subspace_session = None
+        self._durable_session_error = None
+        self._initialize_durable_subspace_session()
         self._store_config_snapshot(now)
         snapshot = self._build_publish_snapshot(now)
         store_runtime_snapshot(self.connection, snapshot, "reload", "ok")
@@ -1643,6 +1878,21 @@ class ArgusServer:
         if control_result is not None:
             return control_result
         now = self.clock.now()
+        if self.config.publish.mode == "live" and self.config.publish.subspace_credential_mode == "durable_identity":
+            try:
+                recovery = self._ensure_durable_subspace_session("scheduled_tick")
+                if recovery and recovery.get("reauthenticated"):
+                    self._record_auth_recovery_for_active_outage(now, recovery)
+                store_runtime_snapshot(self.connection, self._build_publish_snapshot(now), "credential_refresh", "ok")
+            except Exception as exc:
+                exact_cause = getattr(exc, "exact_cause", exc.__class__.__name__)
+                self._durable_session_error = {"exact_cause": str(exact_cause), "message": str(exc)}
+                self.config = dataclasses.replace(
+                    self.config,
+                    publish=dataclasses.replace(self.config.publish, subspace_session_token=None),
+                )
+                store_runtime_snapshot(self.connection, self._build_publish_snapshot(now), "credential_refresh", "failed", str(exc))
+        self._deliver_pending_outage_notifications()
         delivery_result = self._drain_due_delivery(now)
         if delivery_result:
             return 0, {"run_kind": "delivery", "exit_status": "ok", "delivery": delivery_result}
@@ -1707,14 +1957,39 @@ class ArgusServer:
 
     def status(self) -> Dict[str, Any]:
         state = self._scheduler_state()
+        active_outages = self._active_delivery_outage_status()
         return {
             "database_path": str(self.config.database_path),
             "output_dir": str(self.config.output_dir),
             "publish": latest_snapshot(self.connection),
             "scheduler": dict(state),
             "delivery": self._delivery_status(self.clock.now()),
+            "durable_identity": self._durable_subspace_session.public_status() if self._durable_subspace_session else None,
+            "scheduled_delivery_outages": active_outages,
             "last_run": self._last_run(),
         }
+
+    def _active_delivery_outage_status(self) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        for outage in self.connection.execute(
+            "SELECT * FROM delivery_outages WHERE status = 'active' ORDER BY first_observed_at, outage_id"
+        ).fetchall():
+            events = [
+                {**dict(row), "detail": json.loads(row["detail_json"])}
+                for row in self.connection.execute(
+                    "SELECT * FROM delivery_outage_events WHERE outage_id = ? ORDER BY observed_at, rowid",
+                    (outage["outage_id"],),
+                ).fetchall()
+            ]
+            notifications = [
+                dict(row)
+                for row in self.connection.execute(
+                    "SELECT * FROM delivery_outage_notifications WHERE outage_id = ? ORDER BY channel",
+                    (outage["outage_id"],),
+                ).fetchall()
+            ]
+            result.append({**dict(outage), "events": events, "notifications": notifications})
+        return result
 
     def _process_control_requests(self) -> Optional[Tuple[int, Dict[str, Any]]]:
         row = self.connection.execute(
@@ -1938,6 +2213,16 @@ class ArgusServer:
             self.connection.rollback()
             summary = self._mark_run_failed(run_id, run_kind, now, output_dir, cycle_snapshot, exc)
             completed_at = self.clock.now()
+            if run_kind == "scheduled":
+                exact_cause = str(exc).split(":", 1)[0] if str(exc) else exc.__class__.__name__
+                self._record_scheduled_pre_send_failure(
+                    run_id,
+                    completed_at,
+                    cycle_snapshot,
+                    exact_cause,
+                    str(exc),
+                    stage="scheduled_cycle",
+                )
             detail = {
                 "dependency_class": "scheduled_cycle" if run_kind == "scheduled" else "cycle",
                 "reason": "cycle_exception_contained" if run_kind == "scheduled" else "cycle_exception",
@@ -2896,17 +3181,22 @@ class ArgusServer:
                 self.reload()
                 publish_snapshot = latest_snapshot(self.connection)
             self.connection.execute(
-                "INSERT OR IGNORE INTO accepted_reports VALUES (?, ?, ?, ?, ?)",
+                """
+                INSERT OR IGNORE INTO accepted_reports
+                (report_id, first_accepted_run_id, first_effective_mode, first_snapshot_id, first_accepted_at, first_requested_mode)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
                 (
                     candidate["report_id"],
                     run_id,
                     cycle_snapshot["effective_mode"],
                     cycle_snapshot["snapshot_id"],
                     iso_z(now),
+                    cycle_snapshot["requested_mode"],
                 ),
             )
             first = self.connection.execute(
-                "SELECT first_effective_mode FROM accepted_reports WHERE report_id = ?",
+                "SELECT first_effective_mode, first_requested_mode FROM accepted_reports WHERE report_id = ?",
                 (candidate["report_id"],),
             ).fetchone()
             supplied_embeddings, embedding_failure = self._embedding_for_candidate(candidate, now, cycle_embedding)
@@ -2923,6 +3213,14 @@ class ArgusServer:
                         json.dumps({**failure, "report_id": candidate["report_id"], "source_id": candidate["source_id"]}, sort_keys=True),
                         iso_z(now),
                     ),
+                )
+                self._record_scheduled_pre_send_failure(
+                    run_id,
+                    now,
+                    cycle_snapshot,
+                    str(failure["class"]),
+                    str(failure.get("message") or failure["class"]),
+                    stage="embedding",
                 )
                 continue
             if supplied_embeddings is None:
@@ -2996,7 +3294,7 @@ class ArgusServer:
                         iso_z(now),
                     ),
                 )
-            first_acceptance_allows_publish = first["first_effective_mode"] == "live" and (
+            first_acceptance_allows_publish = first["first_requested_mode"] == "live" and (
                 not cycle_snapshot["require_embeddings"] or cycle_snapshot["allow_non_embedded_fallback"] or embedding_matches_snapshot(cycle_snapshot, supplied_embeddings)
             )
             publish_allowed = first_acceptance_allows_publish and bool(cycle_snapshot.get("publish_target_key"))
@@ -3064,6 +3362,7 @@ class ArgusServer:
         return package_payloads
 
     def _publish_package_to_subspace(self, package_payload: Dict[str, Any], idempotency_key: str, supplied_embedding: Dict[str, Any]) -> Dict[str, Any]:
+        auth_recovery = self._ensure_durable_subspace_session("publish_attempt")
         return post_message_to_subspace(
             str(self.config.publish.subspace_endpoint),
             self.config.publish.subspace_websocket_path,
@@ -3072,7 +3371,7 @@ class ArgusServer:
             json.dumps(package_payload, sort_keys=True, separators=(",", ":")),
             [canonical_embedding_for_subspace(supplied_embedding)] if supplied_embedding else [],
             idempotency_key,
-        )
+        ) | {"authenticated_join": True, "auth_recovery": auth_recovery}
 
     def _delivery_window_end(self, now: datetime, run_id: str) -> datetime:
         state = self._scheduler_state()
@@ -3211,50 +3510,415 @@ class ArgusServer:
             return None
         return "sha256:" + hashlib.sha256(("publish-target:v0\n" + str(self.config.publish.subspace_endpoint)).encode("utf-8")).hexdigest()
 
-    def _mark_delivery_permanent_failure(self, entry_id: str, now: datetime, error_class: str, message: str) -> None:
+    def _delivery_outage_key(self, publish_target_key: str) -> str:
+        return "scheduled-news:{}".format(publish_target_key)
+
+    def _record_delivery_failure(
+        self,
+        entry_id: str,
+        now: datetime,
+        *,
+        status: str,
+        exact_cause: str,
+        cause_group: str,
+        stage: str,
+        retry_disposition: str,
+        message: str,
+        error_class: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+        next_retry_at: Optional[str] = None,
+        response: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        entry = self.connection.execute(
+            """
+            SELECT delivery_entries.*, runs.run_kind
+            FROM delivery_entries
+            JOIN runs ON runs.run_id = delivery_entries.run_id
+            WHERE delivery_entries.entry_id = ?
+            """,
+            (entry_id,),
+        ).fetchone()
+        if entry is None:
+            raise PipelineError("delivery entry not found: {}".format(entry_id))
+        observed_at = iso_z(now)
+        if attempt_id:
+            self.connection.execute(
+                """
+                UPDATE publish_attempts
+                SET status = ?, completed_at = ?, response_json = ?, error_class = ?, error_message = ?
+                WHERE attempt_id = ?
+                """,
+                (
+                    "unknown" if status == "unknown" else "failed",
+                    observed_at,
+                    json.dumps(response, sort_keys=True) if response is not None else None,
+                    error_class,
+                    message,
+                    attempt_id,
+                ),
+            )
         self.connection.execute(
             """
             UPDATE delivery_entries
-            SET status = 'permanent_failure',
-                last_error_class = ?,
-                last_error_message = ?,
-                updated_at = ?
+            SET status = ?, next_retry_at = ?, last_error_class = ?, last_error_message = ?, updated_at = ?
             WHERE entry_id = ?
             """,
-            (error_class, message, iso_z(now), entry_id),
+            (status, next_retry_at, exact_cause, message, observed_at, entry_id),
+        )
+        if entry["run_kind"] != "scheduled":
+            self.connection.commit()
+            return ""
+        return self._append_delivery_outage_occurrence(
+            entry["publish_target_key"],
+            now,
+            run_id=entry["run_id"],
+            plan_id=entry["plan_id"],
+            entry_id=entry_id,
+            attempt_id=attempt_id,
+            stage=stage,
+            exact_cause=exact_cause,
+            cause_group=cause_group,
+            retry_disposition=retry_disposition,
+            error_class=error_class,
+            message=message,
+            response=response,
+        )
+
+    def _append_delivery_outage_occurrence(
+        self,
+        publish_target_key: str,
+        now: datetime,
+        *,
+        run_id: Optional[str],
+        plan_id: Optional[str],
+        entry_id: Optional[str],
+        attempt_id: Optional[str],
+        stage: str,
+        exact_cause: str,
+        cause_group: str,
+        retry_disposition: str,
+        error_class: Optional[str],
+        message: str,
+        response: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        observed_at = iso_z(now)
+        outage_key = self._delivery_outage_key(publish_target_key)
+        outage = self.connection.execute(
+            "SELECT * FROM delivery_outages WHERE outage_key = ? AND status = 'active'",
+            (outage_key,),
+        ).fetchone()
+        if outage is None:
+            outage_id = "sha256:" + hashlib.sha256(
+                ("delivery-outage:v0\n{}\n{}\n{}".format(outage_key, entry_id or run_id, observed_at)).encode("utf-8")
+            ).hexdigest()
+            self.connection.execute(
+                """
+                INSERT INTO delivery_outages
+                (outage_id, outage_key, publish_target_key, status, first_observed_at, last_observed_at,
+                 last_exact_cause, credential_recovered_at, credential_recovery_json, recovery_run_id,
+                 recovery_entry_id, recovery_subspace_message_id, cleared_at)
+                VALUES (?, ?, ?, 'active', ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL)
+                """,
+                (outage_id, outage_key, publish_target_key, observed_at, observed_at, exact_cause),
+            )
+            for channel in ("direct_pushover", "operator_alert"):
+                self.connection.execute(
+                    """
+                    INSERT INTO delivery_outage_notifications
+                    (outage_id, channel, status, attempt_count, last_attempt_at, delivered_at, last_error, receipt_json)
+                    VALUES (?, ?, 'pending', 0, NULL, NULL, NULL, NULL)
+                    """,
+                    (outage_id, channel),
+                )
+        else:
+            outage_id = outage["outage_id"]
+            self.connection.execute(
+                "UPDATE delivery_outages SET last_observed_at = ?, last_exact_cause = ? WHERE outage_id = ?",
+                (observed_at, exact_cause, outage_id),
+            )
+        event_count = self.connection.execute(
+            "SELECT COUNT(*) FROM delivery_outage_events WHERE outage_id = ?", (outage_id,)
+        ).fetchone()[0]
+        failure_event_id = "sha256:" + hashlib.sha256(
+            ("delivery-outage-event:v0\n{}\n{}\n{}\n{}".format(outage_id, event_count + 1, exact_cause, observed_at)).encode("utf-8")
+        ).hexdigest()
+        self.connection.execute(
+            """
+            INSERT INTO delivery_outage_events
+            (failure_event_id, outage_id, observed_at, run_id, plan_id, entry_id, attempt_id, stage,
+             exact_cause, cause_group, retry_disposition, error_class, failure_text, detail_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                failure_event_id,
+                outage_id,
+                observed_at,
+                run_id,
+                plan_id,
+                entry_id,
+                attempt_id,
+                stage,
+                exact_cause,
+                cause_group,
+                retry_disposition,
+                error_class,
+                message,
+                json.dumps({"response": response} if response is not None else {}, sort_keys=True),
+            ),
         )
         self.connection.commit()
+        self._deliver_pending_outage_notifications(outage_id)
+        return outage_id
+
+    def _record_scheduled_pre_send_failure(
+        self,
+        run_id: str,
+        now: datetime,
+        snapshot: Dict[str, Any],
+        exact_cause: str,
+        message: str,
+        *,
+        stage: str,
+    ) -> Optional[str]:
+        if snapshot.get("requested_mode") != "live" or not snapshot.get("publish_target_key"):
+            return None
+        run = self.connection.execute("SELECT run_kind FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        if run is None or run["run_kind"] != "scheduled":
+            return None
+        return self._append_delivery_outage_occurrence(
+            str(snapshot["publish_target_key"]),
+            now,
+            run_id=run_id,
+            plan_id=None,
+            entry_id=None,
+            attempt_id=None,
+            stage=stage,
+            exact_cause=exact_cause,
+            cause_group="pre_send",
+            retry_disposition="retry_pending",
+            error_class=exact_cause,
+            message=message,
+        )
+
+    def _outage_alert_message(self, outage: sqlite3.Row) -> str:
+        event = self.connection.execute(
+            "SELECT * FROM delivery_outage_events WHERE outage_id = ? ORDER BY observed_at, rowid LIMIT 1",
+            (outage["outage_id"],),
+        ).fetchone()
+        return (
+            "Argus scheduled-news outage: environment_host={host} target={target} outage_id={outage_id} "
+            "first_observed_at={first} run_id={run_id} entry_id={entry_id} attempt_id={attempt_id} "
+            "exact_cause={cause} failure={failure} recovery_state={recovery_state} evidence=argus status --db {db}"
+        ).format(
+            host=socket.gethostname(),
+            target=self.config.publish.subspace_endpoint,
+            outage_id=outage["outage_id"],
+            first=outage["first_observed_at"],
+            run_id=event["run_id"] if event else None,
+            entry_id=event["entry_id"] if event else None,
+            attempt_id=event["attempt_id"] if event else None,
+            cause=event["exact_cause"] if event else outage["last_exact_cause"],
+            failure=truncate_alert_message(event["failure_text"] if event else "scheduled delivery failed"),
+            recovery_state=outage["status"],
+            db=self.config.database_path,
+        )
+
+    def _deliver_pending_outage_notifications(self, outage_id: Optional[str] = None) -> None:
+        where = "AND outage_id = ?" if outage_id else ""
+        args: Tuple[Any, ...] = (outage_id,) if outage_id else ()
+        jobs = self.connection.execute(
+            """
+            SELECT * FROM delivery_outage_notifications
+            WHERE status IN ('pending', 'failed') {}
+            ORDER BY outage_id, channel
+            """.format(where),
+            args,
+        ).fetchall()
+        for job in jobs:
+            outage = self.connection.execute("SELECT * FROM delivery_outages WHERE outage_id = ?", (job["outage_id"],)).fetchone()
+            if outage is None:
+                continue
+            attempted_at = iso_z(self.clock.now())
+            self.connection.execute(
+                """
+                UPDATE delivery_outage_notifications
+                SET status = 'attempted', attempt_count = attempt_count + 1, last_attempt_at = ?
+                WHERE outage_id = ? AND channel = ? AND delivered_at IS NULL
+                """,
+                (attempted_at, job["outage_id"], job["channel"]),
+            )
+            self.connection.commit()
+            try:
+                message = self._outage_alert_message(outage)
+                if job["channel"] == "direct_pushover":
+                    config = self.config.direct_pushover
+                    if not config.enabled or not config.app_token or not config.user_key:
+                        raise PipelineError("direct Pushover is not configured")
+                    receipt = post_direct_pushover(config.endpoint, config.app_token, config.user_key, message, config.timeout_seconds)
+                else:
+                    config = self.config.operator_alerts
+                    if not config.enabled or config.target != "openclaw_alert" or not config.endpoint or not config.session_key:
+                        raise PipelineError("operator /alert is not configured")
+                    receipt = post_openclaw_alert(config.endpoint, config.session_key, config.source, message, config.timeout_seconds)
+                self.connection.execute(
+                    """
+                    UPDATE delivery_outage_notifications
+                    SET status = 'delivered', delivered_at = ?, last_error = NULL, receipt_json = ?
+                    WHERE outage_id = ? AND channel = ?
+                    """,
+                    (iso_z(self.clock.now()), json.dumps(receipt, sort_keys=True), job["outage_id"], job["channel"]),
+                )
+            except Exception as exc:
+                self.connection.execute(
+                    """
+                    UPDATE delivery_outage_notifications
+                    SET status = 'failed', last_error = ?
+                    WHERE outage_id = ? AND channel = ? AND delivered_at IS NULL
+                    """,
+                    (truncate_alert_message(str(exc)), job["outage_id"], job["channel"]),
+                )
+            self.connection.commit()
+
+    def _record_auth_recovery_for_active_outage(self, now: datetime, evidence: Dict[str, Any]) -> None:
+        target = self._current_publish_target_key()
+        if target is None:
+            return
+        self.connection.execute(
+            """
+            UPDATE delivery_outages
+            SET credential_recovered_at = ?, credential_recovery_json = ?
+            WHERE outage_key = ? AND status = 'active' AND first_observed_at <= ?
+            """,
+            (iso_z(now), json.dumps(evidence, sort_keys=True), self._delivery_outage_key(target), iso_z(now)),
+        )
+        self.connection.commit()
+
+    def _record_scheduled_delivery_success(
+        self,
+        entry_id: str,
+        now: datetime,
+        message_id: str,
+        authenticated_join: bool,
+        auth_recovery: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        entry = self.connection.execute(
+            """
+            SELECT delivery_entries.*, runs.run_kind
+            FROM delivery_entries
+            JOIN runs ON runs.run_id = delivery_entries.run_id
+            WHERE delivery_entries.entry_id = ?
+            """,
+            (entry_id,),
+        ).fetchone()
+        if entry is None or entry["run_kind"] != "scheduled" or not message_id:
+            return
+        outage = self.connection.execute(
+            "SELECT * FROM delivery_outages WHERE outage_key = ? AND status = 'active'",
+            (self._delivery_outage_key(entry["publish_target_key"]),),
+        ).fetchone()
+        if outage is None:
+            return
+        successful_attempt = self.connection.execute(
+            """
+            SELECT completed_at FROM publish_attempts
+            WHERE publish_idempotency_key = ? AND status = 'succeeded' AND subspace_message_id = ?
+            ORDER BY completed_at DESC LIMIT 1
+            """,
+            (entry["publish_idempotency_key"], message_id),
+        ).fetchone()
+        if successful_attempt is None or not successful_attempt["completed_at"] or successful_attempt["completed_at"] < outage["first_observed_at"]:
+            return
+        has_auth_cause = self.connection.execute(
+            "SELECT 1 FROM delivery_outage_events WHERE outage_id = ? AND cause_group IN ('auth', 'auth_policy') LIMIT 1",
+            (outage["outage_id"],),
+        ).fetchone()
+        if auth_recovery:
+            credential_recovered_at = auth_recovery.get("reauthenticated_at") or iso_z(now)
+            credential_evidence = auth_recovery
+        elif not has_auth_cause and authenticated_join:
+            credential_recovered_at = iso_z(now)
+            credential_evidence = {"kind": "durable_identity_authenticated_join", "observed_at": iso_z(now)}
+        else:
+            credential_recovered_at = outage["credential_recovered_at"]
+            credential_evidence = json.loads(outage["credential_recovery_json"]) if outage["credential_recovery_json"] else None
+        self.connection.execute(
+            """
+            UPDATE delivery_outages
+            SET credential_recovered_at = COALESCE(credential_recovered_at, ?),
+                credential_recovery_json = COALESCE(credential_recovery_json, ?),
+                recovery_run_id = ?, recovery_entry_id = ?, recovery_subspace_message_id = ?
+            WHERE outage_id = ?
+            """,
+            (
+                credential_recovered_at,
+                json.dumps(credential_evidence, sort_keys=True) if credential_evidence else None,
+                entry["run_id"],
+                entry_id,
+                message_id,
+                outage["outage_id"],
+            ),
+        )
+        self._clear_delivery_outage_if_recovered(outage["outage_id"], now)
+        self.connection.commit()
+
+    def _clear_delivery_outage_if_recovered(self, outage_id: str, now: datetime) -> bool:
+        outage = self.connection.execute("SELECT * FROM delivery_outages WHERE outage_id = ?", (outage_id,)).fetchone()
+        if (
+            outage is None
+            or outage["status"] != "active"
+            or not outage["credential_recovered_at"]
+            or not outage["recovery_subspace_message_id"]
+        ):
+            return False
+        run = self.connection.execute("SELECT run_kind FROM runs WHERE run_id = ?", (outage["recovery_run_id"],)).fetchone()
+        if run is None or run["run_kind"] != "scheduled":
+            return False
+        self.connection.execute(
+            "UPDATE delivery_outages SET status = 'cleared', cleared_at = ? WHERE outage_id = ? AND status = 'active'",
+            (iso_z(now), outage_id),
+        )
+        return True
+
+    def _mark_delivery_permanent_failure(self, entry_id: str, now: datetime, error_class: str, message: str) -> None:
+        self._record_delivery_failure(
+            entry_id,
+            now,
+            status="permanent_failure",
+            exact_cause=error_class,
+            cause_group="pre_send",
+            stage="pre_send",
+            retry_disposition="permanent_failure",
+            message=message,
+            error_class=error_class,
+        )
 
     def _mark_delivery_retry_pending(self, entry_id: str, now: datetime, delay_seconds: int, error_class: str, message: str) -> None:
         retry_at = now + timedelta(seconds=delay_seconds)
-        self.connection.execute(
-            """
-            UPDATE delivery_entries
-            SET status = 'retry_pending',
-                next_retry_at = ?,
-                last_error_class = ?,
-                last_error_message = ?,
-                updated_at = ?
-            WHERE entry_id = ?
-            """,
-            (iso_z(retry_at), error_class, message, iso_z(now), entry_id),
+        self._record_delivery_failure(
+            entry_id,
+            now,
+            status="retry_pending",
+            exact_cause=error_class,
+            cause_group="pre_send",
+            stage="pre_send",
+            retry_disposition="retry_pending",
+            message=message,
+            error_class=error_class,
+            next_retry_at=iso_z(retry_at),
         )
-        self.connection.commit()
 
     def _mark_delivery_unknown(self, entry_id: str, now: datetime, error_class: str, message: str) -> None:
-        self.connection.execute(
-            """
-            UPDATE delivery_entries
-            SET status = 'unknown',
-                next_retry_at = NULL,
-                last_error_class = ?,
-                last_error_message = ?,
-                updated_at = ?
-            WHERE entry_id = ?
-            """,
-            (error_class, message, iso_z(now), entry_id),
+        self._record_delivery_failure(
+            entry_id,
+            now,
+            status="unknown",
+            exact_cause="ACK_UNKNOWN" if error_class in {"PublishAckUnknownError", "RuntimeError"} else error_class,
+            cause_group="acknowledgement",
+            stage="acknowledgement",
+            retry_disposition="unknown",
+            message=message,
+            error_class=error_class,
         )
-        self.connection.commit()
 
     def _run_publish_attempt_counts(self, run_id: str) -> Dict[str, int]:
         rows = self.connection.execute(
@@ -3309,14 +3973,10 @@ class ArgusServer:
         if latest_plan is None:
             return 0
         placeholders = ",".join("?" for _ in DELIVERY_CIRCUIT_BREAKER_CLASSES)
-        cursor = self.connection.execute(
+        stale_entries = self.connection.execute(
             """
-            UPDATE delivery_entries
-            SET status = 'permanent_failure',
-                next_retry_at = NULL,
-                last_error_class = 'stale_subspace_circuit_breaker',
-                last_error_message = 'superseded run Subspace circuit breaker aged out after a newer delivery plan',
-                updated_at = ?
+            SELECT entry_id
+            FROM delivery_entries
             WHERE publish_target_key = ?
               AND plan_id IN (
                 SELECT plan_id
@@ -3327,11 +3987,22 @@ class ArgusServer:
               AND status IN ('retry_pending', 'attempting')
               AND last_error_class IN ({})
             """.format(placeholders),
-            (iso_z(now), publish_target_key, publish_target_key, latest_plan["plan_id"], *DELIVERY_CIRCUIT_BREAKER_CLASSES),
-        )
-        terminalized = int(cursor.rowcount or 0)
+            (publish_target_key, publish_target_key, latest_plan["plan_id"], *DELIVERY_CIRCUIT_BREAKER_CLASSES),
+        ).fetchall()
+        for row in stale_entries:
+            self._record_delivery_failure(
+                row["entry_id"],
+                now,
+                status="permanent_failure",
+                exact_cause="stale_subspace_circuit_breaker",
+                cause_group="pre_send",
+                stage="circuit_breaker",
+                retry_disposition="permanent_failure",
+                message="superseded run Subspace circuit breaker aged out after a newer delivery plan",
+                error_class="stale_subspace_circuit_breaker",
+            )
+        terminalized = len(stale_entries)
         if terminalized:
-            self.connection.commit()
             self._resolve_hard_failure_alerts(
                 now,
                 ("subspace_publish_circuit_breaker",),
@@ -3398,6 +4069,44 @@ class ArgusServer:
     def _drain_due_delivery(self, now: datetime, max_entries: Optional[int] = None) -> Dict[str, Any]:
         publish_snapshot = latest_snapshot(self.connection)
         if publish_snapshot["effective_mode"] != "live":
+            if publish_snapshot.get("requested_mode") == "live" and publish_snapshot.get("publish_target_key"):
+                blocked = self.connection.execute(
+                    """
+                    SELECT entry_id
+                    FROM delivery_entries
+                    WHERE publish_target_key = ?
+                      AND ((status = 'pending' AND due_at <= ?)
+                        OR (status = 'retry_pending' AND COALESCE(next_retry_at, due_at) <= ?))
+                    ORDER BY COALESCE(next_retry_at, due_at), selected_order_index
+                    LIMIT ?
+                    """,
+                    (
+                        publish_snapshot["publish_target_key"],
+                        iso_z(now),
+                        iso_z(now),
+                        max_entries or self.config.delivery.live_send_concurrency,
+                    ),
+                ).fetchall()
+                exact_cause = (
+                    (self._durable_session_error or {}).get("exact_cause")
+                    or publish_snapshot.get("blocked_reason")
+                    or "PUBLISH_READINESS_BLOCKED"
+                )
+                for row in blocked:
+                    self._record_delivery_failure(
+                        row["entry_id"],
+                        now,
+                        status="retry_pending",
+                        exact_cause=str(exact_cause),
+                        cause_group="auth" if self.config.publish.subspace_credential_mode == "durable_identity" else "pre_send",
+                        stage="pre_send_readiness",
+                        retry_disposition="retry_pending",
+                        message=str((self._durable_session_error or {}).get("message") or publish_snapshot.get("blocked_reason")),
+                        error_class="SubspaceAuthError" if self.config.publish.subspace_credential_mode == "durable_identity" else "PipelineError",
+                        next_retry_at=iso_z(now + timedelta(seconds=self.config.delivery.max_retry_delay_seconds)),
+                    )
+                if blocked:
+                    return {"attempted": 0, "succeeded": 0, "failed": len(blocked), "unknown": 0, "circuit_opened": 0}
             return {}
         target = self._current_publish_target_key()
         if target is None:
@@ -3574,8 +4283,13 @@ class ArgusServer:
             try:
                 response = self._publish_package_to_subspace(package_payload, key, supplied_embeddings)
                 message_id = subspace_message_id_from_response(response)
-                if not message_id and not subspace_response_is_success(response):
-                    raise PublishTransportError("Subspace response missing subspace_message_id", response)
+                if not message_id:
+                    raise PublishTransportError(
+                        "Subspace response missing subspace_message_id",
+                        response,
+                        exact_cause="MISSING_SUBSPACE_MESSAGE_ID",
+                        cause_group="contract",
+                    )
                 completed_at = iso_z(self.clock.now())
                 self.connection.execute(
                     """
@@ -3594,56 +4308,87 @@ class ArgusServer:
                     (message_id, completed_at, entry["entry_id"]),
                 )
                 self.connection.commit()
+                if self._durable_subspace_session is not None:
+                    self._durable_subspace_session.record_authenticated_join(self.clock.now())
+                self._record_scheduled_delivery_success(
+                    entry["entry_id"],
+                    self.clock.now(),
+                    str(message_id),
+                    bool(response.get("authenticated_join")),
+                    response.get("auth_recovery") if isinstance(response.get("auth_recovery"), dict) else None,
+                )
                 succeeded += 1
             except PublishAckUnknownError as exc:
                 response = getattr(exc, "response", None)
-                completed_at = iso_z(self.clock.now())
-                self.connection.execute(
-                    """
-                    UPDATE publish_attempts
-                    SET status = 'unknown', completed_at = ?, response_json = ?, error_class = ?, error_message = ?
-                    WHERE attempt_id = ?
-                    """,
-                    (completed_at, json.dumps(response, sort_keys=True) if response is not None else None, exc.__class__.__name__, str(exc), attempt),
+                self._record_delivery_failure(
+                    entry["entry_id"],
+                    self.clock.now(),
+                    status="unknown",
+                    exact_cause="ACK_UNKNOWN",
+                    cause_group="acknowledgement",
+                    stage="acknowledgement",
+                    retry_disposition="unknown",
+                    message=str(exc),
+                    error_class=exc.__class__.__name__,
+                    attempt_id=attempt,
+                    response=response,
                 )
-                self.connection.execute(
-                    """
-                    UPDATE delivery_entries
-                    SET status = 'unknown',
-                        next_retry_at = NULL,
-                        last_error_class = ?,
-                        last_error_message = ?,
-                        updated_at = ?
-                    WHERE entry_id = ?
-                    """,
-                    (exc.__class__.__name__, str(exc), completed_at, entry["entry_id"]),
-                )
-                self.connection.commit()
                 unknown += 1
             except Exception as exc:
                 response = getattr(exc, "response", None)
-                completed_at = iso_z(self.clock.now())
                 delay = delivery_retry_delay_seconds(self.config.delivery.max_retry_delay_seconds, attempt_number, key)
                 delivery_status = "permanent_failure" if publish_exception_is_permanent(exc) else "retry_pending"
                 next_retry_at = None if delivery_status == "permanent_failure" else iso_z(self.clock.now() + timedelta(seconds=delay))
-                self.connection.execute(
-                    """
-                    UPDATE publish_attempts
-                    SET status = 'failed', completed_at = ?, response_json = ?, error_class = ?, error_message = ?
-                    WHERE attempt_id = ?
-                    """,
-                    (completed_at, json.dumps(response, sort_keys=True) if response is not None else None, exc.__class__.__name__, str(exc), attempt),
+                exact_cause, cause_group, error_class = publish_failure_details(exc)
+                auth_retry = exact_cause in {"TOKEN_INVALID", "TOKEN_REVOKED"} and self._durable_subspace_session is not None
+                self._record_delivery_failure(
+                    entry["entry_id"],
+                    self.clock.now(),
+                    status="retry_pending" if auth_retry else delivery_status,
+                    exact_cause=exact_cause,
+                    cause_group=cause_group,
+                    stage="subspace_publish",
+                    retry_disposition="retry_pending" if auth_retry else delivery_status,
+                    message=str(exc),
+                    error_class=error_class,
+                    attempt_id=attempt,
+                    next_retry_at=iso_z(self.clock.now()) if auth_retry else next_retry_at,
+                    response=response,
                 )
-                self.connection.execute(
-                    """
-                    UPDATE delivery_entries
-                    SET status = ?, next_retry_at = ?, last_error_class = ?, last_error_message = ?, updated_at = ?
-                    WHERE entry_id = ?
-                    """,
-                    (delivery_status, next_retry_at, exc.__class__.__name__, str(exc), completed_at, entry["entry_id"]),
-                )
-                self.connection.commit()
                 failed += 1
+                if auth_retry:
+                    try:
+                        self._durable_subspace_session.invalidate_token(self.clock.now(), exact_cause)
+                        recovery = self._durable_subspace_session.reauth(self.clock.now(), exact_cause)
+                        self.config = dataclasses.replace(
+                            self.config,
+                            publish=dataclasses.replace(
+                                self.config.publish,
+                                subspace_agent_id=self._durable_subspace_session.agent_id,
+                                subspace_session_token=self._durable_subspace_session.session_token,
+                            ),
+                        )
+                        self._record_auth_recovery_for_active_outage(self.clock.now(), recovery)
+                        retry_result = self._drain_due_delivery(self.clock.now(), max_entries=1)
+                        attempted += int(retry_result.get("attempted", 0))
+                        succeeded += int(retry_result.get("succeeded", 0))
+                        failed += int(retry_result.get("failed", 0))
+                        unknown += int(retry_result.get("unknown", 0))
+                    except Exception as reauth_exc:
+                        reauth_cause, reauth_group, reauth_class = publish_failure_details(reauth_exc)
+                        self._record_delivery_failure(
+                            entry["entry_id"],
+                            self.clock.now(),
+                            status="retry_pending",
+                            exact_cause=reauth_cause,
+                            cause_group=reauth_group,
+                            stage="credential_recovery",
+                            retry_disposition="retry_pending",
+                            message=str(reauth_exc),
+                            error_class=reauth_class,
+                            next_retry_at=iso_z(self.clock.now() + timedelta(seconds=delay)),
+                            response=getattr(reauth_exc, "response", None),
+                        )
         if succeeded > 0:
             resolved_circuit_keys = self._resolved_subspace_circuit_alert_keys(target)
             self._resolve_hard_failure_alerts(
@@ -4131,6 +4876,25 @@ def run_status(db_path: Path) -> Dict[str, Any]:
         latest_embedding_alert_row = connection.execute(
             "SELECT * FROM product_alerts WHERE alert_type = 'required_embedding_outage' ORDER BY last_observed_at DESC, alert_key LIMIT 1"
         ).fetchone()
+        active_outages = []
+        for outage in connection.execute(
+            "SELECT * FROM delivery_outages WHERE status = 'active' ORDER BY first_observed_at, outage_id"
+        ).fetchall():
+            events = [
+                {**dict(row), "detail": json.loads(row["detail_json"])}
+                for row in connection.execute(
+                    "SELECT * FROM delivery_outage_events WHERE outage_id = ? ORDER BY observed_at, rowid",
+                    (outage["outage_id"],),
+                ).fetchall()
+            ]
+            notifications = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM delivery_outage_notifications WHERE outage_id = ? ORDER BY channel",
+                    (outage["outage_id"],),
+                ).fetchall()
+            ]
+            active_outages.append({**dict(outage), "events": events, "notifications": notifications})
         last_summary = json.loads(run_row["summary_json"]) if run_row and run_row["summary_json"] else None
         return {
             "publish": snapshot,
@@ -4148,8 +4912,9 @@ def run_status(db_path: Path) -> Dict[str, Any]:
             },
             "last_run": ({**dict(run_row), "summary": last_summary} if run_row else None),
             "product_health": {
-                "status": "degraded" if active_alert_rows else "ok",
+                "status": "degraded" if active_alert_rows or active_outages else "ok",
                 "active_alerts": active_alert_rows,
+                "active_scheduled_delivery_outages": active_outages,
                 "latest_embedding_delivery_outage": (
                     json.loads(latest_embedding_alert_row["detail_json"]) if latest_embedding_alert_row else None
                 ),
@@ -4163,6 +4928,7 @@ def run_status(db_path: Path) -> Dict[str, Any]:
                 "skipped_items_by_reason": skipped_counts,
                 "embedding_failures": embedding_failure_count,
                 "active_product_alerts": len(active_alert_rows),
+                "active_scheduled_delivery_outages": len(active_outages),
             },
             "prime": dict(prime_row) if prime_row else None,
             "last_runtime_event": dict(runtime_event_row) if runtime_event_row else None,
