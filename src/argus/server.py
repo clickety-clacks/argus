@@ -4463,17 +4463,26 @@ class ArgusServer:
                     or publish_snapshot.get("blocked_reason")
                     or "PUBLISH_READINESS_BLOCKED"
                 )
+                readiness_message = str(
+                    (self._durable_session_error or {}).get("message") or publish_snapshot.get("blocked_reason")
+                )
+                if self.config.publish.subspace_credential_mode == "durable_identity":
+                    readiness_cause, readiness_group, readiness_class = publish_failure_details(
+                        SubspaceAuthError(str(exact_cause), readiness_message)
+                    )
+                else:
+                    readiness_cause, readiness_group, readiness_class = str(exact_cause), "pre_send", "PipelineError"
                 for row in blocked:
                     self._record_delivery_failure(
                         row["entry_id"],
                         now,
                         status="retry_pending",
-                        exact_cause=str(exact_cause),
-                        cause_group="auth" if self.config.publish.subspace_credential_mode == "durable_identity" else "pre_send",
+                        exact_cause=readiness_cause,
+                        cause_group=readiness_group,
                         stage="pre_send_readiness",
                         retry_disposition="retry_pending",
-                        message=str((self._durable_session_error or {}).get("message") or publish_snapshot.get("blocked_reason")),
-                        error_class="SubspaceAuthError" if self.config.publish.subspace_credential_mode == "durable_identity" else "PipelineError",
+                        message=readiness_message,
+                        error_class=readiness_class,
                         next_retry_at=iso_z(now + timedelta(seconds=self.config.delivery.max_retry_delay_seconds)),
                     )
                 if blocked:

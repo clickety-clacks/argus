@@ -4885,6 +4885,53 @@ print(json.dumps({
             self.assertEqual(event["outage_id"], outage_id)
             self.assertEqual((event["exact_cause"], event["cause_group"]), ("CONNECTION_RESET", "transport"))
 
+    def test_startup_reauth_readiness_failure_persists_transport_group(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            identity_path, session_path, public_key = write_durable_identity(root)
+            with LocalReauthServer(public_key) as auth:
+                path = write_config(
+                    root,
+                    publish={
+                        "mode": "live",
+                        "subspace_credential_mode": "durable_identity",
+                        "subspace_endpoint": auth.endpoint,
+                        "subspace_identity_path": str(identity_path),
+                        "subspace_session_path": str(session_path),
+                        "allow_non_embedded_fallback": True,
+                    },
+                )
+                first = ArgusServer(path, clock=FakeClock(NOW))
+                original_drain = first._drain_due_delivery
+                try:
+                    first._drain_due_delivery = lambda *args, **kwargs: {}
+                    first.tick()
+                    first._drain_due_delivery = original_drain
+                finally:
+                    first.close()
+                state = json.loads(session_path.read_text())
+                state["session_expires_at"] = iso_z(NOW)
+                session_path.write_text(json.dumps(state, sort_keys=True) + "\n")
+                original_post = subspace_identity_module.requests.post
+
+                def reset_reauth(*args, **kwargs):
+                    try:
+                        raise ConnectionResetError("reauth connection reset")
+                    except ConnectionResetError as exc:
+                        raise subspace_identity_module.requests.ConnectionError("request wrapper") from exc
+
+                subspace_identity_module.requests.post = reset_reauth
+                second = ArgusServer(path, clock=FakeClock(NOW))
+                try:
+                    result = second._drain_due_delivery(NOW, max_entries=1)
+                finally:
+                    second.close()
+                    subspace_identity_module.requests.post = original_post
+            self.assertEqual(result["failed"], 1)
+            event = rows(root / "argus.sqlite3", "delivery_outage_events")[0]
+            self.assertEqual(event["stage"], "pre_send_readiness")
+            self.assertEqual((event["exact_cause"], event["cause_group"]), ("CONNECTION_RESET", "transport"))
+
     def test_durable_identity_renews_approaching_finite_expiry(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
