@@ -1481,7 +1481,11 @@ def delivery_retry_delay_seconds(max_delay_seconds: int, attempt_number: int, ke
 def subspace_websocket_url(endpoint: str, websocket_path: str) -> str:
     parsed = urlparse(endpoint)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise PublishTransportError("invalid Subspace endpoint: {}".format(endpoint))
+        raise PublishTransportError(
+            "invalid Subspace endpoint: {}".format(endpoint),
+            exact_cause="INVALID_SUBSPACE_ENDPOINT",
+            cause_group="contract",
+        )
     scheme = "wss" if parsed.scheme == "https" else "ws"
     endpoint_path = parsed.path.rstrip("/")
     publish_path = "/" + websocket_path.lstrip("/")
@@ -1510,14 +1514,22 @@ def _read_phoenix_reply(
         try:
             frame = json.loads(raw)
         except ValueError as exc:
-            raise PublishTransportError("invalid Subspace websocket frame") from exc
+            raise PublishTransportError(
+                "invalid Subspace websocket frame",
+                exact_cause="INVALID_SUBSPACE_WEBSOCKET_FRAME",
+                cause_group="contract",
+            ) from exc
         if not isinstance(frame, list) or len(frame) != 5:
             continue
         _join_ref, ref, _topic, event, payload = frame
         if ref != expected_ref or event != "phx_reply":
             continue
         if not isinstance(payload, dict):
-            raise PublishTransportError("invalid Subspace {} reply".format(operation))
+            raise PublishTransportError(
+                "invalid Subspace {} reply".format(operation),
+                exact_cause="INVALID_SUBSPACE_REPLY",
+                cause_group="contract",
+            )
         if payload.get("status") != "ok":
             response = {"ok": False, "reply": payload}
             message = payload.get("response", {}).get("reason") if isinstance(payload.get("response"), dict) else None
@@ -1525,7 +1537,11 @@ def _read_phoenix_reply(
         return payload
     if missing_ack_is_unknown:
         raise PublishAckUnknownError("Subspace {} reply not received after {} frames".format(operation, max_frames))
-    raise PublishTransportError("Subspace {} reply not received after {} frames".format(operation, max_frames))
+    raise PublishTransportError(
+        "Subspace {} reply not received after {} frames".format(operation, max_frames),
+        exact_cause="SUBSPACE_REPLY_NOT_FOUND",
+        cause_group="contract",
+    )
 
 
 def post_message_to_subspace(
@@ -1544,7 +1560,11 @@ def post_message_to_subspace(
         try:
             import websocket  # type: ignore
         except ImportError as exc:
-            raise PublishTransportError("websocket-client dependency is unavailable") from exc
+            raise PublishTransportError(
+                "websocket-client dependency is unavailable",
+                exact_cause="WEBSOCKET_CLIENT_UNAVAILABLE",
+                cause_group="dependency",
+            ) from exc
         create_connection = websocket.create_connection
     url = subspace_websocket_url(endpoint, websocket_path)
     try:

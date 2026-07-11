@@ -79,6 +79,14 @@ def _request_exception_cause(exc: requests.RequestException) -> str:
             isinstance(current, OSError) and current.errno == errno.ECONNREFUSED
         ):
             return "CONNECTION_REFUSED"
+        if isinstance(current, ConnectionResetError) or (
+            isinstance(current, OSError) and current.errno == errno.ECONNRESET
+        ):
+            return "CONNECTION_RESET"
+        if isinstance(current, BrokenPipeError) or (
+            isinstance(current, OSError) and current.errno == errno.EPIPE
+        ):
+            return "BROKEN_PIPE"
         if isinstance(current, socket.gaierror):
             return "DNS_RESOLUTION_FAILED"
         current = current.__cause__ or current.__context__

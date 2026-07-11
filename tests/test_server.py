@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import base64
+import errno
 import os
 import shutil
 import sqlite3
@@ -4780,8 +4781,36 @@ print(json.dumps({
                 create_connection=refused_connection,
             )
         self.assertEqual(raised.exception.exact_cause, "CONNECTION_REFUSED")
-        self.assertEqual(server_module.publish_transport_exception_cause(ConnectionResetError("reset")), "CONNECTION_RESET")
-        self.assertEqual(server_module.publish_transport_exception_cause(BrokenPipeError("closed")), "BROKEN_PIPE")
+        for inner, expected in (
+            (ConnectionResetError("reset"), "CONNECTION_RESET"),
+            (OSError(errno.ECONNRESET, "reset"), "CONNECTION_RESET"),
+            (BrokenPipeError("closed"), "BROKEN_PIPE"),
+            (OSError(errno.EPIPE, "closed"), "BROKEN_PIPE"),
+        ):
+            with self.subTest(expected=expected, inner=inner.__class__.__name__):
+                try:
+                    raise inner
+                except OSError as exc:
+                    try:
+                        raise RuntimeError("generic transport wrapper") from exc
+                    except RuntimeError as wrapped:
+                        self.assertEqual(server_module.publish_transport_exception_cause(wrapped), expected)
+                        request_error = subspace_identity_module.requests.ConnectionError("generic requests wrapper")
+                        request_error.__cause__ = wrapped
+                        self.assertEqual(subspace_identity_module._request_exception_cause(request_error), expected)
+                self.assertEqual(server_module.publish_failure_details(inner)[0], expected)
+
+        class InvalidFrameConnection:
+            def recv(self):
+                return "not-json"
+
+        with self.assertRaises(server_module.PublishTransportError) as invalid_frame:
+            server_module._read_phoenix_reply(InvalidFrameConnection(), "1", "join")
+        self.assertEqual(invalid_frame.exception.exact_cause, "INVALID_SUBSPACE_WEBSOCKET_FRAME")
+        self.assertEqual(server_module.publish_failure_details(invalid_frame.exception)[:2], ("INVALID_SUBSPACE_WEBSOCKET_FRAME", "contract"))
+        with self.assertRaises(server_module.PublishTransportError) as invalid_endpoint:
+            server_module.subspace_websocket_url("not-an-endpoint", "/api/firehose/stream/websocket")
+        self.assertEqual(invalid_endpoint.exception.exact_cause, "INVALID_SUBSPACE_ENDPOINT")
 
     def test_durable_identity_renews_approaching_finite_expiry(self):
         with TemporaryDirectory() as tmpdir:
