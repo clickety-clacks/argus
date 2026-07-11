@@ -5191,6 +5191,80 @@ print(json.dumps({
             self.assertEqual(outage["status"], "active")
             self.assertIsNone(outage["recovery_subspace_message_id"])
 
+    def test_migrated_active_outage_captures_existing_attempt_boundary_before_reconciliation(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            identity_path, session_path, public_key = write_durable_identity(root)
+            original_post = server_module.post_message_to_subspace
+            with LocalReauthServer(public_key) as auth:
+                path = write_config(
+                    root,
+                    publish={
+                        "mode": "live",
+                        "subspace_credential_mode": "durable_identity",
+                        "subspace_endpoint": auth.endpoint,
+                        "subspace_identity_path": str(identity_path),
+                        "subspace_session_path": str(session_path),
+                        "allow_non_embedded_fallback": True,
+                    },
+                )
+                server_module.post_message_to_subspace = fake_subspace_success([], "pre-migration")
+                first = ArgusServer(path, clock=FakeClock(NOW))
+                original_drain = first._drain_due_delivery
+                try:
+                    first._drain_due_delivery = lambda *args, **kwargs: {}
+                    first.tick()
+                    first._drain_due_delivery = original_drain
+                    first._drain_due_delivery(NOW, max_entries=1)
+                    run_id = rows(root / "argus.sqlite3", "delivery_entries")[0]["run_id"]
+                    snapshot = first._build_publish_snapshot(NOW)
+                    outage_id = first._record_scheduled_pre_send_failure(
+                        run_id,
+                        NOW,
+                        snapshot,
+                        "CONNECTION_REFUSED",
+                        "same-second failure in a database awaiting boundary migration",
+                        stage="scheduled_cycle",
+                    )
+                finally:
+                    first.close()
+                connection = sqlite3.connect(root / "argus.sqlite3")
+                try:
+                    connection.executescript(
+                        """
+                        DROP INDEX idx_delivery_outage_active;
+                        ALTER TABLE delivery_outages RENAME TO delivery_outages_current;
+                        CREATE TABLE delivery_outages (
+                          outage_id TEXT PRIMARY KEY, outage_key TEXT NOT NULL,
+                          publish_target_key TEXT NOT NULL, status TEXT NOT NULL,
+                          first_observed_at TEXT NOT NULL, last_observed_at TEXT NOT NULL,
+                          last_exact_cause TEXT NOT NULL, credential_recovered_at TEXT,
+                          credential_recovery_json TEXT, recovery_run_id TEXT,
+                          recovery_entry_id TEXT, recovery_subspace_message_id TEXT, cleared_at TEXT
+                        );
+                        INSERT INTO delivery_outages
+                        SELECT outage_id, outage_key, publish_target_key, status, first_observed_at,
+                               last_observed_at, last_exact_cause, credential_recovered_at,
+                               credential_recovery_json, recovery_run_id, recovery_entry_id,
+                               recovery_subspace_message_id, cleared_at
+                        FROM delivery_outages_current;
+                        DROP TABLE delivery_outages_current;
+                        CREATE UNIQUE INDEX idx_delivery_outage_active
+                          ON delivery_outages(outage_key) WHERE status = 'active';
+                        """
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+                second = ArgusServer(path, clock=FakeClock(NOW))
+                second.close()
+                server_module.post_message_to_subspace = original_post
+            outage = rows(root / "argus.sqlite3", "delivery_outages")[0]
+            self.assertEqual(outage["outage_id"], outage_id)
+            self.assertEqual(outage["status"], "active")
+            self.assertEqual(outage["publish_attempt_rowid_at_open"], 1)
+            self.assertIsNone(outage["recovery_subspace_message_id"])
+
     def test_non_auth_outage_and_failed_first_alert_survive_restart_until_scheduled_message_id(self):
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

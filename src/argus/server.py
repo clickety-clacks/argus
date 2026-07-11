@@ -905,9 +905,9 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
         connection.execute("UPDATE accepted_reports SET first_requested_mode = first_effective_mode WHERE first_requested_mode IS NULL")
     delivery_outage_columns = {row["name"] for row in connection.execute("PRAGMA table_info(delivery_outages)")}
     if "credential_generation_at_open" not in delivery_outage_columns:
-        connection.execute("ALTER TABLE delivery_outages ADD COLUMN credential_generation_at_open INTEGER NOT NULL DEFAULT 0")
+        connection.execute("ALTER TABLE delivery_outages ADD COLUMN credential_generation_at_open INTEGER")
     if "publish_attempt_rowid_at_open" not in delivery_outage_columns:
-        connection.execute("ALTER TABLE delivery_outages ADD COLUMN publish_attempt_rowid_at_open INTEGER NOT NULL DEFAULT 0")
+        connection.execute("ALTER TABLE delivery_outages ADD COLUMN publish_attempt_rowid_at_open INTEGER")
     for row in connection.execute(
         """
         SELECT report_id, source_id, canonical_url
@@ -1615,6 +1615,7 @@ class ArgusServer:
         self._tick_exception_alerted = False
         self._persisted_activation_observed_at: Optional[str] = None
         self._initialize_durable_subspace_session()
+        self._initialize_migrated_active_outage_boundaries()
         self._reconcile_active_delivery_outage_recovery(self.clock.now())
         if self.register_service:
             self.start()
@@ -1655,6 +1656,27 @@ class ArgusServer:
         except Exception as exc:
             exact_cause = getattr(exc, "exact_cause", exc.__class__.__name__)
             self._durable_session_error = {"exact_cause": str(exact_cause), "message": str(exc)}
+
+    def _initialize_migrated_active_outage_boundaries(self) -> None:
+        generation = 0
+        if self._durable_subspace_session is not None:
+            generation = int(self._durable_subspace_session.public_status().get("reauth_generation") or 0)
+        self.connection.execute(
+            """
+            UPDATE delivery_outages
+            SET credential_generation_at_open = COALESCE(credential_generation_at_open, ?),
+                publish_attempt_rowid_at_open = COALESCE(
+                  publish_attempt_rowid_at_open,
+                  (SELECT COALESCE(MAX(publish_attempts.rowid), 0)
+                   FROM publish_attempts
+                   WHERE publish_attempts.publish_target_key = delivery_outages.publish_target_key)
+                )
+            WHERE status = 'active'
+              AND (credential_generation_at_open IS NULL OR publish_attempt_rowid_at_open IS NULL)
+            """,
+            (generation,),
+        )
+        self.connection.commit()
 
     def _ensure_durable_subspace_session(self, reason: str) -> Optional[Dict[str, Any]]:
         if self.config.publish.subspace_credential_mode != "durable_identity":
