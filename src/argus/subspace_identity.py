@@ -211,12 +211,33 @@ class DurableSubspaceSession:
                     raise ValueError("session_expires_at must be a string or null")
                 parse_now(expires_at)
             generation = payload.get("reauth_generation", 0)
-            if isinstance(generation, bool):
+            if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
                 raise ValueError("reauth_generation must be an integer")
-            int(generation or 0)
             last_reauth = payload.get("last_reauth")
             if last_reauth is not None and not isinstance(last_reauth, dict):
                 raise ValueError("last_reauth must be an object or null")
+            session_token = payload.get("session_token")
+            if session_token is not None and not isinstance(session_token, str):
+                raise ValueError("session_token must be a string or null")
+            for timestamp_key in ("token_issued_at", "last_authenticated_join_at"):
+                timestamp = payload.get(timestamp_key)
+                if timestamp is not None:
+                    if not isinstance(timestamp, str):
+                        raise ValueError("{} must be a string or null".format(timestamp_key))
+                    parse_now(timestamp)
+            if last_reauth is not None:
+                observed_at = last_reauth.get("observed_at")
+                if observed_at is not None:
+                    if not isinstance(observed_at, str):
+                        raise ValueError("last_reauth.observed_at must be a string")
+                    parse_now(observed_at)
+                last_generation = last_reauth.get("reauth_generation")
+                if last_generation is not None and (
+                    isinstance(last_generation, bool)
+                    or not isinstance(last_generation, int)
+                    or last_generation < 0
+                ):
+                    raise ValueError("last_reauth.reauth_generation must be an integer")
         except (AttributeError, TypeError, ValueError) as exc:
             raise DurableSubspaceStateError(
                 "INVALID_DURABLE_SUBSPACE_SESSION_STATE",

@@ -1550,8 +1550,11 @@ class ServerTests(unittest.TestCase):
                     "require_embeddings": True,
                 },
             )
-            with self.assertRaisesRegex(Exception, "missing_embedding_config"):
-                ArgusServer(path, clock=FakeClock(NOW))
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                self.assertEqual(server.status()["publish"]["blocked_reason"], "missing_embedding_config")
+            finally:
+                server.close()
 
     def test_fake_embedding_backend_blocks_active_live_config(self):
         with TemporaryDirectory() as tmpdir:
@@ -1597,8 +1600,11 @@ class ServerTests(unittest.TestCase):
             config = yaml.safe_load(path.read_text())
             del config["embedding"]["provider"]
             path.write_text(yaml.safe_dump(config))
-            with self.assertRaisesRegex(Exception, "missing_embedding_config"):
-                ArgusServer(path, clock=FakeClock(NOW))
+            server = ArgusServer(path, clock=FakeClock(NOW))
+            try:
+                self.assertEqual(server.status()["publish"]["blocked_reason"], "missing_embedding_config")
+            finally:
+                server.close()
 
     def test_openai_embedding_backend_records_model_backed_vector(self):
         with TemporaryDirectory() as tmpdir:
@@ -4858,6 +4864,8 @@ print(json.dumps({
             "INVALID_DURABLE_SUBSPACE_SESSION_STATE": "contract",
             "DURABLE_SUBSPACE_SESSION_BINDING_MISMATCH": "contract",
             "MISSING_DURABLE_SUBSPACE_IDENTITY": "contract",
+            "missing_subspace_endpoint": "contract",
+            "missing_subspace_credentials": "contract",
             "missing_durable_subspace_identity_config": "contract",
             "missing_publish_cap": "contract",
             "missing_embedding_config": "contract",
@@ -5000,7 +5008,17 @@ print(json.dumps({
                 [],
                 {**base_state, "session_expires_at": "not-a-time"},
                 {**base_state, "reauth_generation": "not-an-integer"},
+                {**base_state, "reauth_generation": 1.5},
                 {**base_state, "last_reauth": "not-an-object"},
+                {
+                    **base_state,
+                    "last_reauth": {
+                        "status": "succeeded",
+                        "observed_at": iso_z(NOW),
+                        "reauth_generation": "not-an-integer",
+                    },
+                },
+                {**base_state, "session_token": 1},
             ]
             for invalid_state in invalid_states:
                 with self.subTest(invalid_state=invalid_state):
@@ -5015,6 +5033,43 @@ print(json.dumps({
                             1.0,
                         )
                     self.assertEqual(failure.exception.exact_cause, "INVALID_DURABLE_SUBSPACE_SESSION_STATE")
+
+    def test_queued_delivery_readiness_config_failures_open_contract_outages(self):
+        for cause in ("missing_subspace_endpoint", "missing_embedding_config"):
+            with self.subTest(cause=cause), TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                identity_path, session_path, public_key = write_durable_identity(root)
+                with LocalReauthServer(public_key) as auth:
+                    path = write_config(
+                        root,
+                        publish={
+                            "mode": "live",
+                            "subspace_credential_mode": "durable_identity",
+                            "subspace_endpoint": auth.endpoint,
+                            "subspace_identity_path": str(identity_path),
+                            "subspace_session_path": str(session_path),
+                        },
+                    )
+                    server = ArgusServer(path, clock=FakeClock(NOW))
+                    original_drain = server._drain_due_delivery
+                    try:
+                        server._drain_due_delivery = lambda *args, **kwargs: {}
+                        server.tick()
+                        server._drain_due_delivery = original_drain
+                        config = yaml.safe_load(path.read_text())
+                        if cause == "missing_subspace_endpoint":
+                            del config["publish"]["subspace_endpoint"]
+                        else:
+                            config["embedding"] = {}
+                        path.write_text(yaml.safe_dump(config))
+                        server.reload()
+                        result = server._drain_due_delivery(NOW, max_entries=1)
+                    finally:
+                        server.close()
+                self.assertEqual(result["failed"], 1)
+                event = rows(root / "argus.sqlite3", "delivery_outage_events")[0]
+                self.assertEqual(event["stage"], "pre_send_readiness")
+                self.assertEqual((event["exact_cause"], event["cause_group"]), (cause, "contract"))
 
     def test_durable_identity_renews_approaching_finite_expiry(self):
         with TemporaryDirectory() as tmpdir:

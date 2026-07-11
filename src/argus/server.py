@@ -495,8 +495,6 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
         dimensions=(int(embedding_payload["dimensions"]) if embedding_payload.get("dimensions") is not None else None),
         space_id=(str(embedding_payload["space_id"]) if embedding_payload.get("space_id") else None),
     )
-    if publish.require_embeddings and not publish.allow_non_embedded_fallback and not embedding_config_valid(embedding):
-        raise PipelineError("missing_embedding_config")
     return RuntimeConfig(
         database_path=Path(database_path),
         output_dir=Path(output_dir),
@@ -1432,6 +1430,8 @@ def publish_failure_details(exc: Exception) -> Tuple[str, str, str]:
             "INVALID_DURABLE_SUBSPACE_SESSION_STATE",
             "DURABLE_SUBSPACE_SESSION_BINDING_MISMATCH",
             "MISSING_DURABLE_SUBSPACE_IDENTITY",
+            "missing_subspace_endpoint",
+            "missing_subspace_credentials",
             "missing_durable_subspace_identity_config",
             "missing_publish_cap",
             "missing_embedding_config",
@@ -4458,19 +4458,17 @@ class ArgusServer:
     def _drain_due_delivery(self, now: datetime, max_entries: Optional[int] = None) -> Dict[str, Any]:
         publish_snapshot = latest_snapshot(self.connection)
         if publish_snapshot["effective_mode"] != "live":
-            if publish_snapshot.get("requested_mode") == "live" and publish_snapshot.get("publish_target_key"):
+            if publish_snapshot.get("requested_mode") == "live":
                 blocked = self.connection.execute(
                     """
                     SELECT entry_id
                     FROM delivery_entries
-                    WHERE publish_target_key = ?
-                      AND ((status = 'pending' AND due_at <= ?)
+                    WHERE ((status = 'pending' AND due_at <= ?)
                         OR (status = 'retry_pending' AND COALESCE(next_retry_at, due_at) <= ?))
                     ORDER BY COALESCE(next_retry_at, due_at), selected_order_index
                     LIMIT ?
                     """,
                     (
-                        publish_snapshot["publish_target_key"],
                         iso_z(now),
                         iso_z(now),
                         max_entries or self.config.delivery.live_send_concurrency,
