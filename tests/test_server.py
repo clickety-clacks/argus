@@ -4853,6 +4853,13 @@ print(json.dumps({
             "CONNECTION_RESET": "transport",
             "BROKEN_PIPE": "transport",
             "REAUTH_START_CONTRACT_VIOLATION": "contract",
+            "INVALID_DURABLE_SUBSPACE_IDENTITY": "contract",
+            "DURABLE_SUBSPACE_IDENTITY_KEY_MISMATCH": "contract",
+            "INVALID_DURABLE_SUBSPACE_SESSION_STATE": "contract",
+            "DURABLE_SUBSPACE_SESSION_BINDING_MISMATCH": "contract",
+            "DURABLE_SUBSPACE_IDENTITY_READ_FAILED": "dependency",
+            "DURABLE_SUBSPACE_SESSION_READ_FAILED": "dependency",
+            "DURABLE_SUBSPACE_SESSION_PERSIST_FAILED": "dependency",
         }
         for cause, group in grouped_causes.items():
             with self.subTest(cause=cause):
@@ -4931,6 +4938,44 @@ print(json.dumps({
             event = rows(root / "argus.sqlite3", "delivery_outage_events")[0]
             self.assertEqual(event["stage"], "pre_send_readiness")
             self.assertEqual((event["exact_cause"], event["cause_group"]), ("CONNECTION_RESET", "transport"))
+
+    def test_invalid_durable_session_readiness_persists_contract_group(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            identity_path, session_path, public_key = write_durable_identity(root)
+            with LocalReauthServer(public_key) as auth:
+                path = write_config(
+                    root,
+                    publish={
+                        "mode": "live",
+                        "subspace_credential_mode": "durable_identity",
+                        "subspace_endpoint": auth.endpoint,
+                        "subspace_identity_path": str(identity_path),
+                        "subspace_session_path": str(session_path),
+                        "allow_non_embedded_fallback": True,
+                    },
+                )
+                first = ArgusServer(path, clock=FakeClock(NOW))
+                original_drain = first._drain_due_delivery
+                try:
+                    first._drain_due_delivery = lambda *args, **kwargs: {}
+                    first.tick()
+                    first._drain_due_delivery = original_drain
+                finally:
+                    first.close()
+                session_path.write_text("not-json\n")
+                second = ArgusServer(path, clock=FakeClock(NOW))
+                try:
+                    result = second._drain_due_delivery(NOW, max_entries=1)
+                finally:
+                    second.close()
+            self.assertEqual(result["failed"], 1)
+            event = rows(root / "argus.sqlite3", "delivery_outage_events")[0]
+            self.assertEqual(event["stage"], "pre_send_readiness")
+            self.assertEqual(
+                (event["exact_cause"], event["cause_group"]),
+                ("INVALID_DURABLE_SUBSPACE_SESSION_STATE", "contract"),
+            )
 
     def test_durable_identity_renews_approaching_finite_expiry(self):
         with TemporaryDirectory() as tmpdir:

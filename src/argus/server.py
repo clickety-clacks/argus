@@ -1426,6 +1426,19 @@ def publish_failure_details(exc: Exception) -> Tuple[str, str, str]:
             group = "transport"
         elif cause.endswith("_CONTRACT_VIOLATION"):
             group = "contract"
+        elif cause in {
+            "INVALID_DURABLE_SUBSPACE_IDENTITY",
+            "DURABLE_SUBSPACE_IDENTITY_KEY_MISMATCH",
+            "INVALID_DURABLE_SUBSPACE_SESSION_STATE",
+            "DURABLE_SUBSPACE_SESSION_BINDING_MISMATCH",
+        }:
+            group = "contract"
+        elif cause in {
+            "DURABLE_SUBSPACE_IDENTITY_READ_FAILED",
+            "DURABLE_SUBSPACE_SESSION_READ_FAILED",
+            "DURABLE_SUBSPACE_SESSION_PERSIST_FAILED",
+        }:
+            group = "dependency"
         else:
             group = "auth"
         return cause, group, exc.__class__.__name__

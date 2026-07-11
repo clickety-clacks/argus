@@ -26,6 +26,12 @@ class SubspaceAuthError(PipelineError):
         self.response = response or {}
 
 
+class DurableSubspaceStateError(PipelineError):
+    def __init__(self, exact_cause: str, message: str) -> None:
+        super().__init__(message)
+        self.exact_cause = exact_cause
+
+
 def _base64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
@@ -104,16 +110,29 @@ class DurableSubspaceIdentity:
     @classmethod
     def load(cls, path: Path) -> "DurableSubspaceIdentity":
         try:
-            payload = json.loads(path.read_text())
+            identity_json = path.read_text()
+        except OSError as exc:
+            raise DurableSubspaceStateError(
+                "DURABLE_SUBSPACE_IDENTITY_READ_FAILED",
+                "failed to read durable Subspace identity: {}".format(exc),
+            ) from exc
+        try:
+            payload = json.loads(identity_json)
             name = str(payload["name"])
             public_key = str(payload["public_key"])
             private_bytes = _base64url_decode(str(payload["private_key"]))
             private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
         except Exception as exc:
-            raise PipelineError("invalid durable Subspace identity: {}".format(exc)) from exc
+            raise DurableSubspaceStateError(
+                "INVALID_DURABLE_SUBSPACE_IDENTITY",
+                "invalid durable Subspace identity: {}".format(exc),
+            ) from exc
         derived_public_key = _base64url_encode(private_key.public_key().public_bytes_raw())
         if derived_public_key != public_key:
-            raise PipelineError("durable Subspace identity public/private key mismatch")
+            raise DurableSubspaceStateError(
+                "DURABLE_SUBSPACE_IDENTITY_KEY_MISMATCH",
+                "durable Subspace identity public/private key mismatch",
+            )
         return cls(name=name, public_key=public_key, private_key=private_key)
 
     def sign(self, canonical_payload: str) -> str:
@@ -155,9 +174,19 @@ class DurableSubspaceSession:
                 "last_authenticated_join_at": None,
             }
         try:
-            payload = json.loads(self.session_path.read_text())
-        except Exception as exc:
-            raise PipelineError("invalid durable Subspace session state: {}".format(exc)) from exc
+            session_json = self.session_path.read_text()
+        except OSError as exc:
+            raise DurableSubspaceStateError(
+                "DURABLE_SUBSPACE_SESSION_READ_FAILED",
+                "failed to read durable Subspace session state: {}".format(exc),
+            ) from exc
+        try:
+            payload = json.loads(session_json)
+        except (TypeError, ValueError) as exc:
+            raise DurableSubspaceStateError(
+                "INVALID_DURABLE_SUBSPACE_SESSION_STATE",
+                "invalid durable Subspace session state: {}".format(exc),
+            ) from exc
         expected = {
             "identity": self.identity.name,
             "subspace_endpoint": self.endpoint,
@@ -166,11 +195,20 @@ class DurableSubspaceSession:
         }
         for key, value in expected.items():
             if payload.get(key) != value:
-                raise PipelineError("durable Subspace session {} mismatch".format(key))
+                raise DurableSubspaceStateError(
+                    "DURABLE_SUBSPACE_SESSION_BINDING_MISMATCH",
+                    "durable Subspace session {} mismatch".format(key),
+                )
         return payload
 
     def _persist(self) -> None:
-        _atomic_write_json(self.session_path, self.state)
+        try:
+            _atomic_write_json(self.session_path, self.state)
+        except OSError as exc:
+            raise DurableSubspaceStateError(
+                "DURABLE_SUBSPACE_SESSION_PERSIST_FAILED",
+                "failed to persist durable Subspace session state: {}".format(exc),
+            ) from exc
 
     @property
     def agent_id(self) -> str:
