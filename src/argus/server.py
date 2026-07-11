@@ -1407,7 +1407,28 @@ def exact_publish_cause(response: Optional[Dict[str, Any]], message: str) -> str
 
 def publish_failure_details(exc: Exception) -> Tuple[str, str, str]:
     if isinstance(exc, SubspaceAuthError):
-        return exc.exact_cause, "auth", exc.__class__.__name__
+        cause = exc.exact_cause
+        if cause in {"TOKEN_INVALID", "TOKEN_REVOKED"}:
+            group = "auth"
+        elif cause == "BANNED":
+            group = "auth_policy"
+        elif cause == "RATE_LIMITED":
+            group = "rate_limit"
+        elif cause in {
+            "CONNECTION_REFUSED",
+            "CONNECTION_RESET",
+            "BROKEN_PIPE",
+            "CONNECTION_ERROR",
+            "TIMEOUT",
+            "DNS_RESOLUTION_FAILED",
+            "TLS_FAILURE",
+        }:
+            group = "transport"
+        elif cause.endswith("_CONTRACT_VIOLATION"):
+            group = "contract"
+        else:
+            group = "auth"
+        return cause, group, exc.__class__.__name__
     if isinstance(exc, PublishTransportError):
         cause = exc.exact_cause
         group = exc.cause_group

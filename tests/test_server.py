@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import base64
+import builtins
 import errno
 import os
 import shutil
@@ -4811,6 +4812,78 @@ print(json.dumps({
         with self.assertRaises(server_module.PublishTransportError) as invalid_endpoint:
             server_module.subspace_websocket_url("not-an-endpoint", "/api/firehose/stream/websocket")
         self.assertEqual(invalid_endpoint.exception.exact_cause, "INVALID_SUBSPACE_ENDPOINT")
+
+        class ReplyConnection:
+            def __init__(self, frame):
+                self.frame = frame
+
+            def recv(self):
+                return json.dumps(self.frame)
+
+        with self.assertRaises(server_module.PublishTransportError) as invalid_reply:
+            server_module._read_phoenix_reply(
+                ReplyConnection(["1", "1", "firehose", "phx_reply", []]), "1", "join"
+            )
+        self.assertEqual(invalid_reply.exception.exact_cause, "INVALID_SUBSPACE_REPLY")
+        with self.assertRaises(server_module.PublishTransportError) as missing_reply:
+            server_module._read_phoenix_reply(
+                ReplyConnection(["1", "other", "firehose", "other", {}]), "1", "join", max_frames=1
+            )
+        self.assertEqual(missing_reply.exception.exact_cause, "SUBSPACE_REPLY_NOT_FOUND")
+
+        original_import = builtins.__import__
+
+        def missing_websocket(name, *args, **kwargs):
+            if name == "websocket":
+                raise ImportError("missing websocket-client")
+            return original_import(name, *args, **kwargs)
+
+        builtins.__import__ = missing_websocket
+        try:
+            with self.assertRaises(server_module.PublishTransportError) as missing_dependency:
+                server_module.post_message_to_subspace("https://subspace.invalid", "/ws", "agent", "token", "{}", [], "key")
+        finally:
+            builtins.__import__ = original_import
+        self.assertEqual(missing_dependency.exception.exact_cause, "WEBSOCKET_CLIENT_UNAVAILABLE")
+
+        grouped_causes = {
+            "TOKEN_REVOKED": "auth",
+            "BANNED": "auth_policy",
+            "RATE_LIMITED": "rate_limit",
+            "CONNECTION_RESET": "transport",
+            "BROKEN_PIPE": "transport",
+            "REAUTH_START_CONTRACT_VIOLATION": "contract",
+        }
+        for cause, group in grouped_causes.items():
+            with self.subTest(cause=cause):
+                failure = subspace_identity_module.SubspaceAuthError(cause, "reauth failed")
+                self.assertEqual(server_module.publish_failure_details(failure)[:2], (cause, group))
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            server = ArgusServer(write_config(root), clock=FakeClock(NOW))
+            try:
+                failure = subspace_identity_module.SubspaceAuthError("CONNECTION_RESET", "reauth reset")
+                exact_cause, cause_group, error_class = server_module.publish_failure_details(failure)
+                outage_id = server._append_delivery_outage_occurrence(
+                    "target",
+                    NOW,
+                    run_id="scheduled-run",
+                    plan_id=None,
+                    entry_id=None,
+                    attempt_id=None,
+                    stage="credential_recovery",
+                    exact_cause=exact_cause,
+                    cause_group=cause_group,
+                    retry_disposition="retry_pending",
+                    error_class=error_class,
+                    message=str(failure),
+                )
+            finally:
+                server.close()
+            event = rows(root / "argus.sqlite3", "delivery_outage_events")[0]
+            self.assertEqual(event["outage_id"], outage_id)
+            self.assertEqual((event["exact_cause"], event["cause_group"]), ("CONNECTION_RESET", "transport"))
 
     def test_durable_identity_renews_approaching_finite_expiry(self):
         with TemporaryDirectory() as tmpdir:
