@@ -226,11 +226,13 @@ class DurableSubspaceSession:
                         raise ValueError("{} must be a string or null".format(timestamp_key))
                     parse_now(timestamp)
             if last_reauth is not None:
+                status = last_reauth.get("status")
+                if status not in {"succeeded", "failed", "required"}:
+                    raise ValueError("last_reauth.status is invalid")
                 observed_at = last_reauth.get("observed_at")
-                if observed_at is not None:
-                    if not isinstance(observed_at, str):
-                        raise ValueError("last_reauth.observed_at must be a string")
-                    parse_now(observed_at)
+                if not isinstance(observed_at, str):
+                    raise ValueError("last_reauth.observed_at must be a string")
+                parse_now(observed_at)
                 last_generation = last_reauth.get("reauth_generation")
                 if last_generation is not None and (
                     isinstance(last_generation, bool)
@@ -238,6 +240,17 @@ class DurableSubspaceSession:
                     or last_generation < 0
                 ):
                     raise ValueError("last_reauth.reauth_generation must be an integer")
+                if status == "succeeded" and last_generation != generation:
+                    raise ValueError("last_reauth.reauth_generation must match reauth_generation")
+                for text_key in ("reason", "exact_cause"):
+                    text_value = last_reauth.get(text_key)
+                    if text_value is not None and not isinstance(text_value, str):
+                        raise ValueError("last_reauth.{} must be a string".format(text_key))
+                last_expiry = last_reauth.get("session_expires_at")
+                if last_expiry is not None:
+                    if not isinstance(last_expiry, str):
+                        raise ValueError("last_reauth.session_expires_at must be a string or null")
+                    parse_now(last_expiry)
         except (AttributeError, TypeError, ValueError) as exc:
             raise DurableSubspaceStateError(
                 "INVALID_DURABLE_SUBSPACE_SESSION_STATE",

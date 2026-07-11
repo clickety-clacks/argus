@@ -3941,7 +3941,7 @@ class ArgusServer:
             "exact_cause={cause} failure={failure} recovery_state={recovery_state} evidence=argus status --db {db}"
         ).format(
             host=socket.gethostname(),
-            target=self.config.publish.subspace_endpoint,
+            target=outage["publish_target_key"],
             outage_id=outage["outage_id"],
             first=outage["first_observed_at"],
             run_id=event["run_id"] if event else None,

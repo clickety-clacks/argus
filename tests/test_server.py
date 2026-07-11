@@ -5018,6 +5018,15 @@ print(json.dumps({
                         "reauth_generation": "not-an-integer",
                     },
                 },
+                {
+                    **base_state,
+                    "last_reauth": {
+                        "status": "succeeded",
+                        "observed_at": iso_z(NOW),
+                        "reauth_generation": 2,
+                    },
+                },
+                {**base_state, "last_reauth": {"status": "succeeded", "reauth_generation": 1}},
                 {**base_state, "session_token": 1},
             ]
             for invalid_state in invalid_states:
@@ -5070,6 +5079,14 @@ print(json.dumps({
                 event = rows(root / "argus.sqlite3", "delivery_outage_events")[0]
                 self.assertEqual(event["stage"], "pre_send_readiness")
                 self.assertEqual((event["exact_cause"], event["cause_group"]), (cause, "contract"))
+                notifications = rows(root / "argus.sqlite3", "delivery_outage_notifications")
+                self.assertEqual({row["channel"] for row in notifications}, {"direct_pushover", "operator_alert"})
+                message_server = ArgusServer(path, clock=FakeClock(NOW), register_service=False)
+                try:
+                    outage = message_server.connection.execute("SELECT * FROM delivery_outages").fetchone()
+                    self.assertIn("target={}".format(outage["publish_target_key"]), message_server._outage_alert_message(outage))
+                finally:
+                    message_server.close()
 
     def test_durable_identity_renews_approaching_finite_expiry(self):
         with TemporaryDirectory() as tmpdir:
