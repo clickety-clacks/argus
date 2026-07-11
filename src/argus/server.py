@@ -1370,6 +1370,14 @@ def publish_transport_exception_cause(exc: BaseException) -> str:
             isinstance(current, OSError) and current.errno == errno.ECONNREFUSED
         ):
             return "CONNECTION_REFUSED"
+        if isinstance(current, ConnectionResetError) or (
+            isinstance(current, OSError) and current.errno == errno.ECONNRESET
+        ):
+            return "CONNECTION_RESET"
+        if isinstance(current, BrokenPipeError) or (
+            isinstance(current, OSError) and current.errno == errno.EPIPE
+        ):
+            return "BROKEN_PIPE"
         if isinstance(current, (TimeoutError, socket.timeout)):
             return "TIMEOUT"
         if isinstance(current, socket.gaierror):
@@ -1412,6 +1420,10 @@ def publish_failure_details(exc: Exception) -> Tuple[str, str, str]:
         return cause, group, exc.__class__.__name__
     if isinstance(exc, ConnectionRefusedError):
         return "CONNECTION_REFUSED", "transport", exc.__class__.__name__
+    if isinstance(exc, ConnectionResetError):
+        return "CONNECTION_RESET", "transport", exc.__class__.__name__
+    if isinstance(exc, BrokenPipeError):
+        return "BROKEN_PIPE", "transport", exc.__class__.__name__
     if isinstance(exc, (TimeoutError, socket.timeout)):
         return "TIMEOUT", "transport", exc.__class__.__name__
     if isinstance(exc, socket.gaierror):
@@ -1640,8 +1652,9 @@ class ArgusServer:
                 publish.subspace_renew_before_seconds,
                 publish.subspace_auth_timeout_seconds,
             )
-            recovery = session.ensure_session(self.clock.now(), "startup")
             self._durable_subspace_session = session
+            self._initialize_migrated_active_outage_boundaries()
+            recovery = session.ensure_session(self.clock.now(), "startup")
             self._durable_session_error = None
             self.config = dataclasses.replace(
                 self.config,
