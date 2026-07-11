@@ -1431,6 +1431,11 @@ def publish_failure_details(exc: Exception) -> Tuple[str, str, str]:
             "DURABLE_SUBSPACE_IDENTITY_KEY_MISMATCH",
             "INVALID_DURABLE_SUBSPACE_SESSION_STATE",
             "DURABLE_SUBSPACE_SESSION_BINDING_MISMATCH",
+            "MISSING_DURABLE_SUBSPACE_IDENTITY",
+            "missing_durable_subspace_identity_config",
+            "missing_publish_cap",
+            "missing_embedding_config",
+            "non_production_embedding_backend",
         }:
             group = "contract"
         elif cause in {

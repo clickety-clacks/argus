@@ -4857,6 +4857,11 @@ print(json.dumps({
             "DURABLE_SUBSPACE_IDENTITY_KEY_MISMATCH": "contract",
             "INVALID_DURABLE_SUBSPACE_SESSION_STATE": "contract",
             "DURABLE_SUBSPACE_SESSION_BINDING_MISMATCH": "contract",
+            "MISSING_DURABLE_SUBSPACE_IDENTITY": "contract",
+            "missing_durable_subspace_identity_config": "contract",
+            "missing_publish_cap": "contract",
+            "missing_embedding_config": "contract",
+            "non_production_embedding_backend": "contract",
             "DURABLE_SUBSPACE_IDENTITY_READ_FAILED": "dependency",
             "DURABLE_SUBSPACE_SESSION_READ_FAILED": "dependency",
             "DURABLE_SUBSPACE_SESSION_PERSIST_FAILED": "dependency",
@@ -4976,6 +4981,40 @@ print(json.dumps({
                 (event["exact_cause"], event["cause_group"]),
                 ("INVALID_DURABLE_SUBSPACE_SESSION_STATE", "contract"),
             )
+
+    def test_invalid_durable_session_values_are_stable_contract_failures(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            identity_path, session_path, _ = write_durable_identity(root)
+            base_state = {
+                "identity": "argus-racter",
+                "subspace_endpoint": "https://subspace.example",
+                "publish_target_key": "target",
+                "agent_id": json.loads(identity_path.read_text())["public_key"],
+                "session_token": "token",
+                "session_expires_at": None,
+                "reauth_generation": 1,
+                "last_reauth": None,
+            }
+            invalid_states = [
+                [],
+                {**base_state, "session_expires_at": "not-a-time"},
+                {**base_state, "reauth_generation": "not-an-integer"},
+                {**base_state, "last_reauth": "not-an-object"},
+            ]
+            for invalid_state in invalid_states:
+                with self.subTest(invalid_state=invalid_state):
+                    session_path.write_text(json.dumps(invalid_state) + "\n")
+                    with self.assertRaises(subspace_identity_module.DurableSubspaceStateError) as failure:
+                        subspace_identity_module.DurableSubspaceSession(
+                            "https://subspace.example",
+                            "target",
+                            identity_path,
+                            session_path,
+                            60,
+                            1.0,
+                        )
+                    self.assertEqual(failure.exception.exact_cause, "INVALID_DURABLE_SUBSPACE_SESSION_STATE")
 
     def test_durable_identity_renews_approaching_finite_expiry(self):
         with TemporaryDirectory() as tmpdir:

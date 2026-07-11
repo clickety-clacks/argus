@@ -187,6 +187,11 @@ class DurableSubspaceSession:
                 "INVALID_DURABLE_SUBSPACE_SESSION_STATE",
                 "invalid durable Subspace session state: {}".format(exc),
             ) from exc
+        if not isinstance(payload, dict):
+            raise DurableSubspaceStateError(
+                "INVALID_DURABLE_SUBSPACE_SESSION_STATE",
+                "invalid durable Subspace session state: expected an object",
+            )
         expected = {
             "identity": self.identity.name,
             "subspace_endpoint": self.endpoint,
@@ -199,6 +204,24 @@ class DurableSubspaceSession:
                     "DURABLE_SUBSPACE_SESSION_BINDING_MISMATCH",
                     "durable Subspace session {} mismatch".format(key),
                 )
+        try:
+            expires_at = payload.get("session_expires_at")
+            if expires_at is not None:
+                if not isinstance(expires_at, str):
+                    raise ValueError("session_expires_at must be a string or null")
+                parse_now(expires_at)
+            generation = payload.get("reauth_generation", 0)
+            if isinstance(generation, bool):
+                raise ValueError("reauth_generation must be an integer")
+            int(generation or 0)
+            last_reauth = payload.get("last_reauth")
+            if last_reauth is not None and not isinstance(last_reauth, dict):
+                raise ValueError("last_reauth must be an object or null")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise DurableSubspaceStateError(
+                "INVALID_DURABLE_SUBSPACE_SESSION_STATE",
+                "invalid durable Subspace session state: {}".format(exc),
+            ) from exc
         return payload
 
     def _persist(self) -> None:
